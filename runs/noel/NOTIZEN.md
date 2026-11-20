@@ -112,5 +112,7 @@ Das entspricht dem Stand von Philip. Andere Setups (aLIGO schnell, aLIGO verknü
 
 ## Abmachungen
 
-- Nichts pushen und nichts committen, ausser Noel sagt es.
+- Noel hat am 21.11. freigegeben: Jede Runde committet ihre behaltenen Änderungen und pusht sie auf `origin/noel`.
+- Nur der Branch `noel`. Kein Merge, kein Pull Request, kein Force-Push, keine anderen Branches anfassen.
+- Verworfene Versuche werden nicht committet.
 - Eine Änderung bleibt nur, wenn sie im Wechselvergleich schneller ist und alle Prüfungen unverändert gut ausfallen.
