@@ -34,6 +34,7 @@ to match phase conventions and signs.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -806,6 +807,124 @@ def amplitude_detector(solution: jnp.ndarray) -> jnp.ndarray:
     return jnp.sqrt(0.5 * EPSILON_0C) * jnp.abs(solution)
 
 
+HOST_DETECTORS = True
+"""
+Where `power_detector` and `signal_detector` are evaluated.
+
+True (default): the formulas run in NumPy through `jax.pure_callback`, with hand-written
+reverse-mode rules (`jax.custom_vjp`). The results are the same, but XLA does not have to compile
+these operations and their transposes. In the benchmark readout that removes about a third of
+the compilation time of the sensitivity and gradient stages.
+
+False: plain `jax.numpy` implementations (`power_detector_jax`, `signal_detector_jax`). Needed
+for forward-mode differentiation (`jax.jvp`, `jax.jacfwd`) through the detectors and for running
+them on an accelerator.
+"""
+
+
+def power_detector_jax(solution: jnp.ndarray) -> jnp.ndarray:
+    """`power_detector` written with `jax.numpy` operations."""
+    return 0.5 * EPSILON_0C * jnp.abs(solution) ** 2
+
+
+def signal_detector_jax(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
+    """`signal_detector` written with `jax.numpy` operations."""
+    upper_sideband = jnp.conj(carrier) * signal[: carrier.shape[0]]
+    lower_sideband = carrier * signal[carrier.shape[0] : carrier.shape[0] * 2]
+    return upper_sideband + lower_sideband
+
+
+def _unbroadcast(value: np.ndarray, shape: tuple) -> np.ndarray:
+    """Sum `value` over the axes that broadcasting added to an operand of shape `shape`."""
+    extra = value.ndim - len(shape)
+    if extra:
+        value = value.sum(axis=tuple(range(extra)))
+    axes = tuple(i for i, size in enumerate(shape) if size == 1 and value.shape[i] != 1)
+    if axes:
+        value = value.sum(axis=axes, keepdims=True)
+    return value
+
+
+def _power_host(solution):
+    return 0.5 * EPSILON_0C * np.abs(np.asarray(solution)) ** 2
+
+
+def _power_host_pullback(solution, cotangent):
+    solution = np.asarray(solution)
+    return (EPSILON_0C * np.asarray(cotangent) * np.conj(solution)).astype(solution.dtype)
+
+
+def _power_callback(solution):
+    result = jax.ShapeDtypeStruct(solution.shape, np.abs(np.zeros((), solution.dtype)).dtype)
+    return jax.pure_callback(_power_host, result, solution, vmap_method="sequential")
+
+
+@jax.custom_vjp
+def _power_detector_host(solution):
+    return _power_callback(solution)
+
+
+def _power_detector_fwd(solution):
+    return _power_callback(solution), solution
+
+
+def _power_detector_bwd(solution, cotangent):
+    result = jax.ShapeDtypeStruct(solution.shape, solution.dtype)
+    return (jax.pure_callback(_power_host_pullback, result, solution, cotangent, vmap_method="sequential"),)
+
+
+_power_detector_host.defvjp(_power_detector_fwd, _power_detector_bwd)
+
+
+def _signal_host(carrier, signal):
+    carrier, signal = np.asarray(carrier), np.asarray(signal)
+    n = carrier.shape[0]
+    return np.conj(carrier) * signal[:n] + carrier * signal[n : 2 * n]
+
+
+def _signal_host_pullback(carrier, signal, cotangent):
+    # JAX pairs cotangents without conjugation: the pullback of `conj(c) * u` with respect to `c`
+    # is `conj(cotangent * u)`, the pullback of `c * l` is `cotangent * l`.
+    carrier, signal, cotangent = np.asarray(carrier), np.asarray(signal), np.asarray(cotangent)
+    n = carrier.shape[0]
+    upper, lower = signal[:n], signal[n : 2 * n]
+    carrier_bar = _unbroadcast(np.conj(cotangent * upper) + cotangent * lower, carrier.shape)
+    signal_bar = np.zeros(signal.shape, signal.dtype)
+    signal_bar[:n] = _unbroadcast(cotangent * np.conj(carrier), upper.shape)
+    signal_bar[n : 2 * n] = _unbroadcast(cotangent * carrier, lower.shape)
+    return carrier_bar.astype(carrier.dtype), signal_bar
+
+
+def _signal_callback(carrier, signal):
+    n = carrier.shape[0]
+    shape = np.broadcast_shapes(carrier.shape, (min(n, signal.shape[0]),) + tuple(signal.shape[1:]))
+    result = jax.ShapeDtypeStruct(shape, np.result_type(carrier.dtype, signal.dtype))
+    return jax.pure_callback(_signal_host, result, carrier, signal, vmap_method="sequential")
+
+
+@jax.custom_vjp
+def _signal_detector_host(carrier, signal):
+    return _signal_callback(carrier, signal)
+
+
+def _signal_detector_fwd(carrier, signal):
+    return _signal_callback(carrier, signal), (carrier, signal)
+
+
+def _signal_detector_bwd(residuals, cotangent):
+    carrier, signal = residuals
+    result = (jax.ShapeDtypeStruct(carrier.shape, carrier.dtype), jax.ShapeDtypeStruct(signal.shape, signal.dtype))
+    return jax.pure_callback(_signal_host_pullback, result, carrier, signal, cotangent, vmap_method="sequential")
+
+
+_signal_detector_host.defvjp(_signal_detector_fwd, _signal_detector_bwd)
+
+
+def _use_host_detector(*arrays) -> bool:
+    """Host evaluation needs complex or floating inputs of the detectors' usual kind."""
+    return HOST_DETECTORS and all(np.issubdtype(array.dtype, np.complexfloating) for array in arrays)
+
+
 def power_detector(solution: jnp.ndarray) -> jnp.ndarray:
     """
     Convert complex field amplitude to optical power.
@@ -824,8 +943,13 @@ def power_detector(solution: jnp.ndarray) -> jnp.ndarray:
     -----
     Uses the scaling:
         0.5 * EPSILON_0C * |field|^2
+
+    Evaluated on the host by default, see `HOST_DETECTORS`.
     """
-    return 0.5 * EPSILON_0C * jnp.abs(solution) ** 2
+    solution = jnp.asarray(solution)
+    if _use_host_detector(solution):
+        return _power_detector_host(solution)
+    return power_detector_jax(solution)
 
 
 def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
@@ -850,10 +974,13 @@ def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
     -----
     Matches:
     finesse > detectors > compute > power.pyx > c_pd1_AC_output
+
+    Evaluated on the host by default, see `HOST_DETECTORS`.
     """
-    upper_sideband = jnp.conj(carrier) * signal[: carrier.shape[0]]
-    lower_sideband = carrier * signal[carrier.shape[0] : carrier.shape[0] * 2]
-    return upper_sideband + lower_sideband
+    carrier, signal = jnp.asarray(carrier), jnp.asarray(signal)
+    if _use_host_detector(carrier, signal) and signal.shape[0] >= 2 * carrier.shape[0]:
+        return _signal_detector_host(carrier, signal)
+    return signal_detector_jax(carrier, signal)
 
 
 # -----------------------------------------------------------------------------
