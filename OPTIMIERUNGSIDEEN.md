@@ -9,7 +9,7 @@ Die Angaben zum Stand von `philip` stammen aus [`README.optimizations.md` auf `o
 - Gewertet wird die **First-Run-Gesamtzeit auf einer CPU** (`--cpus 1`), inklusive Imports und Kompilieren. Mehr Kerne helfen nicht, es zählt nur weniger Arbeit pro Kern.
 - Im Original geht über die Hälfte der Zeit ins **Kompilieren** (22,9 von 44,2 s), der Rest in dichte 751×751-Lösungen und den Gradienten.
 - Die großen Hebel sind **auf `philip` umgesetzt**: Sparse LU, Löser per `pure_callback` außerhalb von XLA, eigene Rückwärtsregel und die Rausch-Abkürzung. Laut Philips Messung fällt die First-Run-Zeit auf macOS damit von 11,0 s auf ca. 0,4 s.
-- Jetzt dominieren die **Imports**. Offen ist vor allem, `plotly` nicht beim Import von `differometor` zu laden.
+- Jetzt dominieren die **Imports**. `plotly` wird auf `max/lu-once` inzwischen erst bei Bedarf geladen (spart ca. 15 ms), der Rest ist vor allem `import jax`.
 
 ## Rahmenbedingungen
 
@@ -46,7 +46,7 @@ Offizielle Baseline (Xeon Platinum 8468, 1 CPU, `benchmarks/cpu-baseline.json`):
 | 8 | Eigene Rückwärtsregel, Kotangenten nur an Nichtnull-Positionen | umgesetzt (`philip`: `custom_vjp`) |
 | 9 | Löser aus XLA herausnehmen (`pure_callback`) | umgesetzt (`philip`: Kompilieren nur noch ca. 0,09 s) |
 | 10 | LU-Zerlegung pro Frequenz einmal statt dreimal | Commit `3153d6d` hier, wirkt nur noch im JAX-Fallback |
-| 11 | `plotly` nicht beim Import laden | **offen**, `__init__.py` importiert `plot.py` auch auf `philip` |
+| 11 | `plotly` nicht beim Import laden | umgesetzt auf `max/lu-once` (Commit `3cf5fab`): 26,3 → 11,7 ms, für `philip` noch zu übernehmen |
 | 12 | Blockstruktur oben/unten/Mechanik (Schur-Komplement) | offen, neben Sparse LU vermutlich überflüssig |
 | 13 | XLA-Flags mit niedrigerer Optimierungsstufe | verworfen: Grauzone, und das Kompilieren ist schon fast weg |
 
@@ -95,14 +95,12 @@ Meine Schätzung aus der Topologie (71 Strecken × 4 Feldrichtungen ≈ 286 Carr
 
 `differometor/__init__.py` lädt `differometor.plot`, und das importiert `plotly.graph_objects`. Der Benchmark nutzt `visualize_setup` nicht, der Import läuft aber in der gewerteten Zeit mit. Bei ca. 0,4 s First-Run auf `philip` ist jeder Import-Anteil spürbar.
 
-Vorschlag: `visualize_setup` erst bei Bedarf laden, per modulweitem `__getattr__` in `__init__.py`. Vorher messen, was es wirklich kostet:
+**Umgesetzt** in Commit `3cf5fab`: `visualize_setup` wird erst beim ersten Zugriff über ein modulweites `__getattr__` in `__init__.py` geladen. `from differometor.plot import visualize_setup`, `dir()` und Stern-Importe funktionieren weiter.
 
-```bash
-python -X importtime -c "import differometor" 2> importtime.log
-```
+Gemessen auf macOS (Python 3.12, gepinnte Requirements, Median aus 9 frischen Prozessen, nach `import jax, numpy` wie im Benchmark): `import differometor` braucht **26,3 ms vorher, 11,7 ms nachher**. Der Gewinn ist mit ca. 15 ms klein, weil plotly 7 intern selbst schon lazy lädt. Bei ca. 0,4 s First-Run auf `philip` sind das trotzdem ca. 3–4 %. Die Änderung lässt sich per Cherry-Pick auf `philip` übernehmen (`__init__.py` ist dort unverändert).
 
 ## Was als Nächstes noch lohnt
 
-1. **Imports messen und kürzen** (Punkt 11). Laut Philip entfallen auf `import jax` ca. 0,22 s und auf `scipy.sparse.linalg` ca. 0,04 s. Den Rest von bis zu ca. 0,14 s sollten wir aufschlüsseln.
+1. **Imports weiter aufschlüsseln.** Laut Philip entfallen auf `import jax` ca. 0,22 s und auf `scipy.sparse.linalg` ca. 0,04 s. Der plotly-Anteil (ca. 15 ms) ist erledigt, der Rest sollte per `python -X importtime` geprüft werden.
 2. **Offizielle Messung auf Linux x86 mit `--cpus 1`.** Bisher gibt es nur macOS (Threads begrenzt) und Docker auf aarch64.
 3. **JAX-Fallback** (Punkte 1, 5, 6, 10): bringt für die Wertung nichts, wäre aber für andere Setups und den Sonderpreis eine saubere Ergänzung.

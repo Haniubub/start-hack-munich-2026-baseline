@@ -110,7 +110,22 @@ Das entspricht dem Stand von Philip. Andere Setups (aLIGO schnell, aLIGO verknü
 | 4 | Unter Linux ist die Kompilation fast doppelt so teuer wie auf dem Mac (134 statt 75 ms). Ursache suchen | offen | Vermutlich der Readout selbst |
 | 5 | Messung auf x86-Linux | – | Braucht eine passende Maschine |
 
+## Stand der anderen Branches
+
+Vor jeder Runde: `git fetch --all --prune`, dann alle fremden Branches auf neue Commits prüfen.
+
+| Branch | Zuletzt gesehen | Stand in `noel` |
+| --- | --- | --- |
+| `origin/philip` | `ab82e42` (20.11. 19:58) | vollständig enthalten |
+| `origin/max/lu-once` | `79ae580` (20.11. 20:08) | vollständig enthalten. Max' `__init__.py` (Plotly bei Bedarf, mit `__all__` und `__dir__`) ersetzt meine einfachere Fassung |
+| Joel | kein Branch vorhanden (geprüft 21.11. 00:45) | – |
+| `origin/main` | `5eece1d` | unverändertes Kit |
+
+Messung nach dem Merge von Max' Stand: 483 ms Erstlauf (Mac, Median aus 6 frischen Läufen), `PASS`.
+
 ## Abmachungen
+
+- Zu Beginn jeder Runde die Branches von Max, Philip und Joel holen und sichten. Was messbar hilft, in `noel` übernehmen (Merge oder Cherry-Pick) und wie jede Änderung messen und prüfen. Fremde Branches nie verändern.
 
 - Noel hat am 21.11. freigegeben: Jede Runde committet ihre behaltenen Änderungen und pusht sie auf `origin/noel`.
 - Nur der Branch `noel`. Kein Merge, kein Pull Request, kein Force-Push, keine anderen Branches anfassen.
