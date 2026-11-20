@@ -60,6 +60,59 @@ def solve(matrix: jnp.ndarray, right_hand_side: jnp.ndarray) -> jnp.ndarray:
     return jnp.linalg.solve(matrix, right_hand_side)
 
 
+def factorize(matrix: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    LU-factorize a (batch of) complex128 system matrices once for reuse.
+
+    The factorization is wrapped in `stop_gradient`: gradients with respect to the
+    matrix flow through the matrix-vector product in `factorized_solve` instead,
+    exactly like `jnp.linalg.solve` does internally.
+    """
+    return jax.scipy.linalg.lu_factor(lax.stop_gradient(matrix.astype(jnp.complex128)))
+
+
+def factorized_solve(
+    matrix: jnp.ndarray,
+    factors: tuple[jnp.ndarray, jnp.ndarray],
+    right_hand_side: jnp.ndarray,
+    adjoint: bool = False,
+) -> jnp.ndarray:
+    """
+    Solve `matrix @ x = b` (or `matrix^H @ x = b` if `adjoint`) for one system,
+    reusing an LU factorization from `factorize`.
+
+    Mirrors the structure of `jnp.linalg.solve` (custom_linear_solve around an LU),
+    so the reverse pass reuses the same factors and never differentiates through
+    the factorization itself. JAX transposes linear maps without conjugation, so
+    `transpose_solve` must solve with the plain transpose of the operator:
+    M^T for `M`, and conj(M) for `M^H`.
+    """
+    matrix = matrix.astype(jnp.complex128)
+    right_hand_side = right_hand_side.astype(jnp.complex128)
+    lu_solve = jax.scipy.linalg.lu_solve
+    if adjoint:
+        def matvec(x):
+            return jnp.conjugate(matrix).T @ x
+
+        def solve_(_, y):
+            return lu_solve(factors, y, trans=2)
+
+        def transpose_solve(_, y):
+            # conj(M) x = y  <=>  M conj(x) = conj(y)
+            return jnp.conjugate(lu_solve(factors, jnp.conjugate(y), trans=0))
+    else:
+        def matvec(x):
+            return matrix @ x
+
+        def solve_(_, y):
+            return lu_solve(factors, y, trans=0)
+
+        def transpose_solve(_, y):
+            return lu_solve(factors, y, trans=1)
+
+    return lax.custom_linear_solve(matvec, right_hand_side, solve_, transpose_solve)
+
+
 def update(
     parameters: jnp.ndarray,
     matrix: jnp.ndarray,
@@ -333,7 +386,11 @@ def simulate_jax(
         jnp.conjugate(signal_matrix[:, carrier_size : carrier_size * 2, carrier_size * 2 :])
     )
 
-    signal = vmap(solve)(signal_matrix[:, :, :-1], signal_matrix[:, :, -1])
+    # Factorize each frequency's signal system once; the signal, noise-weight
+    # (adjoint) and covariance solves below all reuse these LU factors.
+    signal_system = signal_matrix[:, :, :-1].astype(jnp.complex128)
+    signal_factors = factorize(signal_system)
+    signal = vmap(factorized_solve)(signal_system, signal_factors, signal_matrix[:, :, -1])
 
     # --------------------
     # Quantum noise solve
@@ -367,13 +424,14 @@ def simulate_jax(
         :, :, carrier.shape[1] : carrier.shape[1] * 2
     ].set(lower_carrier_selections)
 
-    # Back-propagate detector weights by solving the transposed conjugated signal system.
-    transposed_conjugated_signal_matrix = jnp.transpose(jnp.conjugate(signal_matrix[:, :, :-1]), (0, 2, 1))
+    # Back-propagate detector weights by solving the transposed conjugated signal system
+    # (M^H x = s), reusing the LU factors of M instead of factorizing M^H again.
     carrier_selections = jnp.broadcast_to(
         carrier_selections,
-        (carrier_selections.shape[0], transposed_conjugated_signal_matrix.shape[0], carrier_selections.shape[2]),
+        (carrier_selections.shape[0], signal_system.shape[0], carrier_selections.shape[2]),
     )
-    noise_weights = vmap(vmap(solve), in_axes=(None, 0))(transposed_conjugated_signal_matrix, carrier_selections)
+    adjoint_solve = lambda m, f, b: factorized_solve(m, f, b, adjoint=True)
+    noise_weights = vmap(vmap(adjoint_solve), in_axes=(None, None, 0))(signal_system, signal_factors, carrier_selections)
 
     # Update noise source matrix (may depend on current parameters).
     noise_matrix = vmap(update, in_axes=(0, None, None, None, None, None))(
@@ -405,7 +463,7 @@ def simulate_jax(
 
     # Project noise sources into the system and propagate through the signal matrix.
     noise_sources = vmap(matmul_single_batch, in_axes=(None, 0))(noise_matrix, noise_weights)
-    covariances = vmap(vmap(solve), in_axes=(None, 0))(signal_matrix[:, :, :-1], noise_sources)
+    covariances = vmap(vmap(factorized_solve), in_axes=(None, None, 0))(signal_system, signal_factors, noise_sources)
 
     # Convert propagated covariances into amplitude spectral density.
     temporary_sum = jnp.sum(jnp.real(covariances * jnp.conjugate(carrier_selections)), axis=2)
