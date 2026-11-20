@@ -1413,10 +1413,10 @@ def build(setup: Setup):
     # Convert linked parameter names to parameter index positions.
     linked_indices = [parameter_names.index(name) for name in linked_names]
     if len(linked_indices) == 0:
-        linked_indices = [0]
-        indices_to_link = [0]
-        LINKING_FUNCTIONS.append(lambda x: x)
-        linking_function_indices = [0]
+        # No linking: empty index arrays (the shape tells `simulate` that no linking is needed).
+        # Keep one identity function registered so `lax.switch` always has a branch.
+        if len(LINKING_FUNCTIONS) == 0:
+            LINKING_FUNCTIONS.append(lambda x: x)
 
     return (
         (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
