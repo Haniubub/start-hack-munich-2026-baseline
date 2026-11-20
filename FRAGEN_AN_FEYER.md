@@ -1,0 +1,85 @@
+# Fragen an Feyer
+
+Stand: Fr 20.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once`).
+Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
+
+## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
+
+- Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
+- Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
+- Gemessen: 11,0 s → ca. 0,4 s auf macOS, ca. 1,2 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
+
+## Die fünf wichtigsten Fragen
+
+Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere Lösung überhaupt zählt.
+
+1. Zählt eine Lösung, deren Rechenkern in SciPy statt in JAX läuft? (A1)
+2. Wir haben schon vor dem offiziellen Start am öffentlichen Kit gearbeitet. Ist das erlaubt? (D1)
+3. Auf welcher Maschine und mit welchem Befehl wird die Wertung gemessen? (B1, B2)
+4. Wie geht ihr mit der Streuung um, wenn die Gesamtzeit unter 1,5 s liegt? (B3)
+5. Testet ihr auch andere Setups als das UIFO aus dem Benchmark? (C3)
+
+---
+
+## A. Ist unser Ansatz zulässig?
+
+| Nr. | Frage | Warum wir fragen |
+| --- | --- | --- |
+| A1 | Zählt eine Lösung, bei der die Gleichungssysteme ausserhalb von JAX in SciPy (SuperLU) gelöst werden, eingebunden über `jax.pure_callback`? `df.simulate` bleibt aufrufbar und unter `jax.jit` und `jax.vjp` nutzbar. | Daran hängt fast der ganze Gewinn. Bei Nein müssten wir den Sparse-Ansatz in reinem JAX nachbauen. |
+| A2 | Ist ein handgeschriebener Reverse-Mode-Gradient (`jax.custom_vjp`) in Ordnung, wenn er mit dem JAX-Gradienten übereinstimmt? | JAX kann nicht durch SciPy hindurch ableiten. |
+| A3 | Reicht es, wenn der schnelle Weg nur für bestimmte Setups greift (kein Parameter-Linking, kein Homodyn-Detektor, genau ein Rauschdetektor) und alle anderen den unveränderten JAX-Code nutzen? | Unser Dispatcher fällt sonst auf `simulate_jax` zurück. |
+| A4 | Das Rauschen rechnen wir als `Re(yᴴ·N·y)` mit `y = S⁻ᴴ·w`. Das ist algebraisch dasselbe wie im Original, spart aber eine Lösung. Gilt das als «weggelassene Berechnung»? | Im Regeltext steht, dass ausgelassene Berechnungen nicht zählen. |
+| A5 | Komponenten, die nicht von der Frequenz abhängen, werten wir einmal aus und kopieren das Resultat auf alle 101 Frequenzen. In Ordnung? | Gleiche Sorge wie bei A4. |
+| A6 | Muss die Lösung auf der GPU lauffähig bleiben? | `pure_callback` rechnet immer auf der CPU. |
+| A7 | Braucht ihr `vmap` über viele Parametersätze (`run_with_parameter_sets`), Forward-Mode (`jvp`) oder höhere Ableitungen? | Der schnelle Weg kann nur Reverse-Mode nach den Designvariablen. Alles andere läuft über den Rückfall. |
+
+## B. Wie wird gemessen?
+
+| Nr. | Frage | Warum wir fragen |
+| --- | --- | --- |
+| B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
+| B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? | Der «first-run total» entsteht nur einmal pro Prozess. |
+| B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf in Docker zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
+| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns über die Hälfte der Gesamtzeit aus. |
+| B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
+| B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». |
+| B7 | Sind der persistente Kompilier-Cache und vorab exportierte Programme (`jax.export`) wirklich ausgeschlossen? | Wir nutzen beides nicht und wollen sicher sein, dass es auch andere nicht dürfen. |
+| B8 | Dürfen wir `differometor/__init__.py` so ändern, dass Plotly erst bei Bedarf geladen wird? | Der Benchmark braucht `visualize_setup` nicht, der Import läuft aber in der gewerteten Zeit. |
+| B9 | Dürfen wir nur in `differometor/` ändern und dort auch neue Dateien anlegen? `benchmark.py` und die Fixtures lassen wir unverändert. | Der Report speichert die Hashes dieser Dateien. |
+
+## C. Korrektheit
+
+| Nr. | Frage | Warum wir fragen |
+| --- | --- | --- |
+| C1 | Die unveränderte Baseline weicht schon um 5,37e-6 von eurer Referenz ab, erlaubt sind 1e-5. Woher stammt die Referenz (andere Maschine, andere Version, anderes Programm)? | Uns bleiben nur 4,6e-6 Spielraum, obwohl wir vom Original nur um 5,8e-9 abweichen. |
+| C2 | Prüft ihr über `benchmark.py` hinaus, z. B. alle 193 Gradienten oder die Arrays carrier, signal und noise gegen die Baseline? Mit welcher Toleranz? | `benchmark.py` prüft nur einen der 193 Gradientenwerte. Unsere Abweichung zum Original: Gradient 8,0e-8, Signal 1,9e-7 (relativ zum Maximum). |
+| C3 | Testet ihr weitere Setups, öffentliche (aLIGO, Voyager) oder nicht veröffentlichte? | Der schnelle Weg deckt nicht jedes Setup ab (siehe A3). |
+| C4 | Einzelne Gradienteneinträge liegen bei 1e-13, das Maximum bei 5,8e4. Diese Einträge schwanken schon im Original. Ist das akzeptiert? | Ein elementweiser relativer Vergleich würde dort fehlschlagen. |
+
+## D. Regeln und Abgabe
+
+| Nr. | Frage | Warum wir fragen |
+| --- | --- | --- |
+| D1 | Das Kit ist seit Mi 18.11. öffentlich. Ist Arbeit daran vor Sa 13:00 erlaubt, und müssen wir sie deklarieren? | Wir haben bereits eine lauffähige Lösung und wollen das offen sagen. |
+| D2 | In welcher Form wollt ihr die Erklärung zum KI-Einsatz? | Wir haben mit KI-Coding-Tools gearbeitet. |
+| D3 | Was gehört genau in die Abgabe, und in welcher Form: Repo-Link, ZIP, Reports von welcher Maschine? | Die `.gitignore` des Kits schliesst `benchmark*.json` und `*.npz` aus. |
+| D4 | Wonach vergebt ihr den Spezialpreis? Zählen Allgemeingültigkeit, Verbleib in JAX oder GPU-Tauglichkeit? | Wir entscheiden damit, ob wir zusätzlich den JAX-Rückfall beschleunigen. |
+| D5 | Was würde die Lösung für euch im Alltag brauchbar machen? Würdet ihr so etwas upstream übernehmen? | Gibt uns die Richtung für die restliche Zeit und für den Pitch. |
+
+---
+
+## Was wir je nach Antwort tun
+
+| Antwort | Folge |
+| --- | --- |
+| A1 Nein (kein SciPy) | Sparse-Ansatz in reinem JAX nachbauen. Max' `lu-once` und die Rausch-Abkürzung im JAX-Pfad werden dann zur Hauptsache. |
+| A3 oder C3: andere Setups zählen | JAX-Rückfall beschleunigen (`lax.switch` ersetzen, Kopien vermeiden, Rausch-Abkürzung). |
+| B5 Ja (neue Pakete erlaubt) | Schnelleren Sparse-Löser prüfen, Import-Zeit dabei mitmessen. |
+| B8 Ja | Plotly-Import verzögern. |
+| D1 Nein (keine Vorarbeit) | Mit Feyer klären, wie wir damit umgehen, bevor wir etwas abgeben. |
+
+## Noch selbst zu erledigen (keine Frage an Feyer)
+
+- Messung auf x86-Linux mit `--cpus 1`, mehrfach in frischen Prozessen.
+- Ergebnis von `runs/check_fast.py` und `runs/check_setups.py` als Datei ablegen.
+- Nach dem Merge von `max/lu-once` den JAX-Rückfall einmal durchlaufen lassen (`runs/check_setups.py`). Das ist auf diesem Branch noch nicht gelaufen.
