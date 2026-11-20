@@ -1385,3 +1385,41 @@ FUNCTIONS = [
 The order is important if the caller uses integer indices to reference a
 component model.
 """
+
+
+def rebind_functions(jnp_replacement, overrides=None) -> dict:
+    """
+    Copies of every function in this module that use `jnp_replacement` instead of `jax.numpy`.
+
+    The formulas stay exactly as written above; only the array namespace changes. With
+    `numpy` this evaluates components eagerly on the host, which avoids one XLA compilation
+    per operation when values are concrete (e.g. in the build step).
+
+    Parameters
+    ----------
+    jnp_replacement:
+        Module or object providing the `jax.numpy` names used here (e.g. `numpy`).
+    overrides:
+        Optional mapping of names to replace in the copied functions' globals.
+
+    Returns
+    -------
+    dict
+        The rebound namespace, keyed by function name.
+    """
+    import types
+
+    namespace = dict(globals())
+    namespace["jnp"] = jnp_replacement
+    namespace.update(overrides or {})
+    for name, function in list(namespace.items()):
+        if (
+            isinstance(function, types.FunctionType)
+            and function.__module__ == __name__
+            and name not in (overrides or {})
+            and name != "rebind_functions"
+        ):
+            namespace[name] = types.FunctionType(
+                function.__code__, namespace, name, function.__defaults__, function.__closure__
+            )
+    return namespace

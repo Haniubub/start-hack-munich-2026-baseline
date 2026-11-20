@@ -24,8 +24,6 @@ every residual the backward pass needs as arrays that flow through JAX, and the 
 callback rebuilds the sparsity plan and refactorizes the matrices from them.
 """
 
-import types
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -143,19 +141,9 @@ class _Output(list):
 
 
 def _rebind_component_functions():
-    """Copies of `components.FUNCTIONS` whose global `jnp` is the NumPy shim."""
-    namespace = dict(vars(components))
-    namespace["jnp"] = _NumpyShim
-    namespace["standardize_output"] = lambda output: _Output(list(output) + [0.0] * (4 - len(output)))
-    for name, function in vars(components).items():
-        if (
-            isinstance(function, types.FunctionType)
-            and function.__module__ == components.__name__
-            and name != "standardize_output"
-        ):
-            namespace[name] = types.FunctionType(
-                function.__code__, namespace, name, function.__defaults__, function.__closure__
-            )
+    """Copies of `components.FUNCTIONS` whose global `jnp` is the dual-number NumPy shim."""
+    standardize = lambda output: _Output(list(output) + [0.0] * (4 - len(output)))
+    namespace = components.rebind_functions(_NumpyShim, {"standardize_output": standardize})
     return [namespace[function.__name__] for function in components.FUNCTIONS]
 
 
