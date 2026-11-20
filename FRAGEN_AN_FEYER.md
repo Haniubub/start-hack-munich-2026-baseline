@@ -1,13 +1,13 @@
 # Fragen an Feyer
 
-Stand: Fr 20.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once`).
+Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` plus die Optimierungsrunde vom 21.11.).
 Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
 
 ## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
 
 - Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
 - Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
-- Gemessen: 11,0 s → ca. 0,4 s auf macOS, ca. 1,2 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
+- Gemessen auf einem Apple M4: Original 12,8 s → 0,51 s auf macOS und 0,56 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
 
 ## Die fünf wichtigsten Fragen
 
@@ -32,6 +32,9 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | A5 | Komponenten, die nicht von der Frequenz abhängen, werten wir einmal aus und kopieren das Resultat auf alle 101 Frequenzen. In Ordnung? | Gleiche Sorge wie bei A4. |
 | A6 | Muss die Lösung auf der GPU lauffähig bleiben? | `pure_callback` rechnet immer auf der CPU. |
 | A7 | Braucht ihr `vmap` über viele Parametersätze (`run_with_parameter_sets`), Forward-Mode (`jvp`) oder höhere Ableitungen? | Der schnelle Weg kann nur Reverse-Mode nach den Designvariablen. Alles andere läuft über den Rückfall. |
+| A8 | Wir laden den kompilierten SuperLU-Löser direkt aus dem SciPy-Paket (`scipy/sparse/linalg/_dsolve/_superlu`), ohne `import scipy.sparse.linalg`. Das spart rund 90 ms Import. Ist das in Ordnung? | Es ist ein internes Modul von SciPy. Falls nein, kostet uns der normale Import etwa 15 % der Gesamtzeit. |
+| A9 | `df.signal_detector` und `df.power_detector` rechnen bei uns in NumPy (Host-Callback) statt in JAX, mit eigener Rückwärtsregel. Das spart rund 30 ms Kompilierzeit im Readout. Zählt das? | Die Formeln sind unverändert, Forward-Mode geht damit aber nur noch über einen Schalter (`HOST_DETECTORS = False`). |
+| A10 | Dürfen wir Einstellungen des Lösers ändern (SuperLU `Relax=1`, `PanelSize=1`)? Die Pivotierung bleibt gleich. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7), die Zerlegung wird 40 % schneller. |
 
 ## B. Wie wird gemessen?
 
@@ -39,12 +42,12 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | --- | --- | --- |
 | B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
 | B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? | Der «first-run total» entsteht nur einmal pro Prozess. |
-| B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf in Docker zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
-| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns über die Hälfte der Gesamtzeit aus. |
+| B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf je nach Zustand der Maschine um bis zu 40 ms, in älteren Docker-Messungen zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
+| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns zwei Drittel der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). |
 | B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
 | B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». |
 | B7 | Sind der persistente Kompilier-Cache und vorab exportierte Programme (`jax.export`) wirklich ausgeschlossen? | Wir nutzen beides nicht und wollen sicher sein, dass es auch andere nicht dürfen. |
-| B8 | Dürfen wir `differometor/__init__.py` so ändern, dass Plotly erst bei Bedarf geladen wird? | Der Benchmark braucht `visualize_setup` nicht, der Import läuft aber in der gewerteten Zeit. |
+| B8 | Wir laden Plotly erst bei Bedarf (`df.visualize_setup` funktioniert weiter). In Ordnung? | Der Benchmark braucht `visualize_setup` nicht, der Import lief aber in der gewerteten Zeit. |
 | B9 | Dürfen wir nur in `differometor/` ändern und dort auch neue Dateien anlegen? `benchmark.py` und die Fixtures lassen wir unverändert. | Der Report speichert die Hashes dieser Dateien. |
 
 ## C. Korrektheit
@@ -75,11 +78,12 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | A1 Nein (kein SciPy) | Sparse-Ansatz in reinem JAX nachbauen. Max' `lu-once` und die Rausch-Abkürzung im JAX-Pfad werden dann zur Hauptsache. |
 | A3 oder C3: andere Setups zählen | JAX-Rückfall beschleunigen (`lax.switch` ersetzen, Kopien vermeiden, Rausch-Abkürzung). |
 | B5 Ja (neue Pakete erlaubt) | Schnelleren Sparse-Löser prüfen, Import-Zeit dabei mitmessen. |
-| B8 Ja | Plotly-Import verzögern. |
+| A8 Nein | SuperLU wieder über `scipy.sparse.linalg` importieren (in `fast.py` reicht dafür der Rückfall in `_load_superlu`). |
+| A9 Nein | `HOST_DETECTORS = False` in `components.py` setzen. |
+| B8 Nein | Plotly-Import in `__init__.py` wieder direkt machen. |
 | D1 Nein (keine Vorarbeit) | Mit Feyer klären, wie wir damit umgehen, bevor wir etwas abgeben. |
 
 ## Noch selbst zu erledigen (keine Frage an Feyer)
 
 - Messung auf x86-Linux mit `--cpus 1`, mehrfach in frischen Prozessen.
-- Ergebnis von `runs/check_fast.py` und `runs/check_setups.py` als Datei ablegen.
-- Nach dem Merge von `max/lu-once` den JAX-Rückfall einmal durchlaufen lassen (`runs/check_setups.py`). Das ist auf diesem Branch noch nicht gelaufen.
+- Erledigt am 21.11.: `runs/check_fast.py --fallback` und `runs/check_setups.py` laufen auf diesem Branch durch, auch mit Max' `lu-once` im JAX-Rückfall. Die Werte stehen in `runs/noel/NOTIZEN.md`.

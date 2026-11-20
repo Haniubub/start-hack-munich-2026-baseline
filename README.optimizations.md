@@ -71,6 +71,27 @@ Der Backward rechnet `V_bar`, `w_bar` und die Rückstreuung auf die Parameter je
 
 Die Ersparnis wurde nur gesamt gemessen und nicht pro Einzelmaßnahme a–d aufgeschlüsselt.
 
+## Runde vom 21.11. (Branch `noel`)
+
+Gemessen im Wechsel gegen den Stand davor (Philips Branch plus Max' `lu-once`), je frischer Prozess, Erstlauf gesamt als Median:
+
+| Umgebung | Vorher | Nachher |
+|---|---:|---:|
+| Apple M4, macOS, Threads auf 1 begrenzt (12 Läufe) | 0,673 s | **0,508 s** |
+| Docker, Linux aarch64, `--cpus 1` (10 Läufe) | 0,734 s | **0,560 s** |
+
+Was geändert wurde:
+
+| Änderung | Wirkung |
+|---|---|
+| SuperLU-Modul direkt laden statt `import scipy.sparse.linalg` | ca. 85 ms weniger Import |
+| `signal_detector` und `power_detector` als Host-Callback (`components.HOST_DETECTORS`) | ca. 30 ms weniger Kompilieren im Readout |
+| Ableitungen nur für Eingänge, die Designvariablen sind | Rückwärtslauf 24 → 15 ms |
+| SuperLU mit `Relax=1`, `PanelSize=1`, zwei Löser-Aufrufe pro Frequenz statt drei | Vorwärtslauf 43 → 30 ms |
+| Plotly erst bei Bedarf laden | ca. 7 ms weniger Import |
+
+Die Abweichungen zum Original-JAX sind unverändert (Sensitivität 5,8e-9, Gradient 8,0e-8). Details, Messmethode und offene Ideen stehen in [`runs/noel/NOTIZEN.md`](runs/noel/NOTIZEN.md). Die Tabellen weiter oben zeigen den Stand vor dieser Runde.
+
 ## Wo die verbleibende Zeit steckt
 
 Im First-Run (ca. 0,4 s auf macOS) steckt kaum noch Physik:
