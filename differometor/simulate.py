@@ -25,6 +25,7 @@ from jax import lax, vmap, jit
 from differometor.setups import Setup
 from differometor.build import build, pairs_to_arrays, prepare_arrays, LINKING_FUNCTIONS
 from differometor.components import FUNCTIONS, UNIT_VACUUM, H_PLANCK, F0
+from differometor import fast
 
 
 jax.config.update("jax_enable_x64", True)
@@ -149,7 +150,7 @@ def expand_parameters(array: jnp.ndarray, indices: jnp.ndarray, values: jnp.ndar
     return tiled_array.at[row_indices, column_indices].set(flat_values)
 
 
-def simulate(
+def simulate_jax(
     # prepared arrays
     optimized_parameters: jnp.ndarray,
     optimized_parameter_indices: jnp.ndarray,
@@ -411,6 +412,59 @@ def simulate(
     noise = jnp.sqrt(2 * temporary_sum * UNIT_VACUUM * H_PLANCK * F0 * 0.25)
 
     return carrier.T, signal.T, noise.squeeze()
+
+
+def simulate(
+    # prepared arrays
+    optimized_parameters: jnp.ndarray,
+    optimized_parameter_indices: jnp.ndarray,
+    optimized_value_indices: jnp.ndarray,
+    carrier_changing_parameter_indices: jnp.ndarray,
+    carrier_changing_values: jnp.ndarray,
+    signal_changing_parameter_indices: jnp.ndarray,
+    signal_changing_values: jnp.ndarray,
+    # matrices
+    parameters: jnp.ndarray,
+    carrier_matrix: jnp.ndarray,
+    signal_matrix: jnp.ndarray,
+    noise_matrix: jnp.ndarray,
+    noise_selection_vectors: jnp.ndarray,
+    qhd_parameter_indices: jnp.ndarray,
+    qhd_placing_indices: jnp.ndarray,
+    linked_indices: jnp.ndarray,
+    linking_function_indices: jnp.ndarray,
+    indices_to_link: jnp.ndarray,
+    # carrier arrays
+    carrier_function_input_indices: jnp.ndarray,
+    carrier_function_indices: jnp.ndarray,
+    carrier_output_indices: tuple[jnp.ndarray, jnp.ndarray],
+    carrier_matrix_indices: tuple[jnp.ndarray, jnp.ndarray],
+    # signal arrays
+    signal_function_input_indices: jnp.ndarray,
+    signal_function_indices: jnp.ndarray,
+    signal_output_indices: tuple[jnp.ndarray, jnp.ndarray],
+    signal_matrix_indices: tuple[jnp.ndarray, jnp.ndarray],
+    signal_carrier_indices: jnp.ndarray,
+    signal_carrier_placing_indices: tuple[jnp.ndarray, jnp.ndarray],
+    # noise arrays
+    noise_function_input_indices: jnp.ndarray,
+    noise_function_indices: jnp.ndarray,
+    noise_output_indices: tuple[jnp.ndarray, jnp.ndarray],
+    noise_system_matrix_indices: tuple[jnp.ndarray, jnp.ndarray],
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """
+    Run one full simulation pass: carrier, signal, and quantum noise.
+
+    Same arguments and outputs as `simulate_jax`. Setups without parameter linking,
+    without homodyne detectors (qhd), with a single quantum noise detector and a single
+    carrier operating point use the sparse host path in `differometor.fast` (a
+    `jax.custom_vjp` around `jax.pure_callback`, differentiable with respect to
+    `optimized_parameters` in reverse mode). All other setups use `simulate_jax`.
+    """
+    arrays = dict(locals())
+    if fast.supports(arrays):
+        return fast.simulate_fast(arrays)
+    return simulate_jax(**arrays)
 
 
 def run_build_step(

@@ -70,7 +70,17 @@ from differometor.components import (
     corrected_optomechanical_phase_left,
     corrected_optomechanical_phase_right,
     dummy_function,
+    rebind_functions,
 )
+
+# NumPy copies of the component formulas used for constant matrix blocks while building.
+# Values are concrete here, so eager jax.numpy would compile one XLA program per operation.
+_NUMPY_COMPONENTS = rebind_functions(np)
+
+
+def _device_array(values, dtype=None) -> jnp.ndarray:
+    """Convert on the host, then transfer (`jnp.array(..., dtype=...)` compiles a conversion)."""
+    return jnp.asarray(np.asarray(values, dtype=dtype))
 
 # ---------------------------------------------------------------------
 # Global state for parameter linking
@@ -878,7 +888,7 @@ def build(setup: Setup):
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
                 refractive_index_right_position = surfaces_to_refractive_index_parameter_position[node].get("right", 1)
 
-                matrix = mirror_matrix(
+                matrix = _NUMPY_COMPONENTS["mirror_matrix"](
                     data["properties"]["loss"],
                     data["properties"]["reflectivity"],
                     data["properties"]["tuning"],
@@ -925,7 +935,7 @@ def build(setup: Setup):
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
                 refractive_index_right_position = surfaces_to_refractive_index_parameter_position[node].get("right", 1)
 
-                matrix = beamsplitter_matrix(
+                matrix = _NUMPY_COMPONENTS["beamsplitter_matrix"](
                     data["properties"]["loss"],
                     data["properties"]["reflectivity"],
                     data["properties"]["tuning"],
@@ -1285,7 +1295,9 @@ def build(setup: Setup):
             target_output_index = target_index
 
         # Initialize the carrier matrix with the space propagation entry.
-        space_entry = space(jnp.array([F, data["properties"]["length"], data["properties"]["refractive_index"]]))[0]
+        space_entry = _NUMPY_COMPONENTS["space"](
+            np.array([F, data["properties"]["length"], data["properties"]["refractive_index"]])
+        )[0]
         carrier_matrix[source_input_index, target_output_index] = space_entry
         carrier_matrix[target_input_index, source_output_index] = space_entry
 
@@ -1413,30 +1425,30 @@ def build(setup: Setup):
     # Convert linked parameter names to parameter index positions.
     linked_indices = [parameter_names.index(name) for name in linked_names]
     if len(linked_indices) == 0:
-        linked_indices = [0]
-        indices_to_link = [0]
-        LINKING_FUNCTIONS.append(lambda x: x)
-        linking_function_indices = [0]
+        # No linking: empty index arrays (the shape tells `simulate` that no linking is needed).
+        # Keep one identity function registered so `lax.switch` always has a branch.
+        if len(LINKING_FUNCTIONS) == 0:
+            LINKING_FUNCTIONS.append(lambda x: x)
 
     return (
         (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
         (
-            jnp.array([parameters], dtype=complex),
-            jnp.array(carrier_matrix),
-            jnp.array(signal_matrix),
-            jnp.array(noise_matrix, dtype=complex),
-            jnp.array(noise_selection_vectors, dtype=complex),
-            jnp.array(qhd_parameter_indices, dtype=int),
-            jnp.array(qhd_placing_indices, dtype=int),
-            jnp.array(linked_indices, dtype=int),
-            jnp.array(linking_function_indices, dtype=int),
-            jnp.array(indices_to_link, dtype=int),
+            _device_array([parameters], dtype=complex),
+            _device_array(carrier_matrix),
+            _device_array(signal_matrix),
+            _device_array(noise_matrix, dtype=complex),
+            _device_array(noise_selection_vectors, dtype=complex),
+            _device_array(qhd_parameter_indices, dtype=int),
+            _device_array(qhd_placing_indices, dtype=int),
+            _device_array(linked_indices, dtype=int),
+            _device_array(linking_function_indices, dtype=int),
+            _device_array(indices_to_link, dtype=int),
         ),
         (
-            jnp.array(detector_indices, dtype=int),
-            jnp.array(mirror_indices, dtype=int),
-            jnp.array(beamsplitter_indices, dtype=int),
-            jnp.array(isolator_indices, dtype=int),
+            _device_array(detector_indices, dtype=int),
+            _device_array(mirror_indices, dtype=int),
+            _device_array(beamsplitter_indices, dtype=int),
+            _device_array(isolator_indices, dtype=int),
             port_to_index,
         ),
     )
@@ -1634,10 +1646,10 @@ def pairs_to_arrays(
         if len(arrays["function_input_indices"]) == 0:
             # Dummy update that leaves matrices unchanged.
             return (
-                jnp.array([[0, 0, 0]]),
-                jnp.array([FUNCTIONS.index(dummy_function)]),
-                jnp.array([[0], [0]]),
-                jnp.array([[0], [0]]),
+                _device_array([[0, 0, 0]]),
+                _device_array([FUNCTIONS.index(dummy_function)]),
+                _device_array([[0], [0]]),
+                _device_array([[0], [0]]),
             )
 
         function_input_indices = np.vstack(arrays["function_input_indices"])
@@ -1656,27 +1668,27 @@ def pairs_to_arrays(
                 )
 
             return (
-                jnp.array(function_input_indices, dtype=int),
-                jnp.array(arrays["function_indices"], dtype=int),
-                jnp.array(output_indices, dtype=int),
-                jnp.array(system_matrix_indices, dtype=int),
-                jnp.array(carrier_solution_indices, dtype=int),
-                jnp.array(carrier_solution_placing_indices, dtype=int),
+                _device_array(function_input_indices, dtype=int),
+                _device_array(arrays["function_indices"], dtype=int),
+                _device_array(output_indices, dtype=int),
+                _device_array(system_matrix_indices, dtype=int),
+                _device_array(carrier_solution_indices, dtype=int),
+                _device_array(carrier_solution_placing_indices, dtype=int),
             )
 
         return (
-            jnp.array(function_input_indices, dtype=int),
-            jnp.array(arrays["function_indices"], dtype=int),
-            jnp.array(output_indices, dtype=int),
-            jnp.array(system_matrix_indices, dtype=int),
+            _device_array(function_input_indices, dtype=int),
+            _device_array(arrays["function_indices"], dtype=int),
+            _device_array(output_indices, dtype=int),
+            _device_array(system_matrix_indices, dtype=int),
         )
 
     return (
         (
-            jnp.array(optimized_parameter_indices, dtype=int),
-            jnp.array(optimization_value_indices, dtype=int),
-            jnp.array(carrier_changing_parameter_indices, dtype=int),
-            jnp.array(signal_changing_parameter_indices, dtype=int),
+            _device_array(optimized_parameter_indices, dtype=int),
+            _device_array(optimization_value_indices, dtype=int),
+            _device_array(carrier_changing_parameter_indices, dtype=int),
+            _device_array(signal_changing_parameter_indices, dtype=int),
         ),
         combine_arrays(carrier_arrays),
         combine_arrays(signal_arrays, signal=True),
@@ -1728,13 +1740,17 @@ def prepare_arrays(
         If both carrier and signal changing indices are non-empty (unsupported combination),
         or if `changing_values` has an incompatible shape.
     """
+    # Host-side NumPy throughout: eager jax.numpy indexing would compile per operation.
+    parameters = np.asarray(parameters)
+    if changing_values is not None:
+        changing_values = np.asarray(changing_values)
     optimized_parameters = None
 
     # Ensure at least one optimized parameter index exists, using a dummy identity update if needed.
     if len(optimized_parameter_indices) == 0:
-        optimized_parameter_indices = jnp.array([0])
-        optimized_parameters = jnp.array(parameters[0][optimized_parameter_indices])
-        optimized_value_indices = jnp.array([0])
+        optimized_parameter_indices = np.array([0])
+        optimized_parameters = np.array(parameters[0][optimized_parameter_indices])
+        optimized_value_indices = np.array([0])
 
     # Normalize changing_values to shape (V, R) if provided.
     if changing_values is not None:
@@ -1747,8 +1763,8 @@ def prepare_arrays(
 
     # Carrier changing defaults.
     if len(carrier_changing_parameter_indices) == 0:
-        carrier_changing_parameter_indices = jnp.array([0])
-        carrier_changing_values = jnp.array([parameters[0][carrier_changing_parameter_indices]])
+        carrier_changing_parameter_indices = np.array([0])
+        carrier_changing_values = np.array([parameters[0][carrier_changing_parameter_indices]])
     else:
         carrier_changing_values = changing_values
         if carrier_changing_values.shape[0] != len(carrier_changing_parameter_indices):
@@ -1763,17 +1779,21 @@ def prepare_arrays(
 
     # Signal changing defaults.
     if len(signal_changing_parameter_indices) == 0:
-        signal_changing_parameter_indices = jnp.array([0])
-        signal_changing_values = jnp.array([parameters[0][signal_changing_parameter_indices]])
+        signal_changing_parameter_indices = np.array([0])
+        signal_changing_values = np.array([parameters[0][signal_changing_parameter_indices]])
 
-    return (
-        optimized_parameters,
-        optimized_parameter_indices,
-        optimized_value_indices,
-        carrier_changing_parameter_indices,
-        carrier_changing_values,
-        signal_changing_parameter_indices,
-        signal_changing_values,
+    as_jax = lambda array: None if array is None else _device_array(array)
+    return tuple(
+        as_jax(array)
+        for array in (
+            optimized_parameters,
+            optimized_parameter_indices,
+            optimized_value_indices,
+            carrier_changing_parameter_indices,
+            carrier_changing_values,
+            signal_changing_parameter_indices,
+            signal_changing_values,
+        )
     )
 
 
