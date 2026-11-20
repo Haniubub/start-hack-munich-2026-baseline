@@ -34,6 +34,8 @@ import differometor.components as components
 from differometor.components import UNIT_VACUUM, H_PLANCK, F0
 
 NOISE_SCALE = UNIT_VACUUM * H_PLANCK * F0 * 0.25
+# Columns of the detector basis Z = S^-T [e_d] kept per frequency (upper + lower sideband of one port).
+DETECTOR_WIDTH = 2
 
 
 # ---------------------------------------------------------------------
@@ -168,38 +170,72 @@ def _evaluate(function_index, inputs):
     return values, jacobian
 
 
-class _EntryBlock:
-    """One group of matrix entries (carrier, signal or noise) produced by component functions."""
+def _evaluate_values(function_index, inputs):
+    """Values only (no derivatives): inputs (..., rows, k) -> (..., rows, 4)."""
+    outputs = FUNCTIONS_NUMPY[function_index]([inputs[..., j] for j in range(inputs.shape[-1])])
+    values = np.empty(inputs.shape[:-1] + (4,), complex)
+    for o, item in enumerate(outputs):
+        values[..., o] = item
+    return values
 
-    def __init__(self, function_input_indices, function_indices, output_indices):
+
+class _EntryBlock:
+    """One group of matrix entries (carrier, signal or noise) produced by component functions.
+
+    `changing` lists the parameter columns that differ between the rows (the frequency sweep).
+    Calls that read none of them give the same entries in every row and are evaluated once.
+    """
+
+    def __init__(self, function_input_indices, function_indices, output_indices, changing=()):
         self.inputs = np.asarray(function_input_indices)
         function_indices = np.asarray(function_indices)
         self.outputs = np.asarray(output_indices)
-        self.groups = [(int(k), np.nonzero(function_indices == k)[0]) for k in np.unique(function_indices)]
+        calls = self.inputs.shape[0]
+        self.varying = np.isin(self.inputs, np.asarray(changing, int)).any(axis=1)
+        self.groups = []  # (function index, members, varying) with members sorted by call
+        for k in np.unique(function_indices):
+            for varying in (True, False):
+                members = np.nonzero((function_indices == k) & (self.varying == varying))[0]
+                if members.size:
+                    self.groups.append((int(k), members, varying))
+        # Scatter from entries to (call, output) slots; several entries may share a slot.
+        flat = self.outputs[0] * 4 + self.outputs[1]
+        self.scatter = sp.csr_matrix((np.ones(flat.size), (np.arange(flat.size), flat)), shape=(flat.size, calls * 4))
+
+    def _gather(self, values):
+        return values[:, self.outputs[0], self.outputs[1]]
+
+    def values(self, parameters):
+        """parameters: (R, P) -> entries (R, E), no derivatives."""
+        rows, calls = parameters.shape[0], self.inputs.shape[0]
+        values = np.empty((rows, calls, 4), complex)
+        for function_index, members, varying in self.groups:
+            source = parameters if varying else parameters[:1]
+            values[:, members] = _evaluate_values(function_index, source[:, self.inputs[members]])
+        return self._gather(values)
 
     def run(self, parameters):
         """parameters: (R, P). Returns entries (R, E) and the Jacobian tape for the reverse pass."""
         rows, calls, width = parameters.shape[0], self.inputs.shape[0], self.inputs.shape[1]
         values = np.empty((rows, calls, 4), complex)
-        jacobian = np.empty((rows, calls, 4, width), complex)
-        for function_index, members in self.groups:
-            values[:, members], jacobian[:, members] = _evaluate(function_index, parameters[:, self.inputs[members]])
-        return values[:, self.outputs[0], self.outputs[1]], jacobian
+        tape = []
+        for function_index, members, varying in self.groups:
+            source = parameters if varying else parameters[:1]
+            values[:, members], jacobian = _evaluate(function_index, source[:, self.inputs[members]])
+            tape.append(jacobian)
+        return self._gather(values), tape
 
-    def back(self, jacobian, entries_bar, parameter_count):
-        """entries_bar: (R, E) -> real parameter cotangent (R, P)."""
-        rows, calls = jacobian.shape[:2]
-        flat = self.outputs[0] * 4 + self.outputs[1]
-        outputs_bar = np.zeros((rows, calls * 4), complex)
-        for r in range(rows):
-            outputs_bar[r] = np.bincount(flat, entries_bar[r].real, calls * 4) + 1j * np.bincount(
-                flat, entries_bar[r].imag, calls * 4
-            )
-        inputs_bar = np.einsum("rco,rcoj->rcj", outputs_bar.reshape(rows, calls, 4), jacobian).real
-        parameters_bar = np.zeros((rows, parameter_count))
-        columns = self.inputs.ravel()
-        for r in range(rows):
-            parameters_bar[r] = np.bincount(columns, inputs_bar[r].ravel(), parameter_count)
+    def back(self, tape, entries_bar, parameter_count):
+        """entries_bar: (R, E) -> real parameter cotangent summed over the rows (P,)."""
+        rows, calls = entries_bar.shape[0], self.inputs.shape[0]
+        outputs_bar = np.asarray(self.scatter.T @ entries_bar.T).T.reshape(rows, calls, 4)
+        parameters_bar = np.zeros(parameter_count)
+        for (function_index, members, varying), jacobian in zip(self.groups, tape):
+            if varying:
+                inputs_bar = np.einsum("rco,rcoj->cj", outputs_bar[:, members], jacobian).real
+            else:  # identical Jacobian in every row
+                inputs_bar = np.einsum("co,coj->cj", outputs_bar[:, members].sum(0), jacobian[0]).real
+            parameters_bar += np.bincount(self.inputs[members].ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
 
@@ -220,30 +256,40 @@ class EntryPlan:
         for values in (self.carrier_changing_values, self.signal_changing_values):
             if np.any(np.imag(values) != 0):
                 raise ValueError("fast path requires real changing values")
+        changing = self.signal_changing_indices
         self.carrier = _EntryBlock(A["carrier_function_input_indices"], A["carrier_function_indices"], A["carrier_output_indices"])
-        self.signal = _EntryBlock(A["signal_function_input_indices"], A["signal_function_indices"], A["signal_output_indices"])
-        self.noise = _EntryBlock(A["noise_function_input_indices"], A["noise_function_indices"], A["noise_output_indices"])
+        self.signal = _EntryBlock(A["signal_function_input_indices"], A["signal_function_indices"], A["signal_output_indices"], changing)
+        self.noise = _EntryBlock(A["noise_function_input_indices"], A["noise_function_indices"], A["noise_output_indices"], changing)
 
-    def entries(self, optimized_parameters):
+    def _rows(self, optimized_parameters):
         P = self.base.copy()
         P[self.optimized_parameter_indices] = np.asarray(optimized_parameters, float)[self.optimized_value_indices]
         carrier_rows = np.tile(P, (self.carrier_changing_values.shape[1], 1))
         carrier_rows[:, self.carrier_changing_indices] = np.real(self.carrier_changing_values).T
         signal_rows = np.tile(carrier_rows[0], (self.signal_changing_values.shape[1], 1))
         signal_rows[:, self.signal_changing_indices] = np.real(self.signal_changing_values).T
-        carrier, carrier_jacobian = self.carrier.run(carrier_rows[:1])
-        signal, signal_jacobian = self.signal.run(signal_rows)
-        noise, noise_jacobian = self.noise.run(signal_rows)
-        return (carrier[0], signal, noise), (carrier_jacobian, signal_jacobian, noise_jacobian)
+        return carrier_rows[:1], signal_rows
+
+    def values(self, optimized_parameters):
+        """Carrier, signal and noise entries without derivatives (forward pass)."""
+        carrier_rows, signal_rows = self._rows(optimized_parameters)
+        return self.carrier.values(carrier_rows)[0], self.signal.values(signal_rows), self.noise.values(signal_rows)
+
+    def entries(self, optimized_parameters):
+        carrier_rows, signal_rows = self._rows(optimized_parameters)
+        carrier, carrier_tape = self.carrier.run(carrier_rows)
+        signal, signal_tape = self.signal.run(signal_rows)
+        noise, noise_tape = self.noise.run(signal_rows)
+        return (carrier[0], signal, noise), (carrier_tape, signal_tape, noise_tape)
 
     def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count):
-        carrier_jacobian, signal_jacobian, noise_jacobian = tape
+        carrier_tape, signal_tape, noise_tape = tape
         parameter_count = self.base.size
-        signal_rows_bar = self.signal.back(signal_jacobian, signal_bar, parameter_count) + self.noise.back(
-            noise_jacobian, noise_bar, parameter_count
+        signal_rows_bar = self.signal.back(signal_tape, signal_bar, parameter_count) + self.noise.back(
+            noise_tape, noise_bar, parameter_count
         )
-        signal_rows_bar[:, self.signal_changing_indices] = 0.0  # overwritten by the sweep values
-        P_bar = self.carrier.back(carrier_jacobian, carrier_bar[None], parameter_count)[0] + signal_rows_bar.sum(0)
+        signal_rows_bar[self.signal_changing_indices] = 0.0  # overwritten by the sweep values
+        P_bar = self.carrier.back(carrier_tape, carrier_bar[None], parameter_count) + signal_rows_bar
         P_bar[self.carrier_changing_indices] = 0.0
         return np.bincount(self.optimized_value_indices, P_bar[self.optimized_parameter_indices], value_count)
 
@@ -320,6 +366,11 @@ class SystemPlan:
         self.noise_cols = np.concatenate([base_cols, nmi[1][self.noise_live]])
         self.noise_base = noise_base[base_rows, base_cols]
         self.selection = get("noise_selection_vectors")[0, 0]
+        # Rows the quantum noise detector reads. When they fit into DETECTOR_WIDTH, the forward pass
+        # solves S^T z = e_d for each of them; Y and the signal adjoint are then combinations of z.
+        self.detector = np.nonzero(self.selection)[0]
+        self.use_basis = 0 < self.detector.size <= DETECTOR_WIDTH
+        self.order = None
 
     def carrier_matrix(self, carrier_entries):
         n = self.n
@@ -339,9 +390,22 @@ class SystemPlan:
         V[:, self.conjugated] = np.conj(V[:, self.conjugated])
         return V, pre
 
+    def _set_order(self, values_row):
+        """Column order from COLAMD on one matrix, reused for all frequencies (shared pattern)."""
+        first = sp.csc_matrix((values_row[self.in_matrix], self.matrix_rows, self.matrix_ptr), shape=(self.m, self.m))
+        order = np.argsort(spl.splu(first).perm_c)
+        counts = np.diff(self.matrix_ptr)[order]
+        self.ordered_ptr = np.concatenate([[0], np.cumsum(counts)])
+        gather = np.repeat(self.matrix_ptr[order] - self.ordered_ptr[:-1], counts) + np.arange(self.ordered_ptr[-1])
+        self.ordered_rows = self.matrix_rows[gather]
+        self.ordered_values = np.nonzero(self.in_matrix)[0][gather]
+        self.order = order
+
     def signal_lu(self, values_row):
-        A = sp.csc_matrix((values_row[self.in_matrix], self.matrix_rows, self.matrix_ptr), shape=(self.m, self.m))
-        return spl.splu(A)
+        if self.order is None:
+            self._set_order(values_row)
+        B = sp.csc_matrix((values_row[self.ordered_values], self.ordered_rows, self.ordered_ptr), shape=(self.m, self.m))
+        return _OrderedLU(spl.splu(B, permc_spec="NATURAL"), self.order)
 
     def noise_values(self, noise_entries):
         F = noise_entries.shape[0]
@@ -356,6 +420,21 @@ class SystemPlan:
         return w
 
 
+class _OrderedLU:
+    """LU of B = A[:, order]; solves with A, A^T and A^H."""
+
+    def __init__(self, lu, order):
+        self.lu, self.order = lu, order
+
+    def solve(self, b, trans="N"):
+        if trans == "N":
+            y = self.lu.solve(b)
+            x = np.empty_like(y)
+            x[self.order] = y
+            return x
+        return self.lu.solve(b[self.order], trans=trans)
+
+
 def _matvec(rows, cols, values, vector, size):
     """y = A x for a sparse matrix given as (rows, cols, values)."""
     product = values * vector[cols]
@@ -363,7 +442,12 @@ def _matvec(rows, cols, values, vector, size):
 
 
 def forward(plan, carrier_entries, signal_entries, noise_entries):
-    """Carrier, signal and noise outputs plus the adjoint helpers Y = S^-H w and MU."""
+    """Carrier, signal and noise outputs plus the adjoint helpers Y = S^-H w, MU and Z.
+
+    Z[f] = S_f^-T [e_d for d in plan.detector] (zero-padded to DETECTOR_WIDTH columns). It gives
+    Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
+    second factorization, whenever the cotangent of the signal lives on the detector rows.
+    """
     m = plan.m
     carrier_matrix, carrier_rhs = plan.carrier_matrix(carrier_entries)
     carrier = spl.splu(carrier_matrix).solve(carrier_rhs)
@@ -376,21 +460,43 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     X = np.empty((F, m), complex)
     Y = np.empty((F, m), complex)
     MU = np.empty((F, m), complex)
+    Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
     power = np.empty(F)
+    d, k = plan.detector, plan.detector.size
+    basis = np.zeros((m, k), complex)
+    basis[d, np.arange(k)] = 1.0
+    w_d = np.conj(w[d])
     for f in range(F):
         lu = plan.signal_lu(V[f])
         X[f] = lu.solve(rhs[f])
-        y = lu.solve(w, trans="H")
+        if plan.use_basis:
+            z = lu.solve(basis, trans="T")
+            Z[f, :, :k] = z
+            y = np.conj(z @ w_d)
+        else:
+            y = lu.solve(w, trans="H")
         q = _matvec(plan.noise_rows, plan.noise_cols, N[f], y, m)  # N y
         qh = _matvec(plan.noise_cols, plan.noise_rows, np.conj(N[f]), y, m)  # N^H y
         power[f] = (np.conj(y) @ q).real
         MU[f] = lu.solve(0.5 * (q + qh))
         Y[f] = y
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, X, noise, Y, MU
+    return carrier, X, noise, Y, MU, Z
 
 
-def backward(plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, carrier_bar, signal_bar, noise_bar):
+def _signal_adjoint(plan, V, Z, signal_bar):
+    """lam_f = S_f^-T signal_bar_f for every frequency, shape (F, m)."""
+    support = np.nonzero(np.any(signal_bar != 0, axis=0))[0]
+    d, k = plan.detector, plan.detector.size
+    if plan.use_basis and np.isin(support, d).all():
+        return np.einsum("fmk,fk->fm", Z[:, :, :k], signal_bar[:, d])
+    lam = np.empty(signal_bar.shape, complex)
+    for f in range(V.shape[0]):
+        lam[f] = plan.signal_lu(V[f]).solve(signal_bar[f].astype(complex), trans="T")
+    return lam
+
+
+def backward(plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar):
     """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention)."""
     n, m = plan.n, plan.m
     carrier_matrix, _ = plan.carrier_matrix(carrier_entries)
@@ -398,15 +504,12 @@ def backward(plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, ca
     F = V.shape[0]
     carrier_bar = carrier_bar.astype(complex).copy()
     V_bar = np.empty((F, plan.size), complex)
-    w_bar = np.zeros(m, complex)
     g = noise_bar * NOISE_SCALE / noise  # d noise / d power
     rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
-    for f in range(F):
-        lu = plan.signal_lu(V[f])
-        lam = lu.solve(signal_bar[f].astype(complex), trans="T")
-        V_bar[f, plan.in_matrix] = -lam[rows] * X[f, cols] - 2 * g[f] * np.conj(Y[f, rows]) * MU[f, cols]
-        V_bar[f, ~plan.in_matrix] = lam[plan.rhs_rows]
-        w_bar += 2 * g[f] * np.conj(MU[f])
+    lam = _signal_adjoint(plan, V, Z, signal_bar)
+    V_bar[:, plan.in_matrix] = -lam[:, rows] * X[:, cols] - 2 * g[:, None] * np.conj(Y[:, rows]) * MU[:, cols]
+    V_bar[:, ~plan.in_matrix] = lam[:, plan.rhs_rows]
+    w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
 
     N_bar = g[:, None] * np.conj(Y[:, plan.noise_rows]) * Y[:, plan.noise_cols]
     noise_entries_bar = np.zeros((F, plan.noise_live.size), complex)
@@ -489,15 +592,15 @@ def _output_shapes(arrays):
 
 def _host_forward(optimized_parameters, *host_arrays):
     A = dict(zip(HOST_KEYS, host_arrays))
-    entries, _ = EntryPlan(A).entries(optimized_parameters)
-    carrier, X, noise, Y, MU = forward(SystemPlan(A), *entries)
-    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU
+    entries = EntryPlan(A).values(optimized_parameters)  # derivatives are only taped in the backward pass
+    carrier, X, noise, Y, MU, Z = forward(SystemPlan(A), *entries)
+    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z
 
 
 def _host_backward(optimized_parameters, *rest):
     k = len(HOST_KEYS)
     A = dict(zip(HOST_KEYS, rest[:k]))
-    carrier, signal, noise, Y, MU, carrier_bar, signal_bar, noise_bar = rest[k:]
+    carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
     F = Y.shape[0]
     entry_plan = EntryPlan(A)
     (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
@@ -510,6 +613,7 @@ def _host_backward(optimized_parameters, *rest):
         np.asarray(noise).reshape(F),
         np.asarray(Y),
         np.asarray(MU),
+        np.asarray(Z),
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar).T,
         np.asarray(noise_bar, float).reshape(F),
@@ -526,11 +630,12 @@ def _forward_callback(optimized_parameters, host):
         jax.ShapeDtypeStruct((F,), jnp.float64),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
+        jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
     )
-    carrier, signal, noise, Y, MU = jax.pure_callback(
+    carrier, signal, noise, Y, MU, Z = jax.pure_callback(
         _host_forward, result_shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), vmap_method="sequential"
     )
-    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU)
+    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU, Z)
 
 
 def _is_primal(x):
@@ -561,15 +666,15 @@ def _fast_fwd(optimized_parameters, host, others):
         full = lambda p, host, others: simulate_jax(optimized_parameters=p, **host, **others)
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
-    outputs, (Y, MU) = _forward_callback(p, host)
-    return outputs, (p, host, outputs, Y, MU)
+    outputs, (Y, MU, Z) = _forward_callback(p, host)
+    return outputs, (p, host, outputs, Y, MU, Z)
 
 
 def _fast_bwd(residuals, cotangents):
     cotangents = tuple(_zeros_if_symbolic(c) for c in cotangents)
     if len(residuals) == 1:
         return residuals[0](cotangents)
-    p, host, (carrier, signal, noise), Y, MU = residuals
+    p, host, (carrier, signal, noise), Y, MU, Z = residuals
     gradient = jax.pure_callback(
         _host_backward,
         jax.ShapeDtypeStruct(p.shape, p.dtype),
@@ -580,6 +685,7 @@ def _fast_bwd(residuals, cotangents):
         noise,
         Y,
         MU,
+        Z,
         *cotangents,
         vmap_method="sequential",
     )
