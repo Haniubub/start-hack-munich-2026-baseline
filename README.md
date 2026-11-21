@@ -1,3 +1,21 @@
+# start-hack-munich-2026-baseline — Control Command Elite
+
+> Pristine, unmodified reference copy of the Feyer "Faster Physics" challenge
+> (START Hack Munich 2026) — kept by **Team Control Command Elite**.
+
+- Source: `feyerlabs/start-hack-munich-2026` @ `main` (`2bb437a`)
+- This is the original dense-JAX Differometor kit — **no optimizations**.
+- Benchmark: `benchmark.py --cpus 1` → first-run total ≈ **44.2 s** on the jury
+  CPU (Intel Xeon Platinum 8468, 1 logical CPU).
+- Purpose: clean baseline for comparison / reproduction only. All speed-up work
+  lives in the team repo `mpb700/fayer-muc`.
+
+> ⚠️ Upstream `main` clarifies that the final evaluation runs on a **different
+> optical setup** (new values). Optimizations must therefore be value-independent,
+> not tuned to `uifo_800_3000`.
+
+---
+
 # Faster Physics — START Hack Munich 2026
 
 Make **Differometor** faster for general optical setups while preserving its physical predictions and gradients.
