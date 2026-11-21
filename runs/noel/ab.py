@@ -1,6 +1,10 @@
 """Alternate fresh benchmark runs of several repos and compare first-run phases.
 
 Usage: python runs/noel/ab.py N label1=repo1 label2=repo2 ...
+
+The repos must be in the same bytecode state. A `differometor/__pycache__` in only one of them
+makes its import phase several milliseconds faster (compiling `fast.py` and `build.py` takes about
+4 ms each), so the script stops when the states differ. Remove the folders or create them in all.
 """
 import json, os, statistics, subprocess, sys
 from pathlib import Path
@@ -16,6 +20,9 @@ groups = {
     "compile": ["forward_lower", "forward_compile", "sensitivity_lower", "sensitivity_compile", "gradient_lower", "gradient_compile"],
     "forward": ["forward"], "gradient": ["gradient", "sensitivity", "host_transfer"],
 }
+cached = {label: sorted(p.name for p in (Path(repo).resolve() / "differometor" / "__pycache__").glob("*.pyc")) for label, repo in variants}
+if len({tuple(names) for names in cached.values()}) > 1:
+    sys.exit(f"different bytecode caches in differometor/__pycache__, the import phases would not be comparable: {cached}")
 data = {label: [] for label, _ in variants}
 warm = {label: [] for label, _ in variants}
 errs = {label: [] for label, _ in variants}
