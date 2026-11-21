@@ -1,7 +1,7 @@
 # start-hack-munich-2026-baseline — Control Command Elite
 
 > Pristine, unmodified reference copy of the Feyer "Faster Physics" challenge
-> (START Hack Munich 2026) — kept by **Team Control Command Elite**.
+> (START Hack Munich 2026) — kept by **Team Control Command Elite** (a.k.a. **Unslopped**).
 
 - Source: `feyerlabs/start-hack-munich-2026` @ `main` (`2bb437a`)
 - This is the original dense-JAX Differometor kit — **no optimizations**.
