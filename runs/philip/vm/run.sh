@@ -16,7 +16,7 @@ PY="${PY:-}"
 
 if [ -z "$PY" ]; then
   for candidate in "$HOME/fayer-muc/.venv/bin/python" "$HOME/nacht-bench-venv/bin/python"; do
-    if [ -x "$candidate" ] && "$candidate" -c "import jax, scipy, matplotlib" >/dev/null 2>&1; then
+    if [ -x "$candidate" ] && "$candidate" -c "import jax, scipy, matplotlib, importlib.metadata as m; m.version('differometor')" >/dev/null 2>&1; then
       PY="$candidate"
       break
     fi
@@ -24,9 +24,18 @@ if [ -z "$PY" ]; then
 fi
 if [ -z "$PY" ]; then
   echo "Kein fertiges venv gefunden, lege ~/nacht-bench-venv mit den festen Versionen an (dauert ein, zwei Minuten) ..."
-  python3 -m venv "$HOME/nacht-bench-venv"
+  if ! python3 -m venv "$HOME/nacht-bench-venv" >/dev/null 2>&1; then
+    # Frische Ubuntu-Images haben python3-venv nicht dabei.
+    echo "python3-venv fehlt, installiere es mit apt (sudo) ..."
+    sudo -n apt-get update -qq
+    sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-pip
+    rm -rf "$HOME/nacht-bench-venv"
+    python3 -m venv "$HOME/nacht-bench-venv"
+  fi
   "$HOME/nacht-bench-venv/bin/python" -m pip install -q --upgrade pip
   "$HOME/nacht-bench-venv/bin/python" -m pip install -q -r "$FIRST/requirements.txt"
+  # benchmark.py liest die Version der installierten Distribution; importiert wird trotzdem der jeweilige Stand.
+  "$HOME/nacht-bench-venv/bin/python" -m pip install -q --no-deps -e "$FIRST"
   PY="$HOME/nacht-bench-venv/bin/python"
 fi
 
