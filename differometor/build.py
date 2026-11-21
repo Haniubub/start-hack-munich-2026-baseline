@@ -126,6 +126,58 @@ Notes
 """
 
 
+def _sideband_layout(row_indices: np.ndarray, column_indices: np.ndarray, system_size: int, companions: tuple) -> tuple:
+    """
+    Matrix positions of one instruction set in the two-sideband layout of the signal and noise matrix.
+
+    `row_indices` and `column_indices` address a system with one carrier-sized block
+    `[0, system_size)` followed by the signal block. In the signal and noise matrix the carrier
+    block exists twice (upper and lower sideband), so:
+
+    - Positions in the signal block move up by `system_size`. This shift is applied to the two
+      given arrays in place.
+    - Every entry that touches the carrier block is needed a second time for the lower sideband,
+      at `(row + system_size, column + system_size)` of its original position. These copies are
+      appended in three groups: entries with only the row in the carrier block, entries with only
+      the column in it, entries with both.
+
+    Returns new arrays `(row_indices, column_indices, companions)` with the shifted entries
+    followed by the copies. `companions` are arrays with one value per entry that are copied
+    along (`None` stays `None`).
+
+    The entries are few, so plain Python lists are used here: this runs several hundred times per
+    build, and one NumPy call costs as much as the whole list operation.
+    """
+    rows, columns = row_indices.tolist(), column_indices.tolist()
+    in_block_rows = [row < system_size for row in rows]
+    in_block_columns = [column < system_size for column in columns]
+    if not all(in_block_columns):
+        column_indices[[not inside for inside in in_block_columns]] += system_size
+    if not all(in_block_rows):
+        row_indices[[not inside for inside in in_block_rows]] += system_size
+    rows, columns = row_indices.tolist(), column_indices.tolist()
+
+    entries = range(len(rows))
+    copied = (
+        [i for i in entries if in_block_rows[i] and not in_block_columns[i]]
+        + [i for i in entries if in_block_columns[i] and not in_block_rows[i]]
+        + [i for i in entries if in_block_rows[i] and in_block_columns[i]]
+    )
+    new_rows = rows + [rows[i] + system_size if in_block_rows[i] else rows[i] for i in copied]
+    new_columns = columns + [columns[i] + system_size if in_block_columns[i] else columns[i] for i in copied]
+    new_companions = []
+    for companion in companions:
+        if companion is not None:
+            values = companion.tolist()
+            companion = np.array(values + [values[i] for i in copied], dtype=companion.dtype)
+        new_companions.append(companion)
+    return (
+        np.array(new_rows, dtype=row_indices.dtype),
+        np.array(new_columns, dtype=column_indices.dtype),
+        new_companions,
+    )
+
+
 def set_instructions(
     instructions: dict,
     node: str,
@@ -190,11 +242,9 @@ def set_instructions(
 
     # Standardize function input length to 7 by padding with placeholder zeros.
     if function_input_indices.shape[1] < function_input_indices_shape:
-        pad_width = function_input_indices_shape - function_input_indices.shape[1]
-        function_input_indices = np.concatenate(
-            [function_input_indices, np.zeros((function_input_indices.shape[0], pad_width))],
-            axis=1,
-        )
+        padded = np.zeros((function_input_indices.shape[0], function_input_indices_shape))
+        padded[:, : function_input_indices.shape[1]] = function_input_indices
+        function_input_indices = padded
 
     assert (
         function_input_indices.shape[1] == function_input_indices_shape
@@ -220,149 +270,18 @@ def set_instructions(
         # appropriately to also exist in the second sideband block. Entries that already live
         # in the appended signal block must be shifted because the carrier block is duplicated.
 
-        only_row_mask = (system_matrix_row_indices < system_size_for_sidebands) & (
-            system_matrix_column_indices >= system_size_for_sidebands
+        system_matrix_row_indices, system_matrix_column_indices, (output_column_indices, output_row_indices) = _sideband_layout(
+            system_matrix_row_indices,
+            system_matrix_column_indices,
+            system_size_for_sidebands,
+            (output_column_indices, output_row_indices),
         )
-        only_column_mask = (system_matrix_column_indices < system_size_for_sidebands) & (
-            system_matrix_row_indices >= system_size_for_sidebands
-        )
-        row_and_column_mask = (system_matrix_row_indices < system_size_for_sidebands) & (
-            system_matrix_column_indices < system_size_for_sidebands
-        )
-        pure_signal_mask = (system_matrix_row_indices >= system_size_for_sidebands) & (
-            system_matrix_column_indices >= system_size_for_sidebands
-        )
-
-        # Shift indices for entries that belong to the appended signal block.
-        system_matrix_column_indices[pure_signal_mask] += system_size_for_sidebands
-        system_matrix_row_indices[pure_signal_mask] += system_size_for_sidebands
-
-        # Shift the side that references the appended signal block in mixed entries.
-        system_matrix_column_indices[only_row_mask] += system_size_for_sidebands
-        system_matrix_row_indices[only_column_mask] += system_size_for_sidebands
-
-        new_system_matrix_row_indices = system_matrix_row_indices.copy()
-        new_system_matrix_column_indices = system_matrix_column_indices.copy()
-        new_output_column_indices = output_column_indices.copy()
-        new_output_row_indices = output_row_indices.copy() if output_row_indices is not None else None
-
-        # Duplicate entries for the second sideband where needed.
-        if only_row_mask.any():
-            new_system_matrix_row_indices = np.concatenate(
-                [new_system_matrix_row_indices, system_matrix_row_indices[only_row_mask] + system_size_for_sidebands]
-            )
-            new_system_matrix_column_indices = np.concatenate(
-                [new_system_matrix_column_indices, system_matrix_column_indices[only_row_mask]]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[only_row_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[only_row_mask]])
-
-        if only_column_mask.any():
-            new_system_matrix_column_indices = np.concatenate(
-                [
-                    new_system_matrix_column_indices,
-                    system_matrix_column_indices[only_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_system_matrix_row_indices = np.concatenate(
-                [new_system_matrix_row_indices, system_matrix_row_indices[only_column_mask]]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[only_column_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[only_column_mask]])
-
-        if row_and_column_mask.any():
-            new_system_matrix_column_indices = np.concatenate(
-                [
-                    new_system_matrix_column_indices,
-                    system_matrix_column_indices[row_and_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_system_matrix_row_indices = np.concatenate(
-                [
-                    new_system_matrix_row_indices,
-                    system_matrix_row_indices[row_and_column_mask] + system_size_for_sidebands,
-                ]
-            )
-            new_output_column_indices = np.concatenate(
-                [new_output_column_indices, output_column_indices[row_and_column_mask]]
-            )
-            if output_row_indices is not None:
-                new_output_row_indices = np.concatenate([new_output_row_indices, output_row_indices[row_and_column_mask]])
-
-        output_column_indices = new_output_column_indices
-        output_row_indices = new_output_row_indices
-        system_matrix_row_indices = new_system_matrix_row_indices
-        system_matrix_column_indices = new_system_matrix_column_indices
 
         # Apply the same duplication and shifting logic to carrier-index instructions.
         if carrier_indices is not None:
-            only_row_mask = (carrier_row_indices < system_size_for_sidebands) & (
-                carrier_column_indices >= system_size_for_sidebands
+            carrier_row_indices, carrier_column_indices, (carrier_indices,) = _sideband_layout(
+                carrier_row_indices, carrier_column_indices, system_size_for_sidebands, (carrier_indices,)
             )
-            only_column_mask = (carrier_column_indices < system_size_for_sidebands) & (
-                carrier_row_indices >= system_size_for_sidebands
-            )
-            row_and_column_mask = (carrier_row_indices < system_size_for_sidebands) & (
-                carrier_column_indices < system_size_for_sidebands
-            )
-            pure_signal_mask = (carrier_row_indices >= system_size_for_sidebands) & (
-                carrier_column_indices >= system_size_for_sidebands
-            )
-
-            carrier_column_indices[pure_signal_mask] += system_size_for_sidebands
-            carrier_row_indices[pure_signal_mask] += system_size_for_sidebands
-            carrier_column_indices[only_row_mask] += system_size_for_sidebands
-            carrier_row_indices[only_column_mask] += system_size_for_sidebands
-
-            new_carrier_row_indices = carrier_row_indices.copy()
-            new_carrier_column_indices = carrier_column_indices.copy()
-            new_carrier_indices = carrier_indices.copy()
-
-            if only_row_mask.any():
-                new_carrier_row_indices = np.concatenate(
-                    [new_carrier_row_indices, carrier_row_indices[only_row_mask] + system_size_for_sidebands]
-                )
-                new_carrier_column_indices = np.concatenate(
-                    [new_carrier_column_indices, carrier_column_indices[only_row_mask]]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[only_row_mask]])
-
-            if only_column_mask.any():
-                new_carrier_column_indices = np.concatenate(
-                    [
-                        new_carrier_column_indices,
-                        carrier_column_indices[only_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_row_indices = np.concatenate(
-                    [new_carrier_row_indices, carrier_row_indices[only_column_mask]]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[only_column_mask]])
-
-            if row_and_column_mask.any():
-                new_carrier_column_indices = np.concatenate(
-                    [
-                        new_carrier_column_indices,
-                        carrier_column_indices[row_and_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_row_indices = np.concatenate(
-                    [
-                        new_carrier_row_indices,
-                        carrier_row_indices[row_and_column_mask] + system_size_for_sidebands,
-                    ]
-                )
-                new_carrier_indices = np.concatenate([new_carrier_indices, carrier_indices[row_and_column_mask]])
-
-            carrier_indices = new_carrier_indices
-            carrier_row_indices = new_carrier_row_indices
-            carrier_column_indices = new_carrier_column_indices
 
     assert (
         function_input_indices.shape[1] == function_input_indices_shape
@@ -684,7 +603,7 @@ def build(setup: Setup):
 
     # Carrier matrix: identity on the left block, with a separate right-hand-side column.
     carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
-    np.fill_diagonal(carrier_matrix, 1.0)  # identity block without a dense temporary
+    carrier_matrix.reshape(-1)[: system_size * (system_size + 1) : system_size + 2] = 1.0  # unit diagonal of the left block
 
     # Ensure signal_size is at least 1 to avoid conditional logic later.
     if signal_size == 0:
@@ -1569,10 +1488,10 @@ def pairs_to_arrays(
 
         if "output_row_indices" in instruction:
             signal_arrays["output_row_indices"].append(instruction["output_row_indices"].flatten() + signal_component_number)
-            individual_rows = len(np.unique(instruction["output_row_indices"]))
+            individual_rows = len(set(instruction["output_row_indices"].flatten().tolist()))
             signal_component_number += individual_rows
         else:
-            signal_arrays["output_row_indices"].append(np.ones(len(instruction["output_column_indices"])) * signal_component_number)
+            signal_arrays["output_row_indices"].append(np.full(len(instruction["output_column_indices"]), float(signal_component_number)))
             signal_component_number += 1
 
         signal_arrays["system_matrix_row_indices"].append(instruction["system_matrix_row_indices"])
@@ -1613,7 +1532,7 @@ def pairs_to_arrays(
         arrays["function_indices"].extend(instructions[component]["function_indices"])
         arrays["output_column_indices"].append(instructions[component]["output_column_indices"])
         arrays["output_row_indices"].append(
-            np.ones(len(instructions[component]["output_column_indices"])) * (len(components) - 1)
+            np.full(len(instructions[component]["output_column_indices"]), float(len(components) - 1))
         )
         arrays["system_matrix_row_indices"].append(instructions[component]["system_matrix_row_indices"])
         arrays["system_matrix_column_indices"].append(instructions[component]["system_matrix_column_indices"])
@@ -1622,24 +1541,23 @@ def pairs_to_arrays(
     for component, instruction in noise_instructions.items():
         append_information(noise_instructions, noise_arrays, component, noise_components)
 
+    # First position of every parameter name: what `parameter_names.index` gives, without the
+    # linear search (there is one lookup per optimized parameter).
+    parameter_positions = {}
+    for position, name in enumerate(parameter_names):
+        parameter_positions.setdefault(name, position)
+    signal_component_set = set(signal_components)
+
     # Compile optimized parameter indices and include any carrier-side components that need updating.
     for ix, optimization_pair in enumerate(optimization_pairs):
-        if not isinstance(optimization_pair[0], list):
-            optimized_component, optimized_parameter = optimization_pair
-            try:
-                optimized_parameter_indices.append(parameter_names.index(f"{optimized_component}_{optimized_parameter}"))
+        members = [optimization_pair] if not isinstance(optimization_pair[0], list) else optimization_pair
+        for optimized_component, optimized_parameter in members:
+            position = parameter_positions.get(f"{optimized_component}_{optimized_parameter}")
+            if position is not None:  # unknown names are skipped
+                optimized_parameter_indices.append(position)
                 optimization_value_indices.append(ix)
-            except ValueError:
-                pass
-        else:
-            for optimized_component, optimized_parameter in optimization_pair:
-                try:
-                    optimized_parameter_indices.append(parameter_names.index(f"{optimized_component}_{optimized_parameter}"))
-                    optimization_value_indices.append(ix)
-                except ValueError:
-                    pass
 
-        if optimized_component not in signal_components and optimized_component in parameter_instructions:
+        if optimized_component not in signal_component_set and optimized_component in parameter_instructions:
             append_information(parameter_instructions, carrier_arrays, optimized_component, carrier_components)
 
     # Compile changing parameter indices for sweeps.

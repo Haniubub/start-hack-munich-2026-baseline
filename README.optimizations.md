@@ -151,7 +151,54 @@ Eine Änderung: Der Rückwärtslauf speichert Ableitungen der Komponentenfunktio
 | Apple M4, macOS (16 Läufe im Wechsel) | 0,438 s | **0,436 s** | 10,7 → 9,8 ms | 32,4 → 31,3 ms |
 | Docker, Linux aarch64, `--cpus 1` (12 Läufe im Wechsel) | 0,519 s | **0,515 s** | 16,4 → 14,8 ms | 40,3 → 38,4 ms |
 
-Alle Prüfungen fallen aus wie zuvor. Gemessen und bewusst nicht übernommen wurde eine Bündelung der kleinen Arrays für den Rückwärtslauf: Sie macht den Erstlauf in Docker 3 ms schneller, die warmen Wiederholungen dort aber 6 ms langsamer. Die Einzelheiten stehen in `runs/noel/NOTIZEN.md`.
+Alle Prüfungen fallen aus wie zuvor. Gemessen und in dieser Runde noch nicht übernommen wurde eine Bündelung der kleinen Arrays für den Rückwärtslauf: Sie macht den Erstlauf in Docker 3 ms schneller, die warmen Wiederholungen dort aber 6 ms langsamer. Die Einzelheiten stehen in `runs/noel/NOTIZEN.md`.
+
+## Fünfte Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung, auf Noels Entscheid: Die 22 kleinen Arrays, die der Rückwärtslauf braucht (Index-Arrays, Parameter, Frequenzen), reisen als zwei gepackte Residuen statt einzeln. Der Rückwärts-Callback bekommt 16 statt 36 Argumente.
+
+| Umgebung | Erstlauf ohne Imports | Gradient-Phase | Warm |
+|---|---|---|---|
+| Apple M4, macOS (20 Läufe im Wechsel) | 139,5 → **138,4 ms** | 11,1 → 11,2 ms | 32,8 → 32,5 ms |
+| Docker, Linux aarch64, `--cpus 1` (12 Läufe im Wechsel) | 219,4 → **216,1 ms** | 17,1 → 14,6 ms | 41,6 → 44,8 ms |
+| Docker, zweite Reihe (16 Läufe, Reihenfolge getauscht) | 221,1 → **214,6 ms** | 17,7 → 14,5 ms | 39,7 → 46,6 ms |
+
+Was man dazu wissen muss:
+
+- **In der Gesamtzeit ist der Gewinn nicht nachweisbar.** Die Import-Phase (rund 320 ms, fast alles `import jax`) streut um ±3 ms. Die Gesamtzeiten der drei Reihen: 461,2 → 461,6 ms, 534,7 → 535,3 ms und 548,5 → 535,5 ms. Die Messung lief auf Akku, darum liegen alle Werte rund 5 % höher als in den Runden davor.
+- **Die warmen Wiederholungen werden in Docker 3 bis 7 ms langsamer.** Das ist der bewusst in Kauf genommene Preis: Für die Wertung zählt der Erstlauf.
+- **Der grössere Teil des Gewinns hängt am Speicherlayout.** In Docker fallen im Erstlauf rund 6'000 Seitenfehler weniger an (rund 3,5 ms), dafür in jedem warmen Aufruf mehr. Beides hängt davon ab, wann glibc Speicher ans System zurückgibt, und kann auf einer x86-Maschine anders ausfallen. Sicher übertragbar ist rund 1 ms (weniger Argumente beim Lowering und Kompilieren). Darum sollten beide Stände (`6b67cfd` ohne, `45a2328` mit Bündelung) auf x86 im Wechsel gemessen werden. Nachtrag: Seit der sechsten Runde ist die Bündelung fester Teil des Entwurfs, und ihr Nachteil im Warmlauf ist weg.
+
+Die Ausgaben aller Prüfskripte sind Zeile für Zeile gleich wie zuvor. Neu ist `runs/noel/test_pack.py`: Es prüft, dass das Packen jedes Array exakt wiederherstellt.
+
+## Sechste Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung: Der Build übergibt die drei Systemmatrizen (Träger, Signal, Rauschen) in Koordinatenform statt als dichte Arrays. Dafür gibt es den Typ `differometor.fast.SparseMatrix` (Zeilen und Spalten, Werte, feste Form). Die dichte Signal- und Rauschmatrix belegten im Benchmark-Setup je 9 MB, für 1'539 bzw. 0 konstante Einträge. JAX kopierte beide bei jedem Forward-Aufruf in den Callback.
+
+| Umgebung | Erstlauf gesamt | Forward-Phase | Gradient-Phase | Warm |
+|---|---|---|---|---|
+| Apple M4, macOS (16 Läufe im Wechsel, in der siebten Runde nachgemessen) | 0,446 → **0,445 s** | 27,0 → 24,0 ms | 10,4 → 10,0 ms | 31,6 → 29,8 ms |
+| Docker, Linux aarch64, `--cpus 1` (16 Läufe im Wechsel) | 0,515 → **0,512 s** | 35,1 → 29,7 ms | 13,6 → 13,3 ms | 43,3 → 35,2 ms |
+| Docker, zweite Reihe (12 Läufe, Reihenfolge getauscht) | 0,518 → **0,507 s** | 34,8 → 29,4 ms | 14,0 → 13,1 ms | 43,4 → 35,4 ms |
+
+- **Korrektheit:** Die Benchmark-Ausgaben (Carrier, Signal, Noise, Sensitivity, Powers, Gradient) sind bitgleich zum Stand davor. Die Build-Ausgaben von fünf Setups sind als dichte Arrays identisch. Alle Prüfskripte geben dieselben Zahlen aus. Neu ist `runs/noel/test_sparse.py`.
+- **Was sich an der Schnittstelle ändert:** `arrays["carrier_matrix"]`, `arrays["signal_matrix"]` und `arrays["noise_matrix"]` aus `run_build_step` sind `SparseMatrix`-Objekte. `np.asarray(matrix)` und `matrix.dense()` liefern die dichte Matrix wie bisher. Der Original-JAX-Weg (`simulate_jax`) wandelt sie am Eingang selbst um. Wer `simulate` dichte Matrizen übergibt, bekommt dieselben Resultate über den JAX-Weg.
+- **Nebenwirkung:** Die warmen Wiederholungen in Docker sind jetzt schneller als vor der fünften Runde. Die feste Obergrenze für konstante Einträge im Rückwärtslauf gibt es nicht mehr.
+- **Zurücknehmen:** `git revert 7d12ba7`.
+- **Korrektur:** Die erste Mac-Messung dieser Runde (0,441 → 0,433 s gesamt) war in der Import-Phase um rund 3 ms zugunsten des neuen Stands verfälscht, weil nur im Arbeitsbaum eine `.pyc`-Datei lag. Die Tabelle zeigt die Nachmessung. Auf dem Mac geht der Gewinn von rund 3,5 ms in der Streuung der Import-Phase unter. Die Phasen und die Docker-Reihen waren nicht betroffen.
+
+## Siebte Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung: Der Build-Schritt (`run_build_step`) ist schlanker, bei identischer Ausgabe. Die Funktion `set_instructions` brauchte mehr als die Hälfte der Build-Zeit für die Erweiterung der Matrixpositionen auf zwei Seitenbänder, mit rund 35 kleinen NumPy-Aufrufen pro Aufruf. Diese Erweiterung läuft jetzt auf Python-Listen. Dazu kommen fünf kleinere Stellen.
+
+| Umgebung | Erstlauf gesamt | Build-Phase | Warm |
+|---|---|---|---|
+| Apple M4, macOS (16 Läufe im Wechsel) | 0,438 → **0,438 s** | 25,8 → 23,6 ms | 29,3 → 29,7 ms |
+| Docker, Linux aarch64, `--cpus 1` (16 Läufe im Wechsel) | 0,511 → **0,508 s** | 26,2 → 23,0 ms | 35,8 → 35,5 ms |
+
+- **Korrektheit:** Die Arrays aus `run_build_step` sind für 27 Setups identisch (946 Arrays). `set_instructions` liefert in 20'000 zufälligen Aufrufen dasselbe wie vorher. Die Benchmark-Ausgaben sind bitgleich, alle Prüfskripte geben dieselben Zahlen aus. Neu ist `runs/noel/test_build.py`.
+- **Einordnung:** `run_build_step` allein braucht im Docker-Ablauf 5,9 statt 8,5 ms. Von den 23 ms der Build-Phase gehören die übrigen rund 17 ms zu `benchmark.py` (Start des JAX-Backends, drei kleine XLA-Programme für `jnp.asarray`).
+- **Reports:** `runs/noel/mac-neu.json`, `mac-neu.png` und `docker-neu.json` zeigen diesen Stand: 0,432 s auf macOS und 0,499 s in Docker, je der mittlere von fünf Läufen.
 
 ## Wo die verbleibende Zeit steckt
 

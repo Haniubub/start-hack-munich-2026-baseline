@@ -2,6 +2,7 @@
 
 Usage: python runs/noel/profil.py <repo> [forward|backward|build]
 """
+import functools
 import cProfile
 import json
 import os
@@ -51,11 +52,17 @@ if what == "build":
     sys.exit()
 
 arrays, ports, parameters = build_inputs()
-host = [np.asarray(arrays[k]) if not isinstance(arrays[k], tuple) else np.asarray(arrays[k]) for k in fast.HOST_KEYS]
+sparse = hasattr(fast, "_host_leaves")  # since round 6: sparse system matrices, every host array packed
+if sparse:
+    host = [np.asarray(leaf) for leaf in fast._host_leaves(arrays)]
+    host_forward = functools.partial(fast._host_forward, arrays["carrier_matrix"].shape[0])
+else:
+    host = [np.asarray(arrays[k]) for k in fast.HOST_KEYS]
+    host_forward = fast._host_forward
 p = np.asarray(parameters)
 
 for _ in range(2):
-    t = pc(); out = fast._host_forward(p, *host); t_fwd = pc() - t
+    t = pc(); out = host_forward(p, *host); t_fwd = pc() - t
 print("forward seconds", t_fwd)
 carrier, signal, noise, *helpers = out
 carrier_bar = np.zeros_like(carrier)
@@ -64,7 +71,7 @@ rng = np.random.default_rng(0)
 d = np.nonzero(np.asarray(arrays["noise_selection_vectors"])[0, 0])[0]
 signal_bar[d] = rng.normal(size=(d.size, signal.shape[1])) + 1j * rng.normal(size=(d.size, signal.shape[1]))
 noise_bar = rng.normal(size=noise.shape)
-backward_keys = getattr(fast, "BACKWARD_KEYS", fast.HOST_KEYS)  # older states pass every host array
+backward_keys = () if sparse else getattr(fast, "BACKWARD_KEYS", fast.HOST_KEYS)  # older states pass host arrays
 backward_host = [h for k, h in zip(fast.HOST_KEYS, host) if k in backward_keys]
 args = (p, *backward_host, carrier, signal, noise, *helpers, carrier_bar, signal_bar, noise_bar)
 for _ in range(2):
@@ -75,7 +82,7 @@ profile = cProfile.Profile()
 profile.enable()
 for _ in range(5):
     if what == "forward":
-        fast._host_forward(p, *host)
+        host_forward(p, *host)
     else:
         fast._host_backward(*args)
 profile.disable()

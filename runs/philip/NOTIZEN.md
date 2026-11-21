@@ -42,6 +42,8 @@ Alle drei Spalten stammen aus einer Messreihe (07:03). Zwei Code-Commits kamen d
 
 Joels vier Branches bauen auf `philip` (`ab82e42`) auf. Ihre drei Code-Änderungen (Detektoren als Host-Callback, Plotly bei Bedarf, SuperLU ohne SciPy-Import) gibt es hier, bei Noel und bei Max in eigener Fassung. `sx`, `sx2` und `sx2-env` setzen zusätzlich je eine Einstellung in `differometor/__init__.py` (XLA-Optimierungsstufe 1, `jax_disable_most_optimizations`, XLA-Stufe 0 ohne teure LLVM-Pässe). Das ist die Regelfrage B6. Die letzte Zeile ist nur gemessen und nicht eingebaut. Derselbe Vergleich für die Nebius-VM liegt als Paket bereit (`_nacht/vm/`, Skripte in `runs/philip/vm/`).
 
+**Gegen Noels siebte Runde** (`cb902d7`), jeweils abwechselnd: um 12:51 vor der Übernahme von Noels Build (12 Läufe) `noel` 748,5 / 685,5 ms, `philip-nacht` (`9bc219c`) 679,1 / 604,7 ms. Um 13:00 mit Noels Build (Änderung 22, 14 Läufe, die Maschine lief gerade rund 15 % langsamer) `noel` 908,6 / 776,8 ms, `philip-nacht` **756,5 / 665,6 ms**. Der Abstand kommt weiter aus dem Kompilieren (309 gegen 215 ms) und dem Gradienten (43 gegen 14 ms).
+
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
 Ohne Bytecode-Cache (frischer Export mit `git archive`, `PYTHONDONTWRITEBYTECODE=1` wie im Dockerfile, 8 Läufe): `noel` 781,1 / 749,4, `philip-nacht` 646,3 / 601,6. Der Import kostet dann bei beiden rund 300 ms.
@@ -75,6 +77,7 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 ist das Kompilieren der
 | 19 | Nullensuche in den dichten Build-Matrizen mit einem Vergleich | `sparse.py` | 0,9 → 0,6 ms für die Signalmatrix |
 | 20 | Signalwerte entstehen direkt in dem Feld, in dem die Vorab-Elimination arbeitet (eine Kopie von 4 MB weniger) | `fast.py` | Vorwärts 61,4 → 58,1 ms, warm 55,1 → 51,9 ms (12 Läufe). Bit-identisch |
 | 21 | Signal- und Rauschmatrix entstehen im Build nie als dichte Arrays, ihre Einträge folgen aus der Trägermatrix (Idee aus Noels Runde 6) | `build.py`, `sparse.py` | Build-Schritt allein 18,1 → 13,8 ms (Minimum 15,8 → 12,8, je 16 frische Prozesse abwechselnd). Bit-identisch |
+| 22 | Build-Schritt aus Noels Runde 7 übernommen (`e311d5c`): Seitenband-Erweiterung auf Python-Listen (`_sideband_layout`), Wörterbuch statt `list.index`, weniger kleine NumPy-Aufrufe | `build.py`, `runs/noel/test_build.py` | Build-Schritt allein 14,3 → 10,7 ms (Minimum 13,0 → 9,7, je 20 frische Prozesse abwechselnd). 946 Build-Arrays aus 27 Setups identisch |
 | – | Übernommen: Noels Runden 2 und 3 (Tests, Notizen) und Max' Aufteilung in nachgeladene Module | `setups.py`, `simulate.py`, `_*.py`, `runs/noel/` | Ohne `.pyc` übersetzt Python beim Import rund ein Sechstel weniger Quelltext (in der langsamen Phase gemessen: 33 → 28 ms) |
 
 ### 1. Basismatrizen sparse
@@ -208,6 +211,16 @@ Die Schnittstelle bleibt, wie sie war: `run_build_step` liefert weiter `BaseMatr
 
 Gemessen am Build-Schritt allein (`Setup.from_data`, `constrain_inter_grid_cell_spaces`, `run_build_step` im frischen Prozess, je 16 Prozesse abwechselnd): Median 18,1 → 13,8 ms, Minimum 15,8 → 12,8 ms. In der Gesamtzeit geht das an diesem Vormittag im Rauschen der Messmaschine unter (Build-Phase im Wechselvergleich, 12 Läufe: Median 64,9 → 62,6 ms, Minimum 58,1 → 52,7 ms).
 
+### 22. Noels Build aus Runde 7
+
+Noel hat in Runde 7 (`e311d5c`) den Build-Schritt verschlankt, bei identischer Ausgabe: Die Erweiterung der Anweisungen auf zwei Seitenbänder läuft in `_sideband_layout` auf Python-Listen statt in rund 35 kleinen NumPy-Schritten pro Aufruf, dazu ein Wörterbuch statt `list.index` und weniger Allokationen. Das ist hier übernommen. Beim Zusammenführen gab es in `build.py` zwei Konfliktstellen: die Einheitsdiagonale der Trägermatrix (Noels Zeile) und das Ende des Builds, wo dieser Branch bei `BaseMatrix` bleibt (Änderung 21) statt bei Noels `SparseMatrix`.
+
+Geprüft mit Noels `runs/noel/test_build.py`: `_sideband_layout` gegen die Referenz in 20'000 Zufallsfällen, und die Build-Ausgaben vor und nach der Übernahme für 27 Setups (946 Arrays, 0 verschieden, `PYTHONHASHSEED=0`). Die Arrays des Benchmarks sind bit-identisch.
+
+Gemessen am Build-Schritt allein, je 20 frische Prozesse abwechselnd: Median 14,3 → 10,7 ms, Minimum 13,0 → 9,7 ms. Zusammen mit Änderung 21 sind es 18,1 → 10,7 ms.
+
+Aus Noels Runden 5 und 6 ist sonst nichts übernommen: Die gebündelten Residuen (Runde 5) braucht es hier nicht, weil die kleinen Host-Arrays seit Änderung 13 keine Programm-Argumente mehr sind, und die Matrizen in Koordinatenform (Runde 6) gibt es hier als `BaseMatrix` seit Änderung 1. `fast.py`, `sparse.py`, `simulate.py` und `components.py` bleiben die dieses Branches. Darum laufen `runs/noel/test_pack.py` und `runs/noel/test_sparse.py` hier nicht: Sie prüfen `_host_leaves` und `SparseMatrix` aus Noels `fast.py`. Dieselben Fragen prüfen hier `test_static.py`, `test_compat.py` und `test_build_entries.py`.
+
 ## Wo die Zeit auf x86 jetzt steckt
 
 Zahlen aus der Messreihe von 07:03 (schnelle Phase der Maschine).
@@ -255,6 +268,7 @@ python runs/check_setups.py
 python runs/noel/test_detectors.py .
 python runs/noel/test_adjoint.py .
 python runs/noel/test_perturbed.py .
+python runs/noel/test_build.py .
 python runs/philip/test_condensed.py
 python runs/philip/test_forward_cache.py
 python runs/philip/test_compat.py
