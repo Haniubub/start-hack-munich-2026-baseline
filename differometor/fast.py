@@ -338,49 +338,58 @@ class _EntryBlock:
         # Scatter from entries to (call, output) slots; several entries may share a slot.
         self.scatter = _grouping(self.outputs[0] * 4 + self.outputs[1])
 
+    # Entries are stored entry by entry, shape (E, R): one contiguous row of R values (the sweep)
+    # per matrix entry. Selecting or writing a set of entries then moves whole rows.
+
+    def _inputs(self, source, members):
+        """Function inputs of the calls `members`, shape (members, R, k), for parameters (R, P)."""
+        return np.moveaxis(source.T[self.inputs[members]], 1, 2)
+
     def _gather(self, values):
-        return values[:, self.outputs[0], self.outputs[1]]
+        """Outputs (calls, 4, R) -> entries (E, R)."""
+        return values[self.outputs[0], self.outputs[1]]
 
     def values(self, parameters):
-        """parameters: (R, P) -> entries (R, E), no derivatives."""
+        """parameters: (R, P) -> entries (E, R), no derivatives."""
         rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((rows, calls, 4), complex)
+        values = np.empty((calls, 4, rows), complex)
         for function_index, members, varying, _ in self.groups:
             source = parameters if varying else parameters[:1]
-            values[:, members] = _evaluate_values(function_index, source[:, self.inputs[members]])
+            values[members] = np.moveaxis(_evaluate_values(function_index, self._inputs(source, members)), 1, 2)
         return self._gather(values)
 
     def run(self, parameters):
-        """parameters: (R, P). Returns entries (R, E) and the Jacobian tape for the reverse pass."""
+        """parameters: (R, P). Returns entries (E, R) and the Jacobian tape for the reverse pass."""
         rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((rows, calls, 4), complex)
+        values = np.empty((calls, 4, rows), complex)
         tape = []
         for function_index, members, varying, columns in self.groups:
             source = parameters if varying else parameters[:1]
-            inputs = source[:, self.inputs[members]]
+            inputs = self._inputs(source, members)
             if columns.size:
-                values[:, members], jacobian = _evaluate(function_index, inputs, columns)
+                outputs, jacobian = _evaluate(function_index, inputs, columns)
             else:
-                values[:, members], jacobian = _evaluate_values(function_index, inputs), None
+                outputs, jacobian = _evaluate_values(function_index, inputs), None
+            values[members] = np.moveaxis(outputs, 1, 2)
             tape.append(jacobian)
         return self._gather(values), tape
 
     def back(self, tape, entries_bar, parameter_count):
-        """entries_bar: (R, E) -> real parameter cotangent summed over the rows (P,)."""
-        rows, calls = entries_bar.shape[0], self.inputs.shape[0]
+        """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,)."""
+        rows, calls = entries_bar.shape[1], self.inputs.shape[0]
         order, starts, slots = self.scatter
-        outputs_bar = np.zeros((rows, calls * 4), complex)
+        outputs_bar = np.zeros((calls * 4, rows), complex)
         if order.size:
-            outputs_bar[:, slots] = _group_sum(entries_bar, order, starts)
-        outputs_bar = outputs_bar.reshape(rows, calls, 4)
+            outputs_bar[slots] = np.add.reduceat(entries_bar[order], starts, axis=0)
+        outputs_bar = outputs_bar.reshape(calls, 4, rows)
         parameters_bar = np.zeros(parameter_count)
         for (function_index, members, varying, columns), jacobian in zip(self.groups, tape):
             if jacobian is None:
                 continue
             if varying:
-                inputs_bar = np.einsum("rco,rcoj->cj", outputs_bar[:, members], jacobian).real
+                inputs_bar = np.einsum("cor,croj->cj", outputs_bar[members], jacobian).real
             else:  # identical Jacobian in every row
-                inputs_bar = np.einsum("co,coj->cj", outputs_bar[:, members].sum(0), jacobian[0]).real
+                inputs_bar = np.einsum("co,coj->cj", outputs_bar[members].sum(2), jacobian[:, 0]).real
             parameters_bar += np.bincount(self.inputs[members][:, columns].ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
@@ -425,14 +434,14 @@ class EntryPlan:
     def values(self, optimized_parameters):
         """Carrier, signal and noise entries without derivatives (forward pass)."""
         carrier_rows, signal_rows = self._rows(optimized_parameters)
-        return self.carrier.values(carrier_rows)[0], self.signal.values(signal_rows), self.noise.values(signal_rows)
+        return self.carrier.values(carrier_rows)[:, 0], self.signal.values(signal_rows), self.noise.values(signal_rows)
 
     def entries(self, optimized_parameters):
         carrier_rows, signal_rows = self._rows(optimized_parameters)
         carrier, carrier_tape = self.carrier.run(carrier_rows)
         signal, signal_tape = self.signal.run(signal_rows)
         noise, noise_tape = self.noise.run(signal_rows)
-        return (carrier[0], signal, noise), (carrier_tape, signal_tape, noise_tape)
+        return (carrier[:, 0], signal, noise), (carrier_tape, signal_tape, noise_tape)
 
     def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count):
         carrier_tape, signal_tape, noise_tape = tape
@@ -441,7 +450,7 @@ class EntryPlan:
             noise_tape, noise_bar, parameter_count
         )
         signal_rows_bar[self.signal_changing_indices] = 0.0  # overwritten by the sweep values
-        P_bar = self.carrier.back(carrier_tape, carrier_bar[None], parameter_count) + signal_rows_bar
+        P_bar = self.carrier.back(carrier_tape, carrier_bar[:, None], parameter_count) + signal_rows_bar
         P_bar[self.carrier_changing_indices] = 0.0
         return np.bincount(self.optimized_value_indices, P_bar[self.optimized_parameter_indices], value_count)
 
@@ -536,14 +545,14 @@ class SystemPlan:
         return _splu(n, M[self.carrier_rows, self.carrier_cols], self.carrier_rows, self.carrier_ptr), M[:, -1]
 
     def signal_values(self, signal_entries, carrier):
-        """Nonzero values of the augmented signal matrices, shape (F, size), plus placing pre-values."""
-        F = signal_entries.shape[0]
-        V = np.broadcast_to(self.signal_base.astype(complex), (F, self.size)).copy()
-        V[:, self.update_positions[self.update_live]] = signal_entries[:, self.update_live]
-        pre = V[:, self.placing_positions].copy()
+        """Nonzero values of the augmented signal matrices, shape (size, F), plus placing pre-values."""
+        V = np.empty((self.size, signal_entries.shape[1]), complex)
+        V[:] = self.signal_base[:, None]
+        V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
+        pre = V[self.placing_positions]
         live = self.placing_live
-        V[:, self.placing_positions[live]] = -pre[:, live] * carrier[self.signal_carrier_indices[live]]
-        V[:, self.conjugated] = np.conj(V[:, self.conjugated])
+        V[self.placing_positions[live]] = -pre[live] * carrier[self.signal_carrier_indices[live], None]
+        V[self.conjugated] = np.conj(V[self.conjugated])
         return V, pre
 
     def _set_order(self, values_row):
@@ -559,7 +568,7 @@ class SystemPlan:
 
     def signal_factors(self, V):
         """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
-        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V.T, self.in_matrix)
+        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix)
 
     def signal_lu(self, values_row):
         if self.order is None:
@@ -569,9 +578,10 @@ class SystemPlan:
         return _OrderedLU(lu, self.order)
 
     def noise_values(self, noise_entries):
-        F = noise_entries.shape[0]
+        """Noise matrix values, shape (F, entries), from the noise entries (E, F)."""
+        F = noise_entries.shape[1]
         base = np.broadcast_to(self.noise_base.astype(complex), (F, self.noise_base.size))
-        return np.concatenate([base, noise_entries[:, self.noise_live]], axis=1)
+        return np.concatenate([base, noise_entries[self.noise_live].T], axis=1)
 
     def detector_weights(self, carrier):
         n, s = self.n, self.selection
@@ -872,7 +882,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     V, pre = plan.signal_values(signal_entries, carrier)
     w = plan.detector_weights(carrier)
     N = plan.noise_values(noise_entries)
-    F = V.shape[0]
+    F = V.shape[1]
     factors = plan.signal_factors(V)
     d, k = plan.detector, plan.detector.size
     Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
@@ -888,7 +898,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
     power = np.einsum("fm,fm->f", np.conj(Y), q).real
     right_hand_sides = np.zeros((F, m, 2), complex)
-    right_hand_sides[:, plan.rhs_rows, 0] = V[:, ~plan.in_matrix]
+    right_hand_sides[:, plan.rhs_rows, 0] = V[~plan.in_matrix].T
     right_hand_sides[:, :, 1] = 0.5 * (q + qh)
     solutions = factors.solve(right_hand_sides)
     X = np.ascontiguousarray(solutions[:, :, 0])
@@ -898,23 +908,25 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
 
 
 def _signal_adjoint(plan, V, Z, signal_bar):
-    """lam_f = S_f^-T signal_bar_f for every frequency, shape (F, m)."""
-    support = np.nonzero(np.any(signal_bar != 0, axis=0))[0]
+    """lam_f = S_f^-T signal_bar_f for every frequency; `signal_bar` and the result have shape (m, F)."""
+    support = np.nonzero(np.any(signal_bar != 0, axis=1))[0]
     d, k = plan.detector, plan.detector.size
     if plan.use_basis and np.isin(support, d).all():
-        return np.einsum("fmk,fk->fm", Z[:, :, :k], signal_bar[:, d])
+        return np.einsum("fmk,kf->mf", Z[:, :, :k], signal_bar[d])
     lam = np.empty(signal_bar.shape, complex)
-    for f in range(V.shape[0]):
-        lam[f] = plan.signal_lu(V[f]).solve(signal_bar[f].astype(complex), trans="T")
+    for f in range(V.shape[1]):
+        lam[:, f] = plan.signal_lu(V[:, f]).solve(signal_bar[:, f].astype(complex), trans="T")
     return lam
 
 
 def backward(
-    plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, kept=None
+    plan, carrier_entries, signal_entries, carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, kept=None
 ):
     """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
 
-    `kept` is the last return value of `forward` for the same inputs, when it is still available.
+    `signal` and `signal_bar` have shape (m, F), the adjoint helpers Y and MU (F, m). `kept` is the
+    last return value of `forward` for the same inputs, when it is still available. The work on
+    the signal matrix entries runs entry by entry, on arrays of shape (entries, F).
     """
     n, m = plan.n, plan.m
     if kept is None:
@@ -922,28 +934,29 @@ def backward(
         V, pre = plan.signal_values(signal_entries, carrier)
     else:
         carrier_lu, V, pre = kept
-    F = V.shape[0]
+    F = V.shape[1]
     carrier_bar = carrier_bar.astype(complex).copy()
-    V_bar = np.empty((F, plan.size), complex)
+    V_bar = np.empty((plan.size, F), complex)
     g = noise_bar * NOISE_SCALE / noise  # d noise / d power
     rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
     lam = _signal_adjoint(plan, V, Z, signal_bar)
-    V_bar[:, plan.in_matrix] = -lam[:, rows] * X[:, cols] - 2 * g[:, None] * np.conj(Y[:, rows]) * MU[:, cols]
-    V_bar[:, ~plan.in_matrix] = lam[:, plan.rhs_rows]
+    Y_rows, MU_rows = np.ascontiguousarray(Y.T), np.ascontiguousarray(MU.T)
+    V_bar[plan.in_matrix] = -lam[rows] * signal[cols] - 2 * g * np.conj(Y_rows[rows]) * MU_rows[cols]
+    V_bar[~plan.in_matrix] = lam[plan.rhs_rows]
     w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
 
     N_bar = g[:, None] * np.conj(Y[:, plan.noise_rows]) * Y[:, plan.noise_cols]
-    noise_entries_bar = np.zeros((F, plan.noise_live.size), complex)
-    noise_entries_bar[:, plan.noise_live] = N_bar[:, plan.noise_base.size :]
+    noise_entries_bar = np.zeros((plan.noise_live.size, F), complex)
+    noise_entries_bar[plan.noise_live] = N_bar[:, plan.noise_base.size :].T
 
-    V_bar[:, plan.conjugated] = np.conj(V_bar[:, plan.conjugated])
+    V_bar[plan.conjugated] = np.conj(V_bar[plan.conjugated])
     live = plan.placing_live
     placed = plan.placing_positions[live]
     sci = plan.signal_carrier_indices[live]
-    np.add.at(carrier_bar, sci, -(V_bar[:, placed] * pre[:, live]).sum(0))
-    V_bar[:, placed] = -V_bar[:, placed] * carrier[sci]
+    np.add.at(carrier_bar, sci, -(V_bar[placed] * pre[live]).sum(1))
+    V_bar[placed] = -V_bar[placed] * carrier[sci, None]
     signal_entries_bar = np.zeros_like(signal_entries)
-    signal_entries_bar[:, plan.update_live] = V_bar[:, plan.update_positions[plan.update_live]]
+    signal_entries_bar[plan.update_live] = V_bar[plan.update_positions[plan.update_live]]
 
     s = plan.selection
     carrier_bar += w_bar[:n] * s[:n] + np.conj(w_bar[n : 2 * n]) * s[n : 2 * n]
@@ -1057,13 +1070,13 @@ def _host_backward(optimized_parameters, *rest):
         carrier_entries,
         signal_entries,
         np.asarray(carrier)[:, 0],
-        np.asarray(signal).T,
+        np.asarray(signal),
         np.asarray(noise).reshape(F),
         np.asarray(Y),
         np.asarray(MU),
         np.asarray(Z),
         np.asarray(carrier_bar)[:, 0],
-        np.asarray(signal_bar).T,
+        np.asarray(signal_bar),
         np.asarray(noise_bar, float).reshape(F),
         kept=kept,
     )

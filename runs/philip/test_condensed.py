@@ -47,9 +47,9 @@ def check(name, setup, pairs, frequencies, parameters):
     plan = fast.SystemPlan(A)
     carrier_lu, carrier_rhs = plan.carrier_matrix(entries[0])
     V, _ = plan.signal_values(entries[1], carrier_lu.solve(carrier_rhs))
-    m, F = plan.m, V.shape[0]
+    m, F = plan.m, V.shape[1]
     rows, cols = plan.matrix_rows, plan.matrix_cols
-    values = np.ascontiguousarray(V.T[plan.in_matrix])
+    values = np.ascontiguousarray(V[plan.in_matrix])
     condensed = fast._CondensedLU(m, rows, cols, values)
     stages = fast._CondensedLU.MAX_STAGES
     fast._CondensedLU.MAX_STAGES = 0
