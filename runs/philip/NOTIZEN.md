@@ -235,7 +235,7 @@ Zusammen auf der Cloud-Maschine (8 Läufe, abwechselnd): `d043e68` 679,1 / 576,5
 
 Noch nicht übernommen, liegen als Branches vor: `sub/imports` (Pause des Garbage Collectors und träge JAX-Module während `import jax`, braucht einen Träger vor `import jax`: `.pth`-Datei aus `pip install -e .` oder eine Datei `statistics.py` neben `benchmark.py`; dazu als eigene, abgeschaltete Stufe der Vorimport vor dem Timer) und `sub/cache` (Compile-Cache trotz Zeile 170 von `benchmark.py`, opt-in).
 
-## Branch `philip-fastest` (Sa 21.11.2026, 18:15)
+## Branch `philip-fastest` (Sa 21.11.2026, 18:35)
 
 Abzweig von `philip-nacht` (`38f670e`). Alle Zahlen: Nebius-VM, Intel Xeon Platinum 8468, Python 3.12.3, `python benchmark.py --cpus 1 --repeats 3`, frische Prozesse im Wechsel, Median / Minimum in ms, alle Läufe `PASS`. Rohdaten in `_nacht/vm/jobs/` auf dem Branch `philip`.
 
@@ -248,6 +248,10 @@ Abzweig von `philip-nacht` (`38f670e`). Alle Zahlen: Nebius-VM, Intel Xeon Plati
 | 29 | Kompilierter Code für die Dataclass-Methoden, die `import jax` erzeugt (`DATACLASS_CODE`) | `_startup.py`, `_dataclass_code.bin` | `neu-1804`: ohne 339,8 statt 315,3, Imports 212,6 statt 192,7 |
 | 30 | Inline-`jit`-Funktionen beim Differenzieren direkt auswerten, kleine Programme an Ort und Stelle lowern (`INLINE_JITS_UNDER_AD`, `DIRECT_LOWERING_SMALL_PROGRAMS`) | `_tuning.py` | `neu-1804`: ohne 323,0 statt 315,3, Lower 30,5 statt 25,8 |
 
+| 31 | Die jit-Objekte von JAX' eigenen Funktionen entstehen erst bei der ersten Nutzung (`LAZY_JITS`): `import jax` dekoriert 234 Funktionen mit `jax.jit`, ein Lauf ruft rund 15 davon auf | `_startup.py` | Auftrag `jits-1825`, 14 Läufe: Erstlauf 316,3 → 305,9, Imports 192,9 → 182,9 |
+
+**Stand mit 31 gegen `e842662`, Auftrag `jits-1825`:** Erstlauf 316,3 / 306,7 → **305,9 / 301,4 ms**. Ausgaben bit-identisch.
+
 **Stand `03ec2a3` gegen `50341f9` (25 bis 27), Auftrag `neu-1804`:** Erstlauf 355,8 / 344,5 → **315,3 / 309,5 ms**, Imports 225,3 → 192,7, Lower 31,6 → 25,8, alles andere gleich. Ausgaben und Gradient sind bit-identisch zum Stand davor.
 
 Was man wissen muss:
@@ -255,8 +259,9 @@ Was man wissen muss:
 - **Bytecode neu erzeugen.** Nach jeder Änderung an `differometor/*.py` oder `statistics.py`: `bash runs/philip/bytecode.sh <python3.12>` und committen. Sonst kompiliert Python die geänderten Module wieder selbst, und der Gewinn von 27 und 29 fehlt, ohne dass etwas auffällt.
 - **Python-Version.** 27 und 29 wirken nur unter Python 3.12. `dataclasses.py` erzeugt in 3.12.3 (Feyers Baseline-Maschine) und 3.12.11 dieselben Methodentexte, auf der VM kam beim Aufzeichnen kein neuer Text dazu.
 - **28 im Detail.** JAX braucht von den drei Modulen beim Import nur je ein Klassenobjekt. Es bekommt einen Platzhalter; wird das Modul später wirklich geladen, wandern Unterklassen und die Einträge in JAX' Typ-Tabellen auf die echte Klasse. `numpy.unique` fragt bei jedem Aufruf `numpy.ma.is_masked`, das wird ohne Laden beantwortet.
-- **Prüfen:** `python runs/flags/test_tuning.py` und `python runs/philip/test_startup.py`, beide auch unter Linux mit Python 3.12.3 gelaufen.
-- **Schalter:** `DIFFEROMETOR_STARTUP=gc,lazy` nimmt 28 und 29 heraus, `DIFFEROMETOR_TUNING=INLINE_JITS_UNDER_AD=0,DIRECT_LOWERING_SMALL_PROGRAMS=0` nimmt 30 heraus, `ENABLED = False` in `statistics.py` alle Start-Massnahmen.
+- **31 im Detail.** `jax.jit` gibt für Funktionen aus einem `jax.`-Modul ein `_LazyJit` zurück. Es trägt Name, Docstring, Signatur und `_fun` wie das echte Objekt, lässt sich als Methode binden und baut das echte jit-Objekt mit JAX' eigenem `make_jit` beim ersten Aufruf oder beim ersten Zugriff auf `.lower`, `.trace`, `._jit_info` und Ähnliches. Funktionen von ausserhalb (also auch die aus `benchmark.py`) bekommen sofort das echte Objekt. Zwei sichtbare Unterschiede: `type(jnp_funktion)` ist `_LazyJit` statt `PjitFunction`, und ein Fehler, der durch eine solche Funktion läuft, hat im Traceback eine zusätzliche Zeile aus `_startup.py`.
+- **Prüfen:** `python runs/flags/test_tuning.py` und `python runs/philip/test_startup.py`, beide auch unter Linux mit Python 3.12.3 gelaufen. `test_startup.py` lässt dazu `runs/philip/jax_battery.py` (83 JAX-Aufrufe: jax.numpy, Array-Methoden, grad, vmap, jit, Kontrollfluss, Zufall, Fehlerfälle) einmal mit und einmal ohne alle Start-Massnahmen laufen und vergleicht Zahlen, Namen, Signaturen und Fehlermeldungen.
+- **Schalter:** `DIFFEROMETOR_STARTUP=gc,lazy` nimmt 28, 29 und 31 heraus (`gc,lazy,defer,dataclass` nur 31), `DIFFEROMETOR_TUNING=INLINE_JITS_UNDER_AD=0,DIRECT_LOWERING_SMALL_PROGRAMS=0` nimmt 30 heraus, `ENABLED = False` in `statistics.py` alle Start-Massnahmen.
 - **Offen:** Balanced-Homodyne-Setups laufen auf diesem Branch weiter über den dichten JAX-Weg (35,5 s auf dem Xeon, Auftrag `stand-1642`). Noels `8cb5eff` zeigt den Umbau.
 
 Gemessen und nicht eingebaut (`prof-1726`, je 20 Läufe): `SHORT_LOCATIONS_AT_IMPORT`, `INLINE_DISPATCH_AT_IMPORT` und `DIFFEROMETOR_GC=off` bringen je höchstens 0,5 ms. `--xla_disable_all_hlo_passes` macht das Kompilieren von Readout und Gradient langsamer und bricht Programme mit Scatter.

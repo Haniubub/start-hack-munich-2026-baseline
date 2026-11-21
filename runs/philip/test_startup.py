@@ -94,6 +94,43 @@ check("methods of JAX dataclasses have the same code with and without the code f
       runs["with"].get("installed", "").startswith("on:") and runs["without"].get("installed") == "None" and len(methods) >= 3
       and all(runs["with"][key] == runs["without"].get(key) for key in methods), str({k: v for k, v in runs["with"].items() if k == "installed"}) + str(runs["without"].get("error", "")))
 
+# ---- lazy jit objects ---------------------------------------------------------------------------
+from jax._src.numpy import reductions  # noqa: E402
+
+created, built = state.get("lazy_jits", [0, 0])
+check("JAX's own jit objects are lazy and almost none is built after the imports", state.get("lazy_jits_installed") == "on" and created > 150 and built < 25,
+      f"{state.get('lazy_jits_installed')} created {created} built {built}")
+lazy = reductions._mean
+check("a lazy jit object is built by its first call, once", type(lazy).__name__ == "_LazyJit" and lazy._lazy_real is None
+      and float(jnp.mean(jnp.arange(4.0))) == 1.5 and type(lazy._lazy_real).__name__ == "PjitFunction" and lazy._lazy_pending is None)
+check("a function from outside JAX gets JAX's jit object at once", type(jax.jit(lambda x: x)).__name__ == "PjitFunction")
+
+# The same battery of JAX calls with and without all start-up measures.
+import re  # noqa: E402
+
+battery = {}
+for mode in ("1", "0"):
+    result = subprocess.run([sys.executable, str(root / "runs" / "philip" / "jax_battery.py")], cwd=root, env=dict(os.environ, DIFFEROMETOR_STARTUP_SHADOW=mode),
+                            capture_output=True, text=True)
+    battery[mode] = json.loads(result.stdout.strip().splitlines()[-1]) if result.returncode == 0 and result.stdout.strip() else {"error": result.stderr[-800:]}
+
+
+def normalized(value):
+    """Without memory addresses; and without the one traceback frame a lazy jit object adds to an error."""
+    if isinstance(value, dict):
+        return {key: ([frame for frame in item if frame != "_startup.py"] if key == "frames" else normalized(item)) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalized(item) for item in value]
+    return re.sub(r"0x[0-9a-f]+", "0x", value) if isinstance(value, str) else value
+
+
+different = [key for key in sorted(set(battery["1"]) | set(battery["0"])) if normalized(battery["1"].get(key)) != normalized(battery["0"].get(key))]
+check("83 JAX calls give the same numbers, names, signatures and errors with and without the measures", len(battery["1"]) >= 80 and not different,
+      f"{len(battery['1'])} entries, different: {different[:6]} {battery['1'].get('error', '')}")
+extra = [key for key in battery["1"] if key.startswith("error.") and isinstance(battery["1"][key], dict)
+         and battery["1"][key]["frames"].count("_startup.py") > 1]
+check("an error passes through at most one frame of the start-up measures", not extra, str(extra))
+
 # ---- opt_einsum ---------------------------------------------------------------------------------
 from jax._src.numpy import einsum as jax_einsum  # noqa: E402
 

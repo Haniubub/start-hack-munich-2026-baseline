@@ -29,7 +29,7 @@ kind (B)  does NOT remove work. It moves the imports in front of the first timer
 
 For measurements the switches can be overridden per process without editing this file:
 ``DIFFEROMETOR_STARTUP`` is a comma separated list out of ``gc``, ``lazy``, ``defer``,
-``dataclass``, ``preimport`` (or ``none``) and replaces the five early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
+``dataclass``, ``jits``, ``preimport`` (or ``none``) and replaces the six early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
 """
 import sys
 
@@ -72,6 +72,16 @@ DEFER_UNUSED_MODULES = True
 # not the expected one, nothing is installed. Rebuild the file with `runs/philip/bytecode.sh`.
 DATACLASS_CODE = True
 DATACLASS_CODE_FILE = "_dataclass_code.bin"
+
+# early, kind (A): the jit objects of JAX's own functions are built on first use. `import jax`
+# decorates 323 of its functions with `jax.jit` (most of jax.numpy and lax); for each one JAX
+# reads the signature, resolves static arguments and builds the C++ dispatch object, 30 to 40
+# microseconds apiece and 10 ms altogether on an M4, although a run calls a dozen of them.
+# With this switch `jax.jit` hands back a `_LazyJit` for functions defined in a `jax.` module:
+# it carries the name, docstring and attributes JAX would have copied and builds the real jit
+# object with JAX's own `make_jit` on the first call or the first use of anything else
+# (`.lower`, `.trace`, `._jit_info`, ...). Functions from anywhere else get JAX's object at once.
+LAZY_JITS = True
 
 # early, kind (B): MOVES WORK OUTSIDE THE TIMED WINDOW. When the process is `benchmark.py`, the
 # hook repeats the environment set-up of its header (JAX_PLATFORMS, JAX_ENABLE_X64, CPU affinity,
@@ -137,11 +147,135 @@ def _early_options():
                 ("lazy", LAZY_JAX_MODULES),
                 ("defer", DEFER_UNUSED_MODULES),
                 ("dataclass", DATACLASS_CODE),
+                ("jits", LAZY_JITS),
                 ("preimport", PREIMPORT),
             )
             if on
         }
-    return {part.strip().lower() for part in value.split(",")} & {"gc", "lazy", "defer", "dataclass", "preimport"}
+    return {part.strip().lower() for part in value.split(",")} & {"gc", "lazy", "defer", "dataclass", "jits", "preimport"}
+
+
+# --------------------------------------------------------------------------------------------
+# Lazy jit objects
+# --------------------------------------------------------------------------------------------
+
+_MethodType = type((lambda self: None).__get__(0))
+_FunctionType = type(lambda: None)
+_jit_lock = None  # one lock for building jit objects, created with the first `_LazyJit`
+
+
+class _LazyJit:
+    """What `jax.jit` returns for a function of JAX itself until its jit object is needed.
+
+    JAX's jit object is built by `_build_jit` on the first call and on the first read of an
+    attribute this object does not have. Until then this object answers what does not need it:
+    the attributes JAX copies from the function (name, module, docstring, annotations,
+    `__wrapped__`, `_fun`), the signature, and binding as a method, which works like that of
+    JAX's object. Calls always go through `__call__` here and then to JAX's object.
+    """
+
+    __slots__ = ("_lazy_pending", "_lazy_real", "__dict__", "__weakref__")
+
+    def __init__(self, make, fun, options):
+        self._lazy_pending = (make, fun, options)
+        self._lazy_real = None
+
+    def __call__(self, /, *args, **kwargs):
+        real = self._lazy_real
+        if real is None:
+            real = _build_jit(self)
+        return real(*args, **kwargs)
+
+    def __get__(self, instance, owner=None):
+        return self if instance is None else _MethodType(self, instance)
+
+    def __getattr__(self, name):
+        # Reached only for names that are neither set on this object nor defined by the class.
+        if name[:2] == "__" and name[-2:] == "__":
+            raise AttributeError(name)
+        return getattr(_build_jit(self), name)
+
+    @property
+    def __signature__(self):
+        import inspect
+
+        return inspect.signature(self.__dict__["__wrapped__"])
+
+    def __reduce_ex__(self, protocol):
+        return _build_jit(self).__reduce_ex__(protocol)
+
+    def __repr__(self):
+        return f"<PjitFunction of {self.__dict__.get('__wrapped__')!r}>"
+
+
+def _build_jit(lazy):
+    """JAX's jit object for a `_LazyJit`, built once."""
+    with _jit_lock:
+        real = lazy._lazy_real
+        if real is None:
+            make, fun, options = lazy._lazy_pending
+            real = make(fun, **options)
+            lazy._lazy_real = real
+            lazy._lazy_pending = None
+            state()["lazy_jits"][1] += 1
+    return real
+
+
+def _install_lazy_jits(pjit):
+    """Replace `jax._src.pjit.make_jit`, through which `jax.jit` and `pjit` build every jit object."""
+    global _jit_lock
+    import _thread
+
+    original = pjit.make_jit
+    code = original.__code__
+    if code.co_argcount != 1 or code.co_varnames[0] != "fun" or not code.co_kwonlyargcount:
+        raise TypeError("make_jit has another signature than expected")
+    wraps = pjit.wraps
+    _jit_lock = _thread.RLock()
+    counts = state().setdefault("lazy_jits", [0, 0])  # created, built
+
+    def make_jit(fun, **options):
+        if type(fun) is _FunctionType and (fun.__module__ or "").startswith("jax."):
+            lazy = _LazyJit(original, fun, options)
+            wraps(fun)(lazy)  # what JAX copies from the function to its jit object
+            lazy._fun = fun
+            counts[0] += 1
+            return lazy
+        return original(fun, **options)
+
+    make_jit.__doc__ = original.__doc__
+    make_jit.__wrapped__ = original
+    pjit.make_jit = make_jit
+    # Frames of this file are plumbing, as JAX's own frames are: keep them out of filtered
+    # tracebacks and out of the source locations of traced operations.
+    pjit.traceback_util.register_exclusion(__file__)
+    pjit.source_info_util.register_exclusion(__file__)
+
+
+class _AfterExec:
+    """Loader wrapper: run the module's code as usual, then call `after(module)`."""
+
+    def __init__(self, loader, after, note):
+        self._loader, self._after, self._note = loader, after, note
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        try:
+            module.__spec__.loader = self._loader
+            module.__loader__ = self._loader
+        except Exception:
+            pass
+        self._loader.exec_module(module)
+        try:
+            self._after(module)
+            state()[self._note] = "on"
+        except Exception as error:  # another JAX: leave it alone
+            state()[self._note] = f"off: {type(error).__name__}: {error}"
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
 
 
 # --------------------------------------------------------------------------------------------
@@ -503,10 +637,11 @@ class _Watcher:
     other name `None`, which sends the import machinery on to the normal finders.
     """
 
-    def __init__(self, pause, lazy, deferred=None):
+    def __init__(self, pause, lazy, deferred=None, lazy_jits=False):
         self.pause = pause
         self.lazy = lazy
         self.deferred = deferred or {}
+        self.after = {"jax._src.pjit": (_install_lazy_jits, "lazy_jits_installed")} if lazy_jits else {}
         self._busy = False
 
     def remove(self):
@@ -516,7 +651,7 @@ class _Watcher:
             pass
 
     def find_spec(self, name, path=None, target=None):
-        if name != "jax" and name not in self.lazy and name not in self.deferred:
+        if name != "jax" and name not in self.lazy and name not in self.deferred and name not in self.after:
             return None
         if self._busy:
             return None
@@ -542,6 +677,8 @@ class _Watcher:
                 if type(spec.loader) is not SourceFileLoader:
                     return None
                 spec.loader = _DeferredLoader(spec.loader, *self.deferred[name])
+            elif name in self.after:
+                spec.loader = _AfterExec(spec.loader, *self.after[name])
             else:
                 from importlib.machinery import SourceFileLoader
 
@@ -631,9 +768,10 @@ def early(carrier="pth"):
     lazy = LAZY_MODULES if "lazy" in options else frozenset()
     # A module that is loaded already stays as it is.
     deferred = {name: plan for name, plan in DEFERRED_MODULES.items() if name not in sys.modules} if "defer" in options else {}
-    if pause or lazy or deferred:
-        sys.meta_path.insert(0, _Watcher(pause, lazy, deferred))
-        info["early"] += [name for name in ("gc", "lazy", "defer") if name in options]
+    lazy_jits = "jits" in options
+    if pause or lazy or deferred or lazy_jits:
+        sys.meta_path.insert(0, _Watcher(pause, lazy, deferred, lazy_jits))
+        info["early"] += [name for name in ("gc", "lazy", "defer", "jits") if name in options]
     if "preimport" in options and carrier == "pth" and _is_benchmark_process():
         if _preimport():
             info["early"].append("preimport")
