@@ -17,6 +17,10 @@ Messumgebung für alle Zahlen: x86-64 Linux, Intel Xeon 2,1 GHz (Emerald Rapids,
 | 7 | `np.take(..., out=...)` ohne `mode="clip"` im Rückwärtslauf | Gradient im Erstlauf 34,0 → 36,3 ms | schlechter |
 | 8 | Mehr Eliminationsstufen oder ein lockereres Kriterium (Einträge bis Betrag 2, 10, 100) | Restsystem 125–133 statt 200 Unbekannte, aber 44–61 ms statt 37 ms | schlechter |
 | 9 | Kompilier-Einstellungen von JAX selbst (`jax_optimization_level`, `jax_exec_time_optimization_effort`, `jax_memory_fitting_effort`) | Readout bleibt bei 180–190 ms | nichts gebracht |
+| 10 | Noels neue Zerlegung (balanciert, Ordnung auf S + Sᵀ, Schwellen-Pivotisierung 0,1) auf dem Restsystem nach der Vorab-Elimination | Fill 3 369 → 3 143 Einträge pro Frequenz, Zerlegung und zwei Lösungen 17,0 → 15,2 ms im besten Fall | zu wenig für den Aufwand |
+| 11 | Detektor-Ausgabe als eigenes Objekt mit `__getitem__` und `__jax_array__` zurückgeben | `jnp.abs(objekt)`, `jnp.sum(objekt)` und `jnp.where` brechen in JAX 0.9 ab | verworfen, anders gelöst |
+| 12 | Detektor-Ausgabe mit eigener Unterklasse von `ShapedArray` (eigenes `_getitem`) | bräuchte Einträge in mindestens neun typgebundenen Tabellen von JAX | verworfen, anders gelöst |
+| 13 | Noels Frequenzblöcke (je 16 Frequenzen durch Vorwärts- und Rückwärtslauf) | nicht gemessen, nur gesichtet | passt nicht ohne Umbau zur Vorab-Elimination |
 
 ## Die Versuche im Einzelnen
 
@@ -92,7 +96,35 @@ Jede weitere Stufe kostet mehr an Verwaltung (Schur-Komplement, zwei CSR-Blöcke
 
 JAX 0.9 hat eigene Schalter für den Kompilieraufwand (`jax.config`: `jax_optimization_level`, `jax_exec_time_optimization_effort`, `jax_memory_fitting_effort`). Nur gemessen, nicht eingebaut, weil auch das unter Frage B6 fiele. Auf der CPU ändern sie nichts: Der Readout kompiliert mit `O0`, `O1` oder Aufwand −1 weiter in 180–190 ms, der Gradient in 85–100 ms.
 
+### 10. Balancierte, symmetrische Ordnung auf dem Restsystem
+
+Noel zerlegt seit `b658976` das volle Signalsystem (751 Unbekannte) balanciert, mit einer Minimum-Degree-Ordnung auf S + Sᵀ und Schwellen-Pivotisierung. Bei ihm sinkt der Fill von 8 330 auf 6 100 Einträge. Hier geht nur noch das Restsystem nach der Vorab-Elimination an SuperLU (200 Unbekannte, 1 273 Einträge). Dort ist wenig zu holen (bestes von 9, Zerlegung aller 101 Frequenzen plus je eine Lösung mit zwei rechten Seiten für S und Sᵀ):
+
+| Variante | Fill pro Frequenz | Zerlegung | Summe |
+| --- | ---: | ---: | ---: |
+| Stand: `MMD_ATA` auf den Spalten, Teilpivotisierung | 3 369 | 10,5 ms | 17,0 ms |
+| `MMD_AT_PLUS_A`, Schwelle 0,1, balanciert (Noels Wahl) | 3 143 | 8,8 ms | 15,2 ms |
+| `MMD_AT_PLUS_A`, Schwelle 0,1, ohne Balancieren | 3 637 | 11,2 ms | 17,4 ms |
+| `MMD_AT_PLUS_A`, Schwelle 1 (Teilpivotisierung), balanciert | 3 288 | 10,5 ms | 16,6 ms |
+| `COLAMD`, Schwelle 0,1, balanciert | 3 627 | 10,3 ms | 17,4 ms |
+
+Die Zeiten streuen zwischen zwei Zeilen um etwa 1 ms. Der beste Fall spart höchstens 1,8 ms, und dazu kämen das Balancieren und das Skalieren jeder rechten Seite und Lösung. Die Genauigkeit an gestörten Parametern, wegen der Noel die Skalierung braucht, hält die Vorab-Elimination hier schon: `runs/noel/test_perturbed.py` gibt mit diesem Stand 2,1e-08 als grösste Abweichung von log(Sensitivität), ohne Balancieren.
+
+### 11. und 12. Wege, die Auswahl der Detektor-Ports abzufangen
+
+Behalten wurde Änderung 17 in `NOTIZEN.md`: Die Zeilenauswahl `signal_detector(...)[ports]` läuft auf dem Host. Zwei andere Wege dorthin sind gescheitert.
+
+- **Eigenes Objekt statt eines JAX-Arrays.** Ein Objekt mit eigenem `__getitem__`, das sich über `__jax_array__` in ein Array verwandelt, hätte nur öffentliche Schnittstellen gebraucht. JAX 0.9 wandelt solche Objekte aber nicht mehr von selbst um: `jnp.abs(objekt)`, `jnp.sum(objekt)` und `jnp.where(..., objekt, ...)` brechen mit «Triggering __jax_array__() during abstractification is no longer supported» ab. Als Pytree registriert hätte es ausserdem die Struktur der Ausgabe geändert, und `jax.vjp(df.signal_detector, ...)` hätte keinen normalen Kotangenten mehr angenommen (so benutzt es `runs/noel/test_detectors.py`).
+- **Eigener abstrakter Typ.** `Tracer.__getitem__` fragt den abstrakten Wert des Tracers (`aval._getitem`). Eine Unterklasse von `ShapedArray` mit eigenem `_getitem` würde die Auswahl abfangen und liesse sich über `pure_callback_p.bind(..., result_avals=...)` an die Ausgabe hängen. JAX schlägt aber an mindestens neun Stellen im genauen Typ des abstrakten Werts nach (MLIR-Typen, Ergebnis-Handler, Nullen, Abbildung unter `vmap`, Callback-Formen, Sharding). Jede vergessene Tabelle wäre ein `KeyError` in irgendeinem selten benutzten Fall.
+
+Eingebaut ist der kleinste Eingriff: Der zurückgegebene Tracer bekommt eine Unterklasse seiner eigenen Klasse, die sich nur in `__getitem__` unterscheidet. Der abstrakte Typ, die Pytree-Struktur und alle anderen Operationen bleiben, wie JAX sie liefert.
+
+### 13. Frequenzblöcke
+
+Noel schickt seit `66f83b3` je 16 Frequenzen durch den ganzen Vorwärts- und Rückwärtslauf, damit die Zwischenfelder klein bleiben (Seitenfehler im ersten Vorwärtslauf in Docker 10 300 → 8 100). Hier bestimmt die Vorab-Elimination ihr Muster aus den Beträgen über alle Frequenzen und legt dafür Index-Strukturen an, die einige Millisekunden kosten. Pro Block neu aufgebaut wäre das teurer als der Gewinn. Dafür müsste man den Plan (einmal) von den Zahlen (pro Block) trennen. Das ist ein grösserer Umbau und in dieser Nacht nicht mehr sicher zu prüfen gewesen. Als offene Idee in `NOTIZEN.md` vermerkt.
+
 ## Nicht ausprobiert, weil es an den Regeln hängt
 
 - **XLA-Flags.** Auf x86 kostet das Kompilieren rund 290 ms von 960 ms, davon 186 ms für den Readout und 96 ms für die Gradientenfunktion. Diese Programme bestehen fast nur aus Operationen von `benchmark.py` selbst (42 und 25 Operationen, unsere Anteile sind je zwei Callbacks). Aus der Bibliothek heraus lässt sich daran nichts ändern, ausser über Flags. Das ist Frage B6. Nur zur Einordnung gemessen und nicht eingebaut: `XLA_FLAGS=--xla_backend_optimization_level=0` senkt den Readout von 185 auf 120 ms und den Gradienten von 91 auf 68 ms, zusammen rund 100 ms. `--xla_llvm_disable_expensive_passes=true` und `--xla_cpu_use_thunk_runtime=false` ändern nichts.
+- **`jax_disable_most_optimizations` und XLA-Flags in der Bibliothek setzen.** Die Branches `origin/sx`, `origin/sx2` und `origin/sx2-env` (Joel, auf Basis `philip`) messen genau das und melden dort 8,5 % weniger im Erstlauf. Das ist dieselbe Regelfrage B6. Hier nicht eingebaut.
 - **Code der importierten Bibliotheken ins eigene Repo kopieren.** Bringt nichts: `benchmark.py` importiert `jax` selbst und vor `differometor` (rund 370 ms). `import differometor` kostet danach noch 4–5 ms.
