@@ -25,6 +25,8 @@ Alle drei Spalten stammen aus einer Messreihe (07:03). Zwei Code-Commits kamen d
 
 **Endstand 07:29** (10 Läufe, abwechselnd): `noel` (`6b67cfd`, vierte Runde) 712,4 / 686,9 ms, `philip-nacht` (`010b1b0`) **610,0 / 568,4 ms**. Lower 40,2 → 32,3, Kompilieren 223,9 → 168,1, Vorwärtslauf 75,5 → 52,8, Gradient 34,9 → 10,3, Sensitivität 3,1 → 1,8, warm gesamt 84,1 → 53,1 ms.
 
+**Dreier-Vergleich 08:41** (8 Läufe, abwechselnd, Maschine nach einem Neustart etwas langsamer als um 07:29): `max/nacht` (`f1000e9`) 858,5 / 769,9 ms, `noel` (`6b67cfd`) 775,5 / 704,8 ms, `philip-nacht` (`d897aef`) **670,5 / 613,4 ms**. In derselben Reihenfolge: Kompilieren 232,4 / 234,6 / 180,5, Vorwärtslauf 102,3 / 84,2 / 61,5, Gradient 65,3 / 38,7 / 11,3, warm gesamt 136,3 / 93,2 / 62,9 ms (jeweils Median).
+
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
 Ohne Bytecode-Cache (frischer Export mit `git archive`, `PYTHONDONTWRITEBYTECODE=1` wie im Dockerfile, 8 Läufe): `noel` 781,1 / 749,4, `philip-nacht` 646,3 / 601,6. Der Import kostet dann bei beiden rund 300 ms.
@@ -237,6 +239,9 @@ python runs/philip/test_reverse.py
 python runs/philip/test_ports.py
 # Wechselvergleich unter Linux mit --cpus 1 (Vergleichsstand als Git-Worktree in einem zweiten Ordner)
 python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
+# Derselbe Wechselvergleich auf der Nebius-VM (Xeon Platinum 8468), vom Mac aus und für beliebige Commits.
+# Kopiert die Stände mit git archive nach ~/nacht-bench auf der VM, Ergebnis landet in _nacht/vm/.
+bash runs/philip/vm/vm_vergleich.sh <IP> 12 max=origin/max/nacht noel=origin/noel ich=HEAD
 ```
 
 ## Offene Ideen
