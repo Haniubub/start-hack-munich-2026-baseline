@@ -124,6 +124,7 @@ python runs/check_setups.py
 python runs/noel/test_detectors.py .
 python runs/philip/test_condensed.py
 python runs/philip/test_forward_cache.py
+python runs/philip/test_compat.py
 # Wechselvergleich unter Linux mit --cpus 1 (Vergleichsstand als Git-Worktree in einem zweiten Ordner)
 python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 ```
