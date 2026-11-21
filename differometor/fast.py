@@ -27,6 +27,10 @@ The JAX integration (`simulate_fast`) is a `jax.custom_vjp` around two
 `jax.pure_callback`s. The callbacks keep no Python state: the forward callback returns
 every residual the backward pass needs as arrays that flow through JAX, and the backward
 callback rebuilds the sparsity plan from them.
+
+JAX copies every array it hands to a callback. The reverse pass therefore gets no dense noise
+matrix and builds its plan from the index arrays alone: only matrix entries that depend on
+parameters receive a cotangent, so the constant entries are not needed there.
 """
 
 import importlib.machinery
@@ -436,14 +440,21 @@ def _last_writer(rows, columns, width):
 
 
 class SystemPlan:
-    """Static sparsity data derived from the index arrays (cheap, rebuilt in every callback)."""
+    """Static sparsity data derived from the index arrays (cheap, rebuilt in every callback).
 
-    def __init__(self, A):
+    The forward pass needs the complete sparsity pattern, so it scans the dense signal and noise
+    matrix for their nonzeros. The reverse pass only needs the entries that depend on parameters:
+    the ones written by component functions or multiplied by the carrier. `signal_base=False`
+    restricts the signal pattern to those entries and `noise_base=False` leaves out the constant
+    noise entries. Then no dense matrix is scanned and the noise matrix is not read at all.
+    """
+
+    def __init__(self, A, signal_base=True, noise_base=True):
         get = lambda key: np.asarray(A[key])
         self.carrier_base = get("carrier_matrix")
         self.n = n = self.carrier_base.shape[0]
-        signal_base = get("signal_matrix")
-        self.m = m = signal_base.shape[0]
+        signal_matrix = get("signal_matrix")
+        self.m = m = signal_matrix.shape[0]
 
         # Carrier system: pattern of the n x n matrix, right-hand side in column n.
         self.cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
@@ -460,12 +471,15 @@ class SystemPlan:
         smi = get("signal_matrix_indices") % np.array([[m], [m + 1]])
         placing = get("signal_carrier_placing_indices") % np.array([[m], [m + 1]])
         self.signal_carrier_indices = get("signal_carrier_indices").ravel()
-        base_rows, base_cols = np.divmod(_flat_nonzero(signal_base), m + 1)
         key = lambda rows, cols: cols * m + rows
-        keys = np.unique(np.concatenate([key(base_rows, base_cols), key(smi[0], smi[1]), key(placing[0], placing[1])]))
+        written = [key(smi[0], smi[1]), key(placing[0], placing[1])]
+        if signal_base:
+            base_rows, base_cols = np.divmod(_flat_nonzero(signal_matrix), m + 1)
+            written.append(key(base_rows, base_cols))
+        keys = np.unique(np.concatenate(written))
         cols, rows = np.divmod(keys, m)
         self.rows, self.cols, self.size = rows, cols, rows.size
-        self.signal_base = signal_base[rows, cols]
+        self.signal_base = signal_matrix[rows, cols]
         self.update_positions = np.searchsorted(keys, key(smi[0], smi[1]))
         self.update_live = _last_writer(smi[0], smi[1], m + 1)
         self.placing_positions = np.searchsorted(keys, key(placing[0], placing[1]))
@@ -483,17 +497,22 @@ class SystemPlan:
         self.rhs_rows = rows[~self.in_matrix]
 
         # Noise matrix: base entries plus entries written by noise component functions.
-        noise_base = get("noise_matrix")
         nmi = get("noise_system_matrix_indices") % m
         self.noise_live = _last_writer(nmi[0], nmi[1], m)
-        base = _flat_nonzero(noise_base)
-        base = base[~np.isin(base, nmi[0] * m + nmi[1])]
-        base_rows, base_cols = np.divmod(base, m)
+        if noise_base:
+            noise_matrix = get("noise_matrix")
+            base = _flat_nonzero(noise_matrix)
+            base = base[~np.isin(base, nmi[0] * m + nmi[1])]
+            base_rows, base_cols = np.divmod(base, m)
+            self.noise_base = noise_matrix[base_rows, base_cols]
+        else:
+            base_rows = base_cols = np.empty(0, np.intp)
+            self.noise_base = np.empty(0, complex)
         self.noise_rows = np.concatenate([base_rows, nmi[0][self.noise_live]])
         self.noise_cols = np.concatenate([base_cols, nmi[1][self.noise_live]])
-        self.noise_base = noise_base[base_rows, base_cols]
-        self.noise_by_row = _grouping(self.noise_rows)
-        self.noise_by_col = _grouping(self.noise_cols)
+        if noise_base:  # scatter plans for N y and N^H y (forward pass only)
+            self.noise_by_row = _grouping(self.noise_rows)
+            self.noise_by_col = _grouping(self.noise_cols)
         self.selection = get("noise_selection_vectors")[0, 0]
         # Rows the quantum noise detector reads. When they fit into DETECTOR_WIDTH, the forward pass
         # solves S^T z = e_d for each of them; Y and the signal adjoint are then combinations of z.
@@ -517,6 +536,17 @@ class SystemPlan:
         V[:, self.placing_positions[live]] = -pre[:, live] * carrier[self.signal_carrier_indices[live]]
         V[:, self.conjugated] = np.conj(V[:, self.conjugated])
         return V, pre
+
+    def placing_inputs(self, signal_entries):
+        """The `pre` values of `signal_values` alone: what the carrier is multiplied with, shape (F, P)."""
+        F = signal_entries.shape[0]
+        writer = np.full(self.size, -1)
+        writer[self.update_positions[self.update_live]] = np.nonzero(self.update_live)[0]
+        writer = writer[self.placing_positions]
+        written = writer >= 0
+        pre = np.broadcast_to(self.signal_base[self.placing_positions].astype(complex), (F, writer.size)).copy()
+        pre[:, written] = signal_entries[:, writer[written]]
+        return pre
 
     def _set_order(self, values_row):
         """Column order from COLAMD on one matrix, reused for all frequencies (shared pattern)."""
@@ -628,29 +658,36 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     return carrier, X, noise, Y, MU, Z
 
 
-def _signal_adjoint(plan, V, Z, signal_bar):
-    """lam_f = S_f^-T signal_bar_f for every frequency, shape (F, m)."""
+def _signal_adjoint(plan, Z, signal_bar, general_adjoint):
+    """lam_f = S_f^-T signal_bar_f for every frequency, shape (F, m).
+
+    The detector basis Z covers a cotangent that lives on the detector rows (the usual readout).
+    Any other cotangent needs the complete signal systems again: `general_adjoint(signal_bar)`.
+    """
     support = np.nonzero(np.any(signal_bar != 0, axis=0))[0]
     d, k = plan.detector, plan.detector.size
     if plan.use_basis and np.isin(support, d).all():
         return np.einsum("fmk,fk->fm", Z[:, :, :k], signal_bar[:, d])
-    lam = np.empty(signal_bar.shape, complex)
-    for f in range(V.shape[0]):
-        lam[f] = plan.signal_lu(V[f]).solve(signal_bar[f].astype(complex), trans="T")
-    return lam
+    return general_adjoint(signal_bar)
 
 
-def backward(plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar):
-    """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention)."""
+def backward(
+    plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, general_adjoint
+):
+    """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
+
+    `plan` only has to contain the parameter-dependent entries (`SystemPlan(..., signal_base=False,
+    noise_base=False)`): constant matrix entries receive no cotangent.
+    """
     n, m = plan.n, plan.m
     carrier_lu, _ = plan.carrier_matrix(carrier_entries)
-    V, pre = plan.signal_values(signal_entries, carrier)
-    F = V.shape[0]
+    pre = plan.placing_inputs(signal_entries)
+    F = signal_entries.shape[0]
     carrier_bar = carrier_bar.astype(complex).copy()
     V_bar = np.empty((F, plan.size), complex)
     g = noise_bar * NOISE_SCALE / noise  # d noise / d power
     rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
-    lam = _signal_adjoint(plan, V, Z, signal_bar)
+    lam = _signal_adjoint(plan, Z, signal_bar, general_adjoint)
     V_bar[:, plan.in_matrix] = -lam[:, rows] * X[:, cols] - 2 * g[:, None] * np.conj(Y[:, rows]) * MU[:, cols]
     V_bar[:, ~plan.in_matrix] = lam[:, plan.rhs_rows]
     w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
@@ -710,6 +747,10 @@ HOST_KEYS = (
     "noise_system_matrix_indices",
 )
 
+# The reverse pass does not read the dense noise matrix (see `SystemPlan`). Every array handed to a
+# callback is copied, so the 9 MB matrix is left out of the residuals.
+BACKWARD_KEYS = tuple(key for key in HOST_KEYS if key != "noise_matrix")
+
 
 def supports(arrays):
     """Static (shape/dtype only) check whether the fast path covers these `simulate` arguments."""
@@ -742,17 +783,28 @@ def _host_forward(optimized_parameters, *host_arrays):
 
 
 def _host_backward(optimized_parameters, *rest):
-    k = len(HOST_KEYS)
-    A = dict(zip(HOST_KEYS, rest[:k]))
+    k = len(BACKWARD_KEYS)
+    A = dict(zip(BACKWARD_KEYS, rest[:k]))
     carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
     F = Y.shape[0]
     entry_plan = EntryPlan(A)
     (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
+    carrier = np.asarray(carrier)[:, 0]
+
+    def general_adjoint(signal_bar):
+        # A cotangent outside the detector rows: factorize the complete signal systems once more.
+        plan = SystemPlan(A, noise_base=False)
+        V, _ = plan.signal_values(signal_entries, carrier)
+        lam = np.empty(signal_bar.shape, complex)
+        for f in range(F):
+            lam[f] = plan.signal_lu(V[f]).solve(signal_bar[f].astype(complex), trans="T")
+        return lam
+
     entries_bar = backward(
-        SystemPlan(A),
+        SystemPlan(A, signal_base=False, noise_base=False),
         carrier_entries,
         signal_entries,
-        np.asarray(carrier)[:, 0],
+        carrier,
         np.asarray(signal).T,
         np.asarray(noise).reshape(F),
         np.asarray(Y),
@@ -761,6 +813,7 @@ def _host_backward(optimized_parameters, *rest):
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar).T,
         np.asarray(noise_bar, float).reshape(F),
+        general_adjoint,
     )
     gradient = entry_plan.pullback(tape, *entries_bar, value_count=optimized_parameters.shape[0])
     return gradient.astype(optimized_parameters.dtype)
@@ -811,7 +864,7 @@ def _fast_fwd(optimized_parameters, host, others):
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
     outputs, (Y, MU, Z) = _forward_callback(p, host)
-    return outputs, (p, host, outputs, Y, MU, Z)
+    return outputs, (p, {key: host[key] for key in BACKWARD_KEYS}, outputs, Y, MU, Z)
 
 
 def _fast_bwd(residuals, cotangents):
@@ -823,7 +876,7 @@ def _fast_bwd(residuals, cotangents):
         _host_backward,
         jax.ShapeDtypeStruct(p.shape, p.dtype),
         p,
-        *(host[k] for k in HOST_KEYS),
+        *(host[k] for k in BACKWARD_KEYS),
         carrier,
         signal,
         noise,

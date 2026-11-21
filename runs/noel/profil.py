@@ -64,7 +64,9 @@ rng = np.random.default_rng(0)
 d = np.nonzero(np.asarray(arrays["noise_selection_vectors"])[0, 0])[0]
 signal_bar[d] = rng.normal(size=(d.size, signal.shape[1])) + 1j * rng.normal(size=(d.size, signal.shape[1]))
 noise_bar = rng.normal(size=noise.shape)
-args = (p, *host, carrier, signal, noise, *helpers, carrier_bar, signal_bar, noise_bar)
+backward_keys = getattr(fast, "BACKWARD_KEYS", fast.HOST_KEYS)  # older states pass every host array
+backward_host = [h for k, h in zip(fast.HOST_KEYS, host) if k in backward_keys]
+args = (p, *backward_host, carrier, signal, noise, *helpers, carrier_bar, signal_bar, noise_bar)
 for _ in range(2):
     t = pc(); g = fast._host_backward(*args); t_bwd = pc() - t
 print("backward seconds", t_bwd)
