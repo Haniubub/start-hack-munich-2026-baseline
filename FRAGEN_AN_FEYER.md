@@ -1,13 +1,13 @@
 # Fragen an Feyer
 
-Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` plus die Optimierungsrunde vom 21.11.).
+Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` plus zwei Optimierungsrunden vom 21.11.).
 Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
 
 ## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
 
 - Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
 - Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
-- Gemessen auf einem Apple M4: Original 12,8 s → 0,51 s auf macOS und 0,56 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
+- Gemessen auf einem Apple M4: Original 12,8 s → 0,45 s auf macOS und 0,53 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
 
 ## Die fünf wichtigsten Fragen
 
@@ -34,7 +34,7 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | A7 | Braucht ihr `vmap` über viele Parametersätze (`run_with_parameter_sets`), Forward-Mode (`jvp`) oder höhere Ableitungen? | Der schnelle Weg kann nur Reverse-Mode nach den Designvariablen. Alles andere läuft über den Rückfall. |
 | A8 | Wir laden den kompilierten SuperLU-Löser direkt aus dem SciPy-Paket (`scipy/sparse/linalg/_dsolve/_superlu`), ohne `import scipy.sparse.linalg`. Das spart rund 90 ms Import. Ist das in Ordnung? | Es ist ein internes Modul von SciPy. Falls nein, kostet uns der normale Import etwa 15 % der Gesamtzeit. |
 | A9 | `df.signal_detector` und `df.power_detector` rechnen bei uns in NumPy (Host-Callback) statt in JAX, mit eigener Rückwärtsregel. Das spart rund 30 ms Kompilierzeit im Readout. Zählt das? | Die Formeln sind unverändert, Forward-Mode geht damit aber nur noch über einen Schalter (`HOST_DETECTORS = False`). |
-| A10 | Dürfen wir Einstellungen des Lösers ändern (SuperLU `Relax=1`, `PanelSize=1`)? Die Pivotierung bleibt gleich. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7), die Zerlegung wird 40 % schneller. |
+| A10 | Dürfen wir Einstellungen des Lösers ändern? Wir nutzen SuperLU mit `Relax=1`, `PanelSize=1`, skalieren das System vorher (`D⁻¹·S·D` mit Zweierpotenzen) und lassen die Diagonale als Pivot zu, solange sie 10 % des grössten Spalteneintrags erreicht. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7). Die Zerlegung wird insgesamt etwa doppelt so schnell, und bei veränderten Designvariablen ist sie genauer als ohne Skalierung. |
 
 ## B. Wie wird gemessen?
 
@@ -43,9 +43,9 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
 | B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? | Der «first-run total» entsteht nur einmal pro Prozess. |
 | B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf je nach Zustand der Maschine um bis zu 40 ms, in älteren Docker-Messungen zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
-| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns zwei Drittel der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). |
+| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet allein das Übersetzen unserer Module 12,5 ms, mit Cache 1,4 ms. |
 | B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
-| B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». |
+| B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? Und dürfte unser Code selbst Einstellungen setzen (`jax.config`, Speicherverwaltung über `mallopt`)? | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». Wir setzen nichts davon. In Docker sind aber rund 100 ms reine XLA-Kompilation des Readouts aus `benchmark.py`, dort läge der grösste Rest. |
 | B7 | Sind der persistente Kompilier-Cache und vorab exportierte Programme (`jax.export`) wirklich ausgeschlossen? | Wir nutzen beides nicht und wollen sicher sein, dass es auch andere nicht dürfen. |
 | B8 | Wir laden Plotly erst bei Bedarf (`df.visualize_setup` funktioniert weiter). In Ordnung? | Der Benchmark braucht `visualize_setup` nicht, der Import lief aber in der gewerteten Zeit. |
 | B9 | Dürfen wir nur in `differometor/` ändern und dort auch neue Dateien anlegen? `benchmark.py` und die Fixtures lassen wir unverändert. | Der Report speichert die Hashes dieser Dateien. |
@@ -55,7 +55,7 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | Nr. | Frage | Warum wir fragen |
 | --- | --- | --- |
 | C1 | Die unveränderte Baseline weicht schon um 5,37e-6 von eurer Referenz ab, erlaubt sind 1e-5. Woher stammt die Referenz (andere Maschine, andere Version, anderes Programm)? | Uns bleiben nur 4,6e-6 Spielraum, obwohl wir vom Original nur um 5,8e-9 abweichen. |
-| C2 | Prüft ihr über `benchmark.py` hinaus, z. B. alle 193 Gradienten oder die Arrays carrier, signal und noise gegen die Baseline? Mit welcher Toleranz? | `benchmark.py` prüft nur einen der 193 Gradientenwerte. Unsere Abweichung zum Original: Gradient 8,0e-8, Signal 1,9e-7 (relativ zum Maximum). |
+| C2 | Prüft ihr über `benchmark.py` hinaus, z. B. alle 193 Gradienten oder die Arrays carrier, signal und noise gegen die Baseline? Mit welcher Toleranz? | `benchmark.py` prüft nur einen der 193 Gradientenwerte. Unsere Abweichung zum Original: Gradient 8,0e-8, Signal 1,2e-7 (relativ zum Maximum). |
 | C3 | Testet ihr weitere Setups, öffentliche (aLIGO, Voyager) oder nicht veröffentlichte? | Der schnelle Weg deckt nicht jedes Setup ab (siehe A3). |
 | C4 | Einzelne Gradienteneinträge liegen bei 1e-13, das Maximum bei 5,8e4. Diese Einträge schwanken schon im Original. Ist das akzeptiert? | Ein elementweiser relativer Vergleich würde dort fehlschlagen. |
 
