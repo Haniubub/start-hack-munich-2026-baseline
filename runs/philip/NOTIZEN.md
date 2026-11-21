@@ -21,7 +21,7 @@ Maschine: Intel Xeon 2,1 GHz (Emerald Rapids, Nachfolge-Generation des Xeon Plat
 | Warm Gradient | 77,8 / 68,3 | 33,0 / 28,2 | 8,4 / 7,3 |
 | Fehler gegen Feyers Referenz | 5,3742e-06 | 5,3743e-06 | 5,3743e-06 |
 
-Alle drei Spalten stammen aus einer Messreihe (07:03). Der letzte Commit (`36b3ea7`, ein Callback weniger im Readout) kam danach und bringt im Minimum noch rund 5 ms.
+Alle drei Spalten stammen aus einer Messreihe (07:03). Der letzte Code-Commit (`36b3ea7`, ein Callback weniger im Readout) kam danach und bringt im Minimum noch rund 5 ms.
 
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
@@ -175,6 +175,8 @@ Das Readout-Programm des Benchmarks hat damit 31 statt 42 Operationen, das Gradi
 
 **Der Haken:** Es braucht einen Eingriff in JAX-Interna. Der Tracer, den JAX zurückgibt, bekommt eine Unterklasse seiner eigenen Klasse, die sich nur in `__getitem__` unterscheidet (`_pick_ports_on_host`, über `tracer.__class__ = ...`). Abstrakter Typ, Pytree-Struktur und alle anderen Operationen bleiben. Zwei sauberere Wege sind gescheitert, siehe `FEHLVERSUCHE.md` Nr. 11 und 12. Mit konkreten Arrays (ohne Tracing) und unter `vmap` bleibt es bei der normalen JAX-Indexierung. `HOST_DETECTOR_PORTS = False` stellt überall die normale Indexierung wieder her.
 
+Geprüft auch in einem frischen Klon mit neuer Umgebung aus `requirements.txt`, unter Python 3.12 und 3.13.
+
 `test_ports.py` vergleicht mit der normalen Indexierung und mit dem JAX-Detektor: sechs Arten von Port-Arrays, int32 und int64, getracte und konstante Indizes, `jit`, `grad`, `vjp` mit vorgegebenem Kotangenten, `vmap`, `cond`, andere Formen, und alle übrigen Arten, die Ausgabe zu benutzen.
 
 ## Wo die Zeit auf x86 jetzt steckt
@@ -241,4 +243,5 @@ python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 | 1 | Noels Frequenzblöcke (je 16 Frequenzen) auch hier: Plan der Vorab-Elimination einmal, Zahlen pro Block | 3–8 ms (weniger Seitenfehler im ersten Vorwärtslauf) | Plan und Zahlen in `_CondensedLU` trennen, grösserer Umbau |
 | 2 | Vorab-Elimination nur dort für alle Frequenzen rechnen, wo sich Einträge über die Frequenz ändern | 2–4 ms | Buchführung pro Eintrag, ob er konstant ist |
 | 3 | Noels balancierte Zerlegung auf dem Restsystem | höchstens 1,5 ms | `FEHLVERSUCHE.md` Nr. 10 |
-| 4 | XLA-Flags oder `jax_disable_most_optimizations` | Joels Branches `sx*` melden 8,5 %. Hier früher gemessen: `--xla_backend_optimization_level=0` senkt Readout und Gradient zusammen um rund 90 ms (vor Änderung 17) | Regelfrage B6 |
+| 4 | XLA-Flags oder `jax_disable_most_optimizations` | Nur zur Einordnung gemessen, nicht eingebaut (07:20, 6 Läufe, alle `PASS`): mit `XLA_FLAGS=--xla_backend_optimization_level=0` auf diesem Stand Erstlauf 653,9 → 570,3 ms (Minimum 597,3 → 507,5), Kompilieren 183,9 → 114,8 ms, warm unverändert. `--xla_llvm_disable_expensive_passes=true` dazu bringt nichts mehr. Joels Branches `sx*` messen dasselbe auf Basis `philip` | Regelfrage B6 |
+| 5 | Python 3.13 statt 3.12 | Ein frischer Klon mit den gepinnten Paketen läuft unter 3.13 durch (`PASS`, alle Tests) und war im zweiten Lauf mit 562 ms rund 10 % schneller als unter 3.12 (632 ms). Nur ein Lauf je Version | Regelfrage B6 (Python-Version) |
