@@ -167,6 +167,11 @@ def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", sma
 # of it (see `_signal_adjoint`). Rounding leaves about 1e-16.
 PARALLEL_TOLERANCE = 1e-13
 
+# Rows per step where a product of two (rows, F) arrays is formed only to be stored or added
+# somewhere else. The intermediate array of one step (200 kB for 101 frequencies) is reused by
+# the next one instead of touching fresh memory for the whole product.
+_ROW_BLOCK = 128
+
 
 # ---------------------------------------------------------------------
 # Component functions on dual numbers
@@ -631,19 +636,30 @@ class SystemPlan:
         carrier_index, carrier_values, (n, _) = base_entries(A["carrier_matrix"])
         signal_index, signal_values, (m, _) = base_entries(A["signal_matrix"])
         self.n, self.m = n, m
-        # The carrier system is small (n x (n + 1)), so its base stays dense on the host.
-        self.carrier_base = np.zeros((n, n + 1), complex)
-        self.carrier_base.reshape(-1)[carrier_index] = carrier_values
-
-        # Carrier system: pattern of the n x n matrix, right-hand side in column n.
+        # Carrier system: pattern of the n x n matrix in CSC order (key `column * n + row`),
+        # right-hand side in column n. The pattern has the nonzero base entries and every entry
+        # a component function writes; no dense n x (n + 1) array is built for it.
         self.cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
         self.carrier_live = _last_writer(self.cmi[0], self.cmi[1], n + 1)
-        mask = self.carrier_base[:, :-1] != 0
+        base_rows, base_cols = np.divmod(carrier_index, n + 1)
+        in_base = (base_cols < n) & (carrier_values != 0)
         in_matrix = self.cmi[1] < n
-        mask[self.cmi[0][in_matrix], self.cmi[1][in_matrix]] = True
-        self.carrier_cols, self.carrier_rows = np.nonzero(mask.T)
-        self.carrier_rows = self.carrier_rows.astype(np.intc)
-        self.carrier_ptr = np.concatenate([[0], np.cumsum(mask.sum(0))]).astype(np.intc)
+        base_keys = base_cols[in_base] * n + base_rows[in_base]
+        written_keys = self.cmi[1][in_matrix] * n + self.cmi[0][in_matrix]
+        keys = np.unique(np.concatenate([base_keys, written_keys]))
+        self.carrier_cols, rows = np.divmod(keys, n)
+        self.carrier_rows = rows.astype(np.intc)
+        self.carrier_ptr = np.searchsorted(self.carrier_cols, np.arange(n + 1)).astype(np.intc)
+        self.carrier_base_values = np.zeros(keys.size, complex)
+        self.carrier_base_values[np.searchsorted(keys, base_keys)] = carrier_values[in_base]
+        self.carrier_base_rhs = np.zeros(n, complex)
+        self.carrier_base_rhs[base_rows[base_cols == n]] = carrier_values[base_cols == n]
+        # Where the entries that survive (last write wins) go: a pattern slot or a row of the right-hand side.
+        to_matrix, to_rhs = self.carrier_live & in_matrix, self.carrier_live & ~in_matrix
+        self.carrier_matrix_entries = np.nonzero(to_matrix)[0]
+        self.carrier_matrix_slots = np.searchsorted(keys, self.cmi[1][to_matrix] * n + self.cmi[0][to_matrix])
+        self.carrier_rhs_entries = np.nonzero(to_rhs)[0]
+        self.carrier_rhs_rows = self.cmi[0][to_rhs]
 
         # Signal system: pattern of the augmented m x (m + 1) matrix in CSC order. Entries are
         # identified by the key `column * m + row`, which sorts them column by column.
@@ -688,10 +704,12 @@ class SystemPlan:
         self._layout = None
 
     def carrier_matrix(self, carrier_entries):
-        n = self.n
-        M = self.carrier_base.astype(complex)
-        M[self.cmi[0][self.carrier_live], self.cmi[1][self.carrier_live]] = carrier_entries[self.carrier_live]
-        return _splu(n, M[self.carrier_rows, self.carrier_cols], self.carrier_rows, self.carrier_ptr), M[:, -1]
+        """Factorization of the carrier matrix and its right-hand side (n,)."""
+        values = self.carrier_base_values.copy()
+        values[self.carrier_matrix_slots] = carrier_entries[self.carrier_matrix_entries]
+        rhs = self.carrier_base_rhs.copy()
+        rhs[self.carrier_rhs_rows] = carrier_entries[self.carrier_rhs_entries]
+        return _splu(self.n, values, self.carrier_rows, self.carrier_ptr), rhs
 
     def signal_values(self, signal_entries, carrier, spare=0):
         """
@@ -707,8 +725,14 @@ class SystemPlan:
         else:
             V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
         pre = V[self.placing_positions]
-        live = self.placing_live
-        V[self.placing_positions[live]] = -pre[live] * carrier[self.signal_carrier_indices[live], None]
+        # Placing entries become -pre * carrier. The sign goes on the short carrier factor and the
+        # rows are written a block at a time, so no further arrays of the size of `pre` appear.
+        live = np.nonzero(self.placing_live)[0]
+        positions = self.placing_positions[live]
+        factors = -carrier[self.signal_carrier_indices[live]]
+        for start in range(0, live.size, _ROW_BLOCK):
+            block = slice(start, start + _ROW_BLOCK)
+            V[positions[block]] = pre[live[block]] * factors[block, None]
         np.negative(V.imag, out=V.imag, where=self.conjugated[:, None])  # conjugate those rows in place
         return V, pre
 
@@ -1347,7 +1371,8 @@ def _signal_adjoint(plan, carrier, signal, Yc, MU, signal_bar, g, V, factors):
         alpha = (np.conj(weights) @ cotangent) / (np.conj(weights) @ weights).real
         rest = np.abs(cotangent - weights[:, None] * alpha).max(axis=0)
         if (rest <= PARALLEL_TOLERANCE * np.abs(cotangent).max(axis=0)).all():
-            right -= signal * alpha
+            for start in range(0, right.shape[0], _ROW_BLOCK):
+                right[start : start + _ROW_BLOCK] -= signal[start : start + _ROW_BLOCK] * alpha
             return [(Yc, right)], lambda rows: Yc[rows] * alpha
     if factors is None:
         factors = plan.signal_factors(V)
@@ -1397,17 +1422,16 @@ def backward(
     # Cotangents of the visited matrix entries, built in place: sum_k left_k[rows] * right_k[cols].
     rows, cols = layout.rows, layout.cols
     block = np.empty((rows.size, F), complex)
-    work = None
-    for left, right in terms:
-        if work is None:
-            np.take(left, rows, axis=0, out=block, mode="clip")  # "clip" writes straight into `out`
-            work = np.take(right, cols, axis=0)
-            block *= work
-        else:
-            more = np.take(left, rows, axis=0)
-            np.take(right, cols, axis=0, out=work, mode="clip")
-            more *= work
-            block += more
+    for start in range(0, rows.size, _ROW_BLOCK):  # a block of rows at a time, see `_ROW_BLOCK`
+        part, r, c = block[start : start + _ROW_BLOCK], rows[start : start + _ROW_BLOCK], cols[start : start + _ROW_BLOCK]
+        for k, (left, right) in enumerate(terms):
+            if k == 0:
+                np.take(left, r, axis=0, out=part, mode="clip")  # "clip" writes straight into `out`
+                part *= right[c]
+            else:
+                more = left[r]
+                more *= right[c]
+                part += more
     if layout.right_hand_side.size:  # entries of the right-hand side column
         block[layout.right_hand_side] = lam_rows(rows[layout.right_hand_side])
     if layout.conjugated.any():
