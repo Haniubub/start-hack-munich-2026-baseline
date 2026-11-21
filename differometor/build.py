@@ -90,6 +90,37 @@ def _device_array(values, dtype=None) -> jnp.ndarray:
 _structure_array = structure_array
 
 
+def _fixed(values) -> np.ndarray:
+    """A read-only index array that many instruction sets share instead of each building its own."""
+    array = np.array(values)
+    array.flags.writeable = False
+    return array
+
+
+# Output selections and function inputs that are the same for every component of a kind. A build
+# creates several thousand tiny index arrays, and creating one costs more than everything that is
+# done with it afterwards. Only arrays that `set_instructions` never changes are shared: output
+# rows and columns and function inputs, never positions in a system matrix (the sideband layout
+# shifts those in place).
+_NO_INPUT = _fixed([[0, 0, 0, 0, 0, 0, 0]])  # a function that reads no parameter
+_OUTPUT_0 = _fixed([0])
+_OUTPUT_00 = _fixed([0, 0])
+_OUTPUT_0000 = _fixed([0, 0, 0, 0])
+_OUTPUT_0123 = _fixed([0, 1, 2, 3])
+_OUTPUT_0112 = _fixed([0, 1, 1, 2])
+_OUTPUT_01011212 = _fixed([0, 1, 0, 1, 1, 2, 1, 2])
+_OUTPUT_ZEROS_7 = _fixed([0] * 7)
+_OUTPUT_ZEROS_13 = _fixed([0] * 13)
+_OUTPUT_ROWS_0011 = _fixed([0, 0, 1, 1])
+_OUTPUT_ROWS_MIRROR_MASS = _fixed([0, 1, 1, 2, 2, 3, 4])
+_OUTPUT_ROWS_BEAMSPLITTER_MASS = _fixed([0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4])
+# The shared output selections once more behind themselves, as the sideband layout needs them
+# when every entry of an instruction set lies in the carrier block (keyed by identity).
+_TWICE = {id(array): _fixed(array.tolist() * 2) for array in (_OUTPUT_0, _OUTPUT_00, _OUTPUT_0000, _OUTPUT_0112, _OUTPUT_01011212)}
+# Number of distinct output rows of the shared row selections.
+_DISTINCT_ROWS = {id(array): len(set(array.tolist())) for array in (_OUTPUT_ROWS_0011, _OUTPUT_ROWS_MIRROR_MASS, _OUTPUT_ROWS_BEAMSPLITTER_MASS)}
+
+
 def _signal_base_matrix(carrier_base, system_size, full_size) -> BaseMatrix:
     """
     Constant entries of the signal matrix, taken from the entries of the finished carrier matrix.
@@ -149,6 +180,23 @@ def _sideband_layout(row_indices: np.ndarray, column_indices: np.ndarray, system
     build, and one NumPy call costs as much as the whole list operation.
     """
     rows, columns = row_indices.tolist(), column_indices.tolist()
+    if rows and max(rows) < system_size and max(columns) < system_size:
+        # The usual case (surfaces, noise sources): every entry lies in the carrier block, so
+        # nothing is shifted and every entry is copied once, in its original order.
+        new_companions = []
+        for companion in companions:
+            if companion is not None:
+                twice = _TWICE.get(id(companion))
+                if twice is None:
+                    values = companion.tolist()
+                    twice = np.array(values + values, dtype=companion.dtype)
+                companion = twice
+            new_companions.append(companion)
+        return (
+            np.array(rows + [row + system_size for row in rows], dtype=row_indices.dtype),
+            np.array(columns + [column + system_size for column in columns], dtype=column_indices.dtype),
+            new_companions,
+        )
     in_block_rows = [row < system_size for row in rows]
     in_block_columns = [column < system_size for column in columns]
     if not all(in_block_columns):
@@ -651,8 +699,8 @@ def build(setup: Setup):
             set_instructions(
                 signal_instructions,
                 node,
-                function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                output_column_indices=np.array([0]),
+                function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1, 0, 0, 0, 0, 0]]),
+                output_column_indices=_OUTPUT_0,
                 system_matrix_row_indices=np.array([system_size * 2 + signal_index]),
                 system_matrix_column_indices=np.array([-1]),
                 function_indices=[FUNCTIONS.index(signal_function)],
@@ -731,8 +779,8 @@ def build(setup: Setup):
                 set_instructions(
                     carrier_instructions,
                     node,
-                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                    output_column_indices=np.array([0]),
+                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1, 0, 0, 0, 0, 0]]),
+                    output_column_indices=_OUTPUT_0,
                     system_matrix_row_indices=np.array([component_index]),
                     system_matrix_column_indices=np.array([-1]),
                     function_indices=[FUNCTIONS.index(laser)],
@@ -741,8 +789,8 @@ def build(setup: Setup):
                 set_instructions(
                     noise_instructions,
                     node,
-                    function_input_indices=np.array([[0]]),
-                    output_column_indices=np.array([0]),
+                    function_input_indices=_NO_INPUT,
+                    output_column_indices=_OUTPUT_0,
                     system_matrix_row_indices=np.array([component_index]),
                     system_matrix_column_indices=np.array([component_index]),
                     function_indices=[FUNCTIONS.index(vacuum_quantum_noise)],
@@ -766,8 +814,8 @@ def build(setup: Setup):
                 set_instructions(
                     noise_instructions,
                     node,
-                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1]]),
-                    output_column_indices=np.array([0, 1, 2, 3]),
+                    function_input_indices=np.array([[len(parameters) - 2, len(parameters) - 1, 0, 0, 0, 0, 0]]),
+                    output_column_indices=_OUTPUT_0123,
                     system_matrix_row_indices=np.array(
                         [component_index, component_index, component_index + system_size, component_index + system_size]
                     ),
@@ -867,12 +915,12 @@ def build(setup: Setup):
                     ]
                 )
 
-                output_column_indices = np.array([0, 1, 1, 2])
-                system_matrix_row_indices = component_index + np.array([1, 1, 3, 3])
-                system_matrix_column_indices = component_index + np.array([0, 2, 0, 2])
+                output_column_indices = _OUTPUT_0112
+                system_matrix_row_indices = np.array([component_index + 1, component_index + 1, component_index + 3, component_index + 3])
+                system_matrix_column_indices = np.array([component_index, component_index + 2, component_index, component_index + 2])
 
-                noise_output_column_indices = np.array([0, 0])
-                noise_system_matrix_indices = component_index + np.array([1, 3])
+                noise_output_column_indices = _OUTPUT_00
+                noise_system_matrix_indices = np.array([component_index + 1, component_index + 3])
 
             elif data["component"] == "beamsplitter":
                 refractive_index_left_position = surfaces_to_refractive_index_parameter_position[node].get("left", 1)
@@ -930,12 +978,12 @@ def build(setup: Setup):
                     ]
                 )
 
-                output_column_indices = np.array([0, 1, 0, 1, 1, 2, 1, 2])
-                system_matrix_row_indices = component_index + np.array([1, 1, 3, 3, 5, 5, 7, 7])
-                system_matrix_column_indices = component_index + np.array([2, 4, 0, 6, 0, 6, 2, 4])
+                output_column_indices = _OUTPUT_01011212
+                system_matrix_row_indices = np.array([component_index + offset for offset in (1, 1, 3, 3, 5, 5, 7, 7)])
+                system_matrix_column_indices = np.array([component_index + offset for offset in (2, 4, 0, 6, 0, 6, 2, 4)])
 
-                noise_output_column_indices = np.array([0, 0, 0, 0])
-                noise_system_matrix_indices = component_index + np.array([1, 3, 5, 7])
+                noise_output_column_indices = _OUTPUT_0000
+                noise_system_matrix_indices = np.array([component_index + offset for offset in (1, 3, 5, 7)])
 
             # Initialize the carrier matrix diagonal block for the surface.
             carrier_matrix[
@@ -970,7 +1018,7 @@ def build(setup: Setup):
             set_instructions(
                 noise_instructions,
                 node,
-                function_input_indices=np.array([[loss_position]]),
+                function_input_indices=np.array([[loss_position, 0, 0, 0, 0, 0, 0]]),
                 output_column_indices=noise_output_column_indices,
                 system_matrix_row_indices=noise_system_matrix_indices,
                 system_matrix_column_indices=noise_system_matrix_indices,
@@ -1083,8 +1131,8 @@ def build(setup: Setup):
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, refractive_index_right_position, 2],
                     ]
                 ),
-                output_row_indices=np.array([0, 1, 1, 2, 2, 3, 4]),
-                output_column_indices=np.array([0] * 7),
+                output_row_indices=_OUTPUT_ROWS_MIRROR_MASS,
+                output_column_indices=_OUTPUT_ZEROS_7,
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
                 function_indices=[
@@ -1171,8 +1219,8 @@ def build(setup: Setup):
                         [signal_frequency_position, parameter_position + 2, parameter_position + 1, parameter_position, refractive_index_left_position, refractive_index_right_position, parameter_position + 3],
                     ]
                 ),
-                output_row_indices=np.array([0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 4, 4]),
-                output_column_indices=np.array([0] * 13),
+                output_row_indices=_OUTPUT_ROWS_BEAMSPLITTER_MASS,
+                output_column_indices=_OUTPUT_ZEROS_13,
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
                 function_indices=[
@@ -1249,8 +1297,8 @@ def build(setup: Setup):
         set_instructions(
             carrier_instructions,
             f"{source}_{target}",
-            function_input_indices=np.array([[0, parameter_position, parameter_position + 1]]),
-            output_column_indices=np.array([0, 0]),
+            function_input_indices=np.array([[0, parameter_position, parameter_position + 1, 0, 0, 0, 0]]),
+            output_column_indices=_OUTPUT_00,
             system_matrix_row_indices=np.array([source_input_index, target_input_index]),
             system_matrix_column_indices=np.array([target_output_index, source_output_index]),
             function_indices=[FUNCTIONS.index(space)],
@@ -1262,12 +1310,12 @@ def build(setup: Setup):
             f"{source}_{target}",
             function_input_indices=np.array(
                 [
-                    [signal_frequency_position, parameter_position, parameter_position + 1],
-                    [signal_frequency_position, parameter_position, parameter_position + 1],
+                    [signal_frequency_position, parameter_position, parameter_position + 1, 0, 0, 0, 0],
+                    [signal_frequency_position, parameter_position, parameter_position + 1, 0, 0, 0, 0],
                 ]
             ),
-            output_row_indices=np.array([0, 0, 1, 1]),
-            output_column_indices=np.array([0, 0, 0, 0]),
+            output_row_indices=_OUTPUT_ROWS_0011,
+            output_column_indices=_OUTPUT_0000,
             system_matrix_row_indices=np.array(
                 [
                     source_input_index,
@@ -1302,20 +1350,19 @@ def build(setup: Setup):
             )
             system_matrix_column_indices = np.array(signal_matrix_indices)
 
+            modulation_inputs = [signal_frequency_position, parameter_position, parameter_position + 1, 0, 0, 0, 0]
+            if space_signal_number == 1:  # the usual case, without np.tile and np.repeat
+                modulation_output_columns, modulation_output_rows = _OUTPUT_0000, _OUTPUT_ROWS_0011
+            else:
+                modulation_output_columns = np.array([0, 0, 0, 0] * space_signal_number)
+                modulation_output_rows = np.repeat(np.arange(space_signal_number * 2), 2)
+
             set_instructions(
                 signal_instructions,
                 f"{source}_{target}_modulation",
-                function_input_indices=np.tile(
-                    np.array(
-                        [
-                            [signal_frequency_position, parameter_position, parameter_position + 1],
-                            [signal_frequency_position, parameter_position, parameter_position + 1],
-                        ]
-                    ),
-                    (space_signal_number, 1),
-                ),
-                output_column_indices=np.array([0, 0, 0, 0] * space_signal_number),
-                output_row_indices=np.repeat(np.arange(space_signal_number * 2), 2),
+                function_input_indices=np.array([modulation_inputs] * (2 * space_signal_number)),
+                output_column_indices=modulation_output_columns,
+                output_row_indices=modulation_output_rows,
                 system_matrix_row_indices=system_matrix_row_indices,
                 system_matrix_column_indices=system_matrix_column_indices,
                 function_indices=[FUNCTIONS.index(space_modulation), FUNCTIONS.index(space_modulation_lower)] * space_signal_number,
@@ -1345,8 +1392,8 @@ def build(setup: Setup):
         set_instructions(
             noise_instructions,
             node_port,
-            function_input_indices=np.array([[0]]),
-            output_column_indices=np.array([0]),
+            function_input_indices=_NO_INPUT,
+            output_column_indices=_OUTPUT_0,
             system_matrix_row_indices=np.array([port_index]),
             system_matrix_column_indices=np.array([port_index]),
             function_indices=[FUNCTIONS.index(vacuum_quantum_noise)],
@@ -1487,11 +1534,16 @@ def pairs_to_arrays(
         signal_arrays["output_column_indices"].append(instruction["output_column_indices"])
 
         if "output_row_indices" in instruction:
-            signal_arrays["output_row_indices"].append(instruction["output_row_indices"].flatten() + signal_component_number)
-            individual_rows = len(set(instruction["output_row_indices"].flatten().tolist()))
+            output_rows = instruction["output_row_indices"]
+            if output_rows.ndim != 1:
+                output_rows = output_rows.flatten()
+            signal_arrays["output_row_indices"].append(output_rows + signal_component_number)
+            individual_rows = _DISTINCT_ROWS.get(id(output_rows))
+            if individual_rows is None:
+                individual_rows = len(set(output_rows.tolist()))
             signal_component_number += individual_rows
         else:
-            signal_arrays["output_row_indices"].append(np.full(len(instruction["output_column_indices"]), float(signal_component_number)))
+            signal_arrays["output_row_indices"].append(np.array([float(signal_component_number)] * len(instruction["output_column_indices"])))
             signal_component_number += 1
 
         signal_arrays["system_matrix_row_indices"].append(instruction["system_matrix_row_indices"])
@@ -1532,7 +1584,7 @@ def pairs_to_arrays(
         arrays["function_indices"].extend(instructions[component]["function_indices"])
         arrays["output_column_indices"].append(instructions[component]["output_column_indices"])
         arrays["output_row_indices"].append(
-            np.full(len(instructions[component]["output_column_indices"]), float(len(components) - 1))
+            np.array([float(len(components) - 1)] * len(instructions[component]["output_column_indices"]))
         )
         arrays["system_matrix_row_indices"].append(instructions[component]["system_matrix_row_indices"])
         arrays["system_matrix_column_indices"].append(instructions[component]["system_matrix_column_indices"])
