@@ -1,18 +1,18 @@
 {
   "benchmark": "start-munich-2026-public-differometor-uifo-v2",
-  "measured_at_utc": "2026-11-20T23:30:15.225875+00:00",
+  "measured_at_utc": "2026-11-21T02:23:07.126284+00:00",
   "starter_sha256": "d5950bbd872e5b00ad63f0bd7081e5096fb14ba9c96c80a6854a3b714719bd4e",
   "source": {
     "public_repository": "https://github.com/artificial-scientist-lab/Differometor",
     "baseline_commit": "b0dc7c79e7c72a1b010174f6bdcad01efa51d6ff",
-    "commit": "11b696f8266df0d936d6316ad467a68e3db6d99b",
-    "modified": true,
-    "diff_sha256": "375a9bd613a3c238d352379d6603d624a0d1680fc90745c8723c44e795c16f95",
+    "commit": "49d386b67b11d689aeeede26243c6738c7b32e18",
+    "modified": false,
+    "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "simulator_files_sha256": {
-      "differometor/__init__.py": "4db835c791fc3c12e10f290d1f76845fec656b3deaecc74913aaa9c3e5211409",
-      "differometor/build.py": "2a07d671e603e593520ed07c4914f3d2fdc64998cfa65aa9fd5dadfcc096caff",
+      "differometor/__init__.py": "c21a1a5a7cd14c8d9b81dafafa0dcbfe2b22ec53b9173463a19e7a67567bf1da",
+      "differometor/build.py": "af6fe4b6aac0f4794134b1189293da9886ff200760d5cf883c675772e713ee48",
       "differometor/components.py": "fcd89e266442dc11c0ab5ba9d712690587a187029fa607f6bd72a158af251968",
-      "differometor/fast.py": "103fa752b8f2c902c2d6f16d79db154293b606b686946894b7ee76f3fa6b8727",
+      "differometor/fast.py": "ed0d62aafbc0f38b4402f27394f774dde48460119dff97d479ca883a66155c6c",
       "differometor/plot.py": "16735e0fb14902f2c024e3da9f2655cbea634c4dd9e06c48af1247e12d0cf606",
       "differometor/setups.py": "478b1a7391b28604c36d8245e13ffa4f6d0f6dc32eeac6c6feaf5c08aa06a76b",
       "differometor/simulate.py": "5974c4f5ccc90abb4757934328d7bfdf8f9ca2a77cce2f4baf37b413e5066ecc",
@@ -881,191 +881,191 @@
       "key": "imports",
       "label": "Python / library imports",
       "category": "setup",
-      "seconds": 0.34035429201321676
+      "seconds": 0.30603504201280884
     },
     {
       "key": "initialize",
       "label": "Initialize CPU backend",
       "category": "setup",
-      "seconds": 0.0021579579915851355
+      "seconds": 0.0020518329984042794
     },
     {
       "key": "load",
       "label": "Read and parse public inputs",
       "category": "setup",
-      "seconds": 0.0018809159810189158
+      "seconds": 0.0014188339991960675
     },
     {
       "key": "build",
       "label": "Build optical setup and prepare inputs",
       "category": "setup",
-      "seconds": 0.032106124999700114
+      "seconds": 0.02599141700193286
     },
     {
       "key": "forward_lower",
       "label": "Forward: trace / lower",
       "category": "compile",
-      "seconds": 0.004443749989150092
+      "seconds": 0.003643916978035122
     },
     {
       "key": "forward_compile",
       "label": "Forward: compile",
       "category": "compile",
-      "seconds": 0.004021917004138231
+      "seconds": 0.0031987910042516887
     },
     {
       "key": "forward",
       "label": "Forward simulation + AD residuals",
       "category": "execute",
-      "seconds": 0.03679987500072457
+      "seconds": 0.030322750011691824
     },
     {
       "key": "sensitivity_lower",
       "label": "Sensitivity: trace / lower",
       "category": "compile",
-      "seconds": 0.010829083010321483
+      "seconds": 0.009819874976528808
     },
     {
       "key": "sensitivity_compile",
       "label": "Sensitivity: compile",
       "category": "compile",
-      "seconds": 0.026751750003313646
+      "seconds": 0.023044708010274917
     },
     {
       "key": "sensitivity",
       "label": "Sensitivity, powers and scalar loss",
       "category": "execute",
-      "seconds": 0.0007477500184904784
+      "seconds": 0.0005622909811791033
     },
     {
       "key": "gradient_lower",
       "label": "Gradient: trace / lower",
       "category": "compile",
-      "seconds": 0.00490458300919272
+      "seconds": 0.004285083006834611
     },
     {
       "key": "gradient_compile",
       "label": "Gradient: compile",
       "category": "compile",
-      "seconds": 0.020659125002566725
+      "seconds": 0.017957166011910886
     },
     {
       "key": "gradient",
       "label": "Reverse-mode gradient",
       "category": "execute",
-      "seconds": 0.017743792006513104
+      "seconds": 0.012095790996681899
     },
     {
       "key": "host_transfer",
       "label": "Transfer results to host",
       "category": "output",
-      "seconds": 0.0001192079798784107
+      "seconds": 9.987500379793346e-05
     }
   ],
   "repeat_samples": [
     {
-      "forward": 0.030852209019940346,
-      "sensitivity": 0.0003904589975718409,
-      "gradient": 0.016197374992771074,
-      "host_transfer": 8.062500273808837e-05
+      "forward": 0.026129792007850483,
+      "sensitivity": 0.00033924999297596514,
+      "gradient": 0.011089084000559524,
+      "host_transfer": 5.975001840852201e-05
     },
     {
-      "forward": 0.03036562498891726,
-      "sensitivity": 0.00045529199996963143,
-      "gradient": 0.01563733399962075,
-      "host_transfer": 7.204199209809303e-05
+      "forward": 0.025653457996668294,
+      "sensitivity": 0.0003568340034689754,
+      "gradient": 0.011638833006145433,
+      "host_transfer": 7.029197877272964e-05
     },
     {
-      "forward": 0.0291217080084607,
-      "sensitivity": 0.0004116249911021441,
-      "gradient": 0.01512462500249967,
-      "host_transfer": 7.562499376945198e-05
+      "forward": 0.025313374993856996,
+      "sensitivity": 0.0003762500127777457,
+      "gradient": 0.011663790995953605,
+      "host_transfer": 7.375000859610736e-05
     },
     {
-      "forward": 0.02967875002650544,
-      "sensitivity": 0.0003766249865293503,
-      "gradient": 0.01543341699289158,
-      "host_transfer": 6.433299859054387e-05
+      "forward": 0.02515512498212047,
+      "sensitivity": 0.0003220830112695694,
+      "gradient": 0.011132249986985698,
+      "host_transfer": 5.816700286231935e-05
     },
     {
-      "forward": 0.029500875010853633,
-      "sensitivity": 0.0005119580018799752,
-      "gradient": 0.017860916996141896,
-      "host_transfer": 6.966700311750174e-05
+      "forward": 0.025358332990435883,
+      "sensitivity": 0.0003629580023698509,
+      "gradient": 0.011406415986130014,
+      "host_transfer": 6.454199319705367e-05
     },
     {
-      "forward": 0.03027433398528956,
-      "sensitivity": 0.00047849997645244,
-      "gradient": 0.016464584012283012,
-      "host_transfer": 7.591699250042439e-05
+      "forward": 0.02627291699172929,
+      "sensitivity": 0.0004059579805471003,
+      "gradient": 0.012004416988929734,
+      "host_transfer": 7.033301517367363e-05
     },
     {
-      "forward": 0.02964704201440327,
-      "sensitivity": 0.0004528749850578606,
-      "gradient": 0.015864708984736353,
-      "host_transfer": 6.937500438652933e-05
+      "forward": 0.025661208987003192,
+      "sensitivity": 0.0003533340059220791,
+      "gradient": 0.011267833993770182,
+      "host_transfer": 5.9250014601275325e-05
     },
     {
-      "forward": 0.029335416009416804,
-      "sensitivity": 0.0004464159719645977,
-      "gradient": 0.0162877090042457,
-      "host_transfer": 7.675000233575702e-05
+      "forward": 0.025056749989744276,
+      "sensitivity": 0.00031354097882285714,
+      "gradient": 0.011085042002378032,
+      "host_transfer": 6.00829953327775e-05
     },
     {
-      "forward": 0.029656458005774766,
-      "sensitivity": 0.00034683398553170264,
-      "gradient": 0.015921166021144018,
-      "host_transfer": 6.604200461879373e-05
+      "forward": 0.025198624993208796,
+      "sensitivity": 0.0003531250113155693,
+      "gradient": 0.01130287500564009,
+      "host_transfer": 6.033299723640084e-05
     },
     {
-      "forward": 0.029861249990062788,
-      "sensitivity": 0.0003980839974246919,
-      "gradient": 0.016134042001795024,
-      "host_transfer": 8.012499893084168e-05
+      "forward": 0.02510483399964869,
+      "sensitivity": 0.0003665830008685589,
+      "gradient": 0.011240917025133967,
+      "host_transfer": 6.495800334960222e-05
     }
   ],
   "timing_seconds": {
-    "end_to_end": 0.5035201240098104,
-    "trace_lower_and_compile": 0.0716102080186829,
+    "end_to_end": 0.44052737299352884,
+    "trace_lower_and_compile": 0.06194953998783603,
     "runtime_samples": [
-      0.04752066801302135,
-      0.046530292980605736,
-      0.044733582995831966,
-      0.045553125004516914,
-      0.047943417011993006,
-      0.047293334966525435,
-      0.04603400098858401,
-      0.04614629098796286,
-      0.04599050001706928,
-      0.046473500988213345
+      0.037617876019794494,
+      0.03771941698505543,
+      0.037427166011184454,
+      0.036667624983238056,
+      0.0371922489721328,
+      0.0387536249763798,
+      0.03734162700129673,
+      0.03651541596627794,
+      0.036914958007400855,
+      0.03677729202900082
     ],
-    "runtime_median": 0.0463098959880881,
-    "runtime_min": 0.044733582995831966,
-    "runtime_max": 0.047943417011993006,
+    "runtime_median": 0.037266937986714765,
+    "runtime_min": 0.03651541596627794,
+    "runtime_max": 0.0387536249763798,
     "phase_runtime_medians": {
-      "forward": 0.029667604016140103,
-      "sensitivity": 0.0004290204815333709,
-      "gradient": 0.01602760401146952,
-      "host_transfer": 7.38334929337725e-05
+      "forward": 0.02533585399214644,
+      "sensitivity": 0.00035508400469552726,
+      "gradient": 0.011285354499705136,
+      "host_transfer": 6.243749521672726e-05
     }
   },
   "validation": {
     "all_outputs_and_gradients_finite": true,
     "upstream_sensitivity_check_passed": true,
-    "max_absolute_log_sensitivity_error": 5.374545509084783e-06,
+    "max_absolute_log_sensitivity_error": 5.374280199532677e-06,
     "gradient_check": {
       "parameter": "mb11.tuning",
-      "autodiff": 7.616168423793136e-05,
+      "autodiff": 7.616168425003024e-05,
       "finite_differences": [
         {
           "step": 0.001,
-          "central_difference": 7.616632039665375e-05,
-          "absolute_error": 4.6361587223886676e-09
+          "central_difference": 7.616176235443311e-05,
+          "absolute_error": 7.810440286876424e-11
         },
         {
           "step": 0.0005,
-          "central_difference": 7.619813293551724e-05,
-          "absolute_error": 3.6448697585879266e-08
+          "central_difference": 7.616156147170338e-05,
+          "absolute_error": 1.2277832686625155e-10
         }
       ],
       "rtol": 0.01,
@@ -1075,8 +1075,8 @@
     "gradient_shape": [
       193
     ],
-    "gradient_norm": 70517.10072209593,
-    "loss": 9.724718354127166e-08,
+    "gradient_norm": 70517.10072840418,
+    "loss": 9.724620658107728e-08,
     "output_shapes": {
       "carrier": [
         286,

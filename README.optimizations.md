@@ -92,6 +92,29 @@ Was geändert wurde:
 
 Die Abweichungen zum Original-JAX sind unverändert (Sensitivität 5,8e-9, Gradient 8,0e-8). Details, Messmethode und offene Ideen stehen in [`runs/noel/NOTIZEN.md`](runs/noel/NOTIZEN.md). Die Tabellen weiter oben zeigen den Stand vor dieser Runde.
 
+## Zweite Runde vom 21.11. (Branch `noel`)
+
+Drei Stände im Wechsel gemessen, je frischer Prozess, Erstlauf gesamt als Median. Die absoluten Werte hängen vom Zustand der Maschine ab und liegen an diesem Tag tiefer als in der Tabelle oben. Vergleichbar sind nur Werte aus derselben Messreihe.
+
+| Umgebung | Philip + Max | Nach der ersten Runde | Nach der zweiten Runde |
+|---|---:|---:|---:|
+| Apple M4, macOS, Threads auf 1 begrenzt (12 Läufe) | 0,602 s | 0,459 s | **0,453 s** |
+| Docker, Linux aarch64, `--cpus 1` (10 Läufe) | 0,711 s | 0,539 s | **0,529 s** |
+
+Was geändert wurde:
+
+| Änderung | Wirkung (Docker / Mac) |
+|---|---|
+| Rückwärtslauf ohne dichte Matrizen: Der Plan entsteht nur aus den Index-Arrays, die Rauschmatrix wird nicht mehr übergeben | Gradient 26,9 → 21,4 ms / 16,2 → 13,3 ms |
+| Signal-Systeme skaliert (`D⁻¹·S·D`), symmetrisch angeordnet und mit Schwellen-Pivotsuche zerlegt | Forward 42,3 → 39,3 ms / 32,8 → 30,6 ms |
+| Dichte Matrizen im Build ausgerichtet anlegen, damit JAX sie ohne Kopie übernimmt | netto 1,1 ms / 0,6 ms |
+
+Zum zweiten Punkt: Jede Gleichung des Signal-Systems bestimmt ihre eigene Unbekannte, die Diagonale ist 1. Darum eliminiert der Löser jetzt in einer Minimum-Degree-Reihenfolge von `S + Sᵀ` und nimmt die Diagonale als Pivot, solange sie mindestens 10 % des grössten Eintrags ihrer Spalte erreicht. Sonst nimmt SuperLU wie bisher den grössten Eintrag. Die L- und U-Faktoren haben damit rund 6'100 statt 8'330 Einträge. Vor der Zerlegung wird das System mit Zweierpotenzen skaliert, weil die Unbekannten sehr verschiedene Einheiten haben (Einträge von 1e-11 bis 1e13).
+
+Die Skalierung macht den Löser auch genauer. Bei zufällig veränderten Designvariablen (`runs/noel/test_perturbed.py`) stimmt die Sensitivität jetzt in allen sechs Versuchen auf 2e-8 (im Logarithmus) mit dem Original-JAX überein. Die unskalierte Zerlegung lag in einem der Versuche um 8e-6 daneben, also knapp unter der Benchmark-Toleranz von 1e-5.
+
+Am gespeicherten Design bleiben die Abweichungen zum Original-JAX auf dem bisherigen Niveau (Sensitivität 5,7e-9, Gradient 8,0e-8, Signal 1,2e-7). Der neue Test `runs/noel/test_adjoint.py` prüft zusätzlich den allgemeinen Rückwärtslauf mit Gewichten auf allen Ausgängen.
+
 ## Wo die verbleibende Zeit steckt
 
 Im First-Run (ca. 0,4 s auf macOS) steckt kaum noch Physik:
