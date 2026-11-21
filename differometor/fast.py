@@ -559,7 +559,7 @@ class SystemPlan:
 
     def signal_factors(self, V):
         """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
-        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, np.ascontiguousarray(V.T[self.in_matrix]))
+        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V.T, self.in_matrix)
 
     def signal_lu(self, values_row):
         if self.order is None:
@@ -619,7 +619,13 @@ class _BlockLU:
         return x
 
 
-def _eliminable(size, rows, cols, values):
+def _largest_square(values):
+    """max over the frequencies of |v|^2 for entry values of shape (entries, F)."""
+    parts = np.ascontiguousarray(values).view(np.float64).reshape(values.shape[0], values.shape[1], 2)
+    return np.einsum("efk,efk->ef", parts, parts).max(axis=1, initial=0.0)
+
+
+def _eliminable(size, rows, cols, square, one):
     """
     Mask of unknowns that can be eliminated exactly before the LU, without pivoting.
 
@@ -629,17 +635,17 @@ def _eliminable(size, rows, cols, values):
     scale, so the elimination is as stable as LU with pivoting. The selected unknowns are not
     coupled to each other: their block of the matrix is the identity.
 
-    `values` has shape (entries, F). Also returns the mask of entries that are nonzero anywhere.
+    `square` is the largest |v|^2 of every entry over the frequencies, `one` marks entries that
+    are exactly 1 everywhere. Also returns the mask of entries that are nonzero somewhere.
     """
-    magnitude = (values.real**2 + values.imag**2).max(axis=1)
     diagonal = rows == cols
     unit = np.zeros(size, bool)
-    unit[rows[diagonal]] = (values[diagonal] == 1).all(axis=1)
-    live = magnitude > 0
+    unit[rows[diagonal]] = one[diagonal]
+    live = square > 0
     off = live & ~diagonal
     r, c = rows[off], cols[off]
     row_max = np.zeros(size)
-    np.maximum.at(row_max, r, magnitude[off])
+    np.maximum.at(row_max, r, square[off])
     row_count, column_count = np.bincount(r, minlength=size), np.bincount(c, minlength=size)
     undecided = unit & ((row_max <= 1 + 1e-9) | (column_count == 0))
     # Independent set, built in rounds: an undecided unknown is picked when it has the lowest
@@ -694,17 +700,20 @@ class _Elimination:
         S = [[1, S_IJ], [S_JI, S_JJ]],
 
     so x_I = b_I - S_IJ x_J and the remaining system is (S_JJ - S_JI S_IJ) x_J = b_J - S_JI b_I.
-    The transposed system reduces to the transpose of the same matrix. Unknowns keep their
-    numbers; `rows`, `cols` and `values` (entries, F) describe the remaining system in CSC order.
+    The transposed system reduces to the transpose of the same matrix.
+
+    Unknowns keep their numbers. The entry values of all stages live in one array `store` of
+    shape (capacity, F); `ids` are the rows of `store` for the pattern (`rows`, `cols`), which is
+    in CSC order. Entries of S_JJ that the step changes are updated in place, fill-in is appended.
     """
 
-    def __init__(self, size, rows, cols, values, picked, live):
+    def __init__(self, size, rows, cols, ids, picked, live, store, used):
         row_in, col_in = picked[rows], picked[cols]
         ij = np.nonzero(live & row_in & ~col_in)[0]
         ji = np.nonzero(live & ~row_in & col_in)[0]
         jj = np.nonzero(live & ~row_in & ~col_in)[0]
-        self.upper = _BlockCSR(size, rows[ij], cols[ij], values[ij])  # S_IJ
-        self.lower = _BlockCSR(size, rows[ji], cols[ji], values[ji])  # S_JI
+        self.upper = _BlockCSR(size, rows[ij], cols[ij], store[ids[ij]])  # S_IJ
+        self.lower = _BlockCSR(size, rows[ji], cols[ji], store[ids[ji]])  # S_JI
         # S_JI S_IJ: every entry (r, i) meets every entry (i, j) of the same eliminated unknown i.
         by_unknown = np.argsort(rows[ij], kind="stable")
         count = np.bincount(rows[ij], minlength=size)
@@ -714,16 +723,27 @@ class _Elimination:
         left = np.repeat(np.arange(ji.size), partners)
         offset = np.arange(left.size) - np.repeat(np.cumsum(partners) - partners, partners)
         right = by_unknown[start[unknown[left]] + offset]
-        kept = cols[jj] * size + rows[jj]
-        filled = cols[ij[right]] * size + rows[ji[left]]
-        keys, position = np.unique(np.concatenate([kept, filled]), return_inverse=True)
-        self.cols, self.rows = np.divmod(keys, size)
-        self.values = np.zeros((keys.size, values.shape[1]), complex)
-        self.values[position[: jj.size]] = values[jj]
+        keys, self.ids, self.changed, self.used = cols[jj] * size + rows[jj], ids[jj], ids[:0], used
         if left.size:
-            order, starts, slots = _grouping(position[jj.size :])
-            products = values[ji[left[order]]] * values[ij[right[order]]]
-            self.values[slots] -= np.add.reduceat(products, starts, axis=0)
+            order, starts, targets = _grouping(cols[ij[right]] * size + rows[ji[left]])
+            at = np.minimum(np.searchsorted(keys, targets), max(keys.size - 1, 0))
+            exists = keys[at] == targets if keys.size else np.zeros(targets.size, bool)
+            fresh = used + np.arange(targets.size - exists.sum())
+            self.used = used + fresh.size
+            self.fits = self.used <= store.shape[0]
+            if not self.fits:
+                return
+            sums = np.add.reduceat(store[ids[ji[left[order]]]] * store[ids[ij[right[order]]]], starts, axis=0)
+            touched = self.ids[at[exists]]
+            store[touched] -= sums[exists]
+            store[fresh] = 0.0
+            store[fresh] -= sums[~exists]
+            self.changed = np.concatenate([touched, fresh])
+            keys, self.ids = np.concatenate([keys, targets[~exists]]), np.concatenate([self.ids, fresh])
+            order = np.argsort(keys, kind="stable")
+            keys, self.ids = keys[order], self.ids[order]
+        self.fits = True
+        self.cols, self.rows = np.divmod(keys, size)
 
 
 class _CondensedLU:
@@ -738,25 +758,44 @@ class _CondensedLU:
     while a stage still removes a good share of the system. SuperLU (with partial pivoting, as
     before) only factorizes what is left: 200 of 751 unknowns for the benchmark setup.
 
-    `values` has shape (entries, F) for the CSC pattern (`rows`, `cols`). Right-hand sides and
-    solutions have shape (F, size, k).
+    `values` has shape (entries, F) for the CSC pattern (`rows`, `cols`). With `select`, a
+    boolean mask, `values` has one row per mask element and only the selected rows are entries.
+    Right-hand sides and solutions have shape (F, size, k).
     """
 
     MAX_STAGES = 3
     MIN_SHARE = 0.25  # stop when a stage would remove less than this share of the unknowns
     ORDERING = "MMD_ATA"  # 5-10 % less SuperLU work than COLAMD on the reduced systems
 
-    def __init__(self, size, rows, cols, values):
+    def __init__(self, size, rows, cols, values, select=None):
+        entries, F = rows.size, values.shape[1]
+        store = np.empty((3 * entries + 256, F), complex)  # entry values of all stages, with room for fill-in
+        if select is None:
+            store[:entries] = values
+        else:
+            np.compress(select, values, axis=0, out=store[:entries])
+        ids, used = np.arange(entries), entries
         self.stages = []
         remaining = np.ones(size, bool)
-        while _sparsetools is not None and len(self.stages) < self.MAX_STAGES:
-            picked, live = _eliminable(size, rows, cols, values)
-            if picked.sum() < self.MIN_SHARE * remaining.sum():
-                break
-            stage = _Elimination(size, rows, cols, values, picked, live)
-            self.stages.append(stage)
-            remaining &= ~picked
-            rows, cols, values = stage.rows, stage.cols, stage.values
+        if _sparsetools is not None and self.MAX_STAGES:
+            square = np.zeros(store.shape[0])
+            one = np.zeros(store.shape[0], bool)
+            square[:entries] = _largest_square(store[:entries])
+            diagonal = np.nonzero(rows == cols)[0]
+            one[diagonal] = (store[diagonal] == 1).all(axis=1)
+            while len(self.stages) < self.MAX_STAGES:
+                picked, live = _eliminable(size, rows, cols, square[ids], one[ids])
+                if picked.sum() < self.MIN_SHARE * remaining.sum():
+                    break
+                stage = _Elimination(size, rows, cols, ids, picked, live, store, used)
+                if not stage.fits:
+                    break
+                self.stages.append(stage)
+                remaining &= ~picked
+                rows, cols, ids, used = stage.rows, stage.cols, stage.ids, stage.used
+                changed = store[stage.changed]
+                square[stage.changed] = _largest_square(changed)
+                one[stage.changed] = (changed == 1).all(axis=1)
         # What is left goes to SuperLU, renumbered 0..n-1. The column order comes from one
         # matrix and is reused for all frequencies (shared pattern).
         self.rest = rest = np.nonzero(remaining)[0]
@@ -764,12 +803,12 @@ class _CondensedLU:
         number = np.cumsum(remaining) - 1
         rows, cols = number[rows].astype(np.intc), number[cols]
         pointers = np.searchsorted(cols, np.arange(n + 1)).astype(np.intc)
-        first = _splu(n, np.ascontiguousarray(values[:, 0]), rows, pointers, self.ORDERING)
+        first = _splu(n, np.ascontiguousarray(store[ids, 0]), rows, pointers, self.ORDERING)
         order = np.argsort(first.perm_c)
         counts = np.diff(pointers)[order]
         ordered_ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.intc)
         gather = np.repeat(pointers[order] - ordered_ptr[:-1], counts) + np.arange(ordered_ptr[-1])
-        self.lu = _BlockLU(n, np.ascontiguousarray(values[gather].T), rows[gather], ordered_ptr)
+        self.lu = _BlockLU(n, np.ascontiguousarray(store[ids[gather]].T), rows[gather], ordered_ptr)
         self.ordered = rest[order]
 
     def solve(self, b, trans="N"):
