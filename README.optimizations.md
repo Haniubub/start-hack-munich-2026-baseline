@@ -151,7 +151,25 @@ Eine Änderung: Der Rückwärtslauf speichert Ableitungen der Komponentenfunktio
 | Apple M4, macOS (16 Läufe im Wechsel) | 0,438 s | **0,436 s** | 10,7 → 9,8 ms | 32,4 → 31,3 ms |
 | Docker, Linux aarch64, `--cpus 1` (12 Läufe im Wechsel) | 0,519 s | **0,515 s** | 16,4 → 14,8 ms | 40,3 → 38,4 ms |
 
-Alle Prüfungen fallen aus wie zuvor. Gemessen und bewusst nicht übernommen wurde eine Bündelung der kleinen Arrays für den Rückwärtslauf: Sie macht den Erstlauf in Docker 3 ms schneller, die warmen Wiederholungen dort aber 6 ms langsamer. Die Einzelheiten stehen in `runs/noel/NOTIZEN.md`.
+Alle Prüfungen fallen aus wie zuvor. Gemessen und in dieser Runde noch nicht übernommen wurde eine Bündelung der kleinen Arrays für den Rückwärtslauf: Sie macht den Erstlauf in Docker 3 ms schneller, die warmen Wiederholungen dort aber 6 ms langsamer. Die Einzelheiten stehen in `runs/noel/NOTIZEN.md`.
+
+## Fünfte Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung, auf Noels Entscheid: Die 22 kleinen Arrays, die der Rückwärtslauf braucht (Index-Arrays, Parameter, Frequenzen), reisen als zwei gepackte Residuen statt einzeln. Der Rückwärts-Callback bekommt 16 statt 36 Argumente.
+
+| Umgebung | Erstlauf ohne Imports | Gradient-Phase | Warm |
+|---|---|---|---|
+| Apple M4, macOS (20 Läufe im Wechsel) | 139,5 → **138,4 ms** | 11,1 → 11,2 ms | 32,8 → 32,5 ms |
+| Docker, Linux aarch64, `--cpus 1` (12 Läufe im Wechsel) | 219,4 → **216,1 ms** | 17,1 → 14,6 ms | 41,6 → 44,8 ms |
+| Docker, zweite Reihe (16 Läufe, Reihenfolge getauscht) | 221,1 → **214,6 ms** | 17,7 → 14,5 ms | 39,7 → 46,6 ms |
+
+Was man dazu wissen muss:
+
+- **In der Gesamtzeit ist der Gewinn nicht nachweisbar.** Die Import-Phase (rund 320 ms, fast alles `import jax`) streut um ±3 ms. Die Gesamtzeiten der drei Reihen: 461,2 → 461,6 ms, 534,7 → 535,3 ms und 548,5 → 535,5 ms. Die Messung lief auf Akku, darum liegen alle Werte rund 5 % höher als in den Runden davor.
+- **Die warmen Wiederholungen werden in Docker 3 bis 7 ms langsamer.** Das ist der bewusst in Kauf genommene Preis: Für die Wertung zählt der Erstlauf.
+- **Der grössere Teil des Gewinns hängt am Speicherlayout.** In Docker fallen im Erstlauf rund 6'000 Seitenfehler weniger an (rund 3,5 ms), dafür in jedem warmen Aufruf mehr. Beides hängt davon ab, wann glibc Speicher ans System zurückgibt, und kann auf einer x86-Maschine anders ausfallen. Sicher übertragbar ist rund 1 ms (weniger Argumente beim Lowering und Kompilieren). Darum sollten beide Stände (`6b67cfd` ohne, `45a2328` mit Bündelung) auf x86 im Wechsel gemessen werden. Ist die Bündelung dort nicht schneller, genügt `git revert 45a2328`.
+
+Die Ausgaben aller Prüfskripte sind Zeile für Zeile gleich wie zuvor. Neu ist `runs/noel/test_pack.py`: Es prüft, dass das Packen jedes Array exakt wiederherstellt.
 
 ## Wo die verbleibende Zeit steckt
 
