@@ -150,8 +150,9 @@ def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", sma
     )
 
 
-# Columns of the detector basis Z = S^-T [e_d] kept per frequency (upper + lower sideband of one port).
-DETECTOR_WIDTH = 2
+# A signal cotangent counts as a multiple of the detector weights when the rest is below this share
+# of it (see `_signal_adjoint`). Rounding leaves about 1e-16.
+PARALLEL_TOLERANCE = 1e-13
 
 
 # ---------------------------------------------------------------------
@@ -345,7 +346,12 @@ class _EntryBlock:
         # and the scatter from those entries back to (call, output) slots for the reverse pass.
         # Several entries may share a slot.
         self.readers, self.scatter = [], []
-        for _, members, _, _ in self.groups:
+        # `wanted`: the entries whose cotangent `back` reads (those of groups with a design variable
+        # among their inputs), in the order it reads them; `slices` is the part of each group.
+        # `entry_varying` marks the entries that differ between the rows.
+        wanted, self.slices, count = [], [], 0
+        self.entry_varying = np.zeros(self.outputs.shape[1], bool)
+        for _, members, varying, columns in self.groups:
             local = np.full(self.inputs.shape[0], -1)
             local[members] = np.arange(members.size)
             entries = np.nonzero(local[self.outputs[0]] >= 0)[0]
@@ -353,6 +359,12 @@ class _EntryBlock:
             self.readers.append((entries, call, output))
             order, starts, slots = _grouping(call * 4 + output)
             self.scatter.append((entries[order], starts, slots))
+            self.entry_varying[entries] = varying
+            read = entries.size if columns.size else 0
+            self.slices.append((count, count + read))
+            wanted.append(entries[order][:read])
+            count += read
+        self.wanted = np.concatenate(wanted) if wanted else np.empty(0, np.intp)
 
     # Entries are stored entry by entry, shape (E, R): one contiguous row of R values (the sweep)
     # per matrix entry. Selecting or writing a set of entries then moves whole rows.
@@ -385,18 +397,22 @@ class _EntryBlock:
             tape.append(jacobian)
         return entries, tape
 
-    def back(self, tape, entries_bar, parameter_count):
-        """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,)."""
+    def back(self, tape, entries_bar, parameter_count, compact=False):
+        """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,).
+
+        With `compact`, `entries_bar` has one row per entry of `self.wanted`, in that order.
+        """
         rows = entries_bar.shape[1]
         parameters_bar = np.zeros(parameter_count)
-        for (function_index, members, varying, columns), jacobian, (entries, starts, slots) in zip(
-            self.groups, tape, self.scatter
+        for (function_index, members, varying, columns), jacobian, (entries, starts, slots), (start, stop) in zip(
+            self.groups, tape, self.scatter, self.slices
         ):
             if jacobian is None:  # no design variable among the inputs of this group
                 continue
             outputs_bar = np.zeros((members.size * 4, rows), complex)
             if slots.size:
-                outputs_bar[slots] = np.add.reduceat(entries_bar[entries], starts, axis=0)
+                group_bar = entries_bar[start:stop] if compact else entries_bar[entries]
+                outputs_bar[slots] = np.add.reduceat(group_bar, starts, axis=0)
             outputs_bar = outputs_bar.reshape(members.size, 4, rows)
             if varying:
                 inputs_bar = np.einsum("cor,croj->cj", outputs_bar, jacobian).real
@@ -455,10 +471,14 @@ class EntryPlan:
         noise, noise_tape = self.noise.run(signal_rows)
         return (carrier[:, 0], signal, noise), (carrier_tape, signal_tape, noise_tape)
 
-    def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count):
+    def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count, compact=False):
+        """Gradient with respect to the design variables from the cotangents of the entries.
+
+        With `compact`, `signal_bar` only has the rows of `self.signal.wanted` (see `backward`).
+        """
         carrier_tape, signal_tape, noise_tape = tape
         parameter_count = self.base.size
-        signal_rows_bar = self.signal.back(signal_tape, signal_bar, parameter_count) + self.noise.back(
+        signal_rows_bar = self.signal.back(signal_tape, signal_bar, parameter_count, compact) + self.noise.back(
             noise_tape, noise_bar, parameter_count
         )
         signal_rows_bar[self.signal_changing_indices] = 0.0  # overwritten by the sweep values
@@ -544,11 +564,7 @@ class SystemPlan:
         self.noise_by_row = _grouping(self.noise_rows)
         self.noise_by_col = _grouping(self.noise_cols)
         self.selection = get("noise_selection_vectors")[0, 0]
-        # Rows the quantum noise detector reads. When they fit into DETECTOR_WIDTH, the forward pass
-        # solves S^T z = e_d for each of them; Y and the signal adjoint are then combinations of z.
-        self.detector = np.nonzero(self.selection)[0]
-        self.use_basis = 0 < self.detector.size <= DETECTOR_WIDTH
-        self.order = None
+        self._layout = None
 
     def carrier_matrix(self, carrier_entries):
         n = self.n
@@ -570,27 +586,15 @@ class SystemPlan:
         np.negative(V.imag, out=V.imag, where=self.conjugated[:, None])  # conjugate those rows in place
         return V, pre
 
-    def _set_order(self, values_row):
-        """Column order from COLAMD on one matrix, reused for all frequencies (shared pattern)."""
-        first = _splu(self.m, values_row[self.in_matrix], self.matrix_rows, self.matrix_ptr)
-        order = np.argsort(first.perm_c)
-        counts = np.diff(self.matrix_ptr)[order]
-        self.ordered_ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.intc)
-        gather = np.repeat(self.matrix_ptr[order] - self.ordered_ptr[:-1], counts) + np.arange(self.ordered_ptr[-1])
-        self.ordered_rows = self.matrix_rows[gather]
-        self.ordered_values = np.nonzero(self.in_matrix)[0][gather]
-        self.order = order
-
     def signal_factors(self, V):
         """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
         return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix)
 
-    def signal_lu(self, values_row):
-        if self.order is None:
-            self._set_order(values_row)
-        values = np.ascontiguousarray(values_row[self.ordered_values])
-        lu = _splu(self.m, values, self.ordered_rows, self.ordered_ptr, "NATURAL", small_supernodes=True)
-        return _OrderedLU(lu, self.order)
+    def reverse_layout(self, wanted=None, varying=None):
+        """The `_ReverseLayout` for these signal entries (kept for the next call with the same ones)."""
+        if self._layout is None or self._layout[0] is not wanted or self._layout[1] is not varying:
+            self._layout = (wanted, varying, _ReverseLayout(self, wanted, varying))
+        return self._layout[2]
 
     def noise_values(self, noise_entries):
         """Noise matrix values, shape (F, entries), from the noise entries (E, F)."""
@@ -857,21 +861,6 @@ class _CondensedLU:
         return x
 
 
-class _OrderedLU:
-    """LU of B = A[:, order]; solves with A, A^T and A^H."""
-
-    def __init__(self, lu, order):
-        self.lu, self.order = lu, order
-
-    def solve(self, b, trans="N"):
-        if trans == "N":
-            y = self.lu.solve(b)
-            x = np.empty_like(y)
-            x[self.order] = y
-            return x
-        return self.lu.solve(b[self.order], trans=trans)
-
-
 def _scatter_sum(values, grouping, size):
     """Scatter-add the columns of `values` (F, E) into (F, size) target slots."""
     order, starts, slots = grouping
@@ -882,20 +871,15 @@ def _scatter_sum(values, grouping, size):
 
 
 def forward(plan, carrier_entries, signal_entries, noise_entries):
-    """Carrier (n,), signal (m, F) and noise (F,) outputs plus the adjoint helpers Y = S^-H w, MU and Z.
+    """Carrier (n,), signal (m, F) and noise (F,) outputs plus the adjoint helpers Y = S^-H w and MU.
 
-    Z[f] = S_f^-T [e_d for d in plan.detector] (zero-padded to DETECTOR_WIDTH columns). It gives
-    Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
-    second factorization, whenever the cotangent of the signal lives on the detector rows.
+    Per frequency this takes one factorization and two solves: S^T conj(Y) = conj(w), then
+    S [X, MU] = [rhs, (N + N^H) Y / 2]. Simple unknowns are eliminated exactly beforehand and the
+    rest goes through SuperLU as one block-diagonal system for all frequencies (`_CondensedLU`).
+    Everything between the two solves is evaluated for all frequencies at once.
 
-    The last return value (carrier factorization, signal matrix values, placing pre-values) is
-    what `backward` would otherwise compute a second time.
-
-    Per frequency this takes one factorization and two solves with two right-hand sides each:
-    first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Simple unknowns are eliminated
-    exactly beforehand and the rest goes through SuperLU as one block-diagonal system for all
-    frequencies (`_CondensedLU`). Everything between the two solves is evaluated for all
-    frequencies at once.
+    The last return value (carrier factorization, signal matrix values, placing pre-values,
+    signal factorization) is what `backward` would otherwise compute a second time.
     """
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
@@ -905,18 +889,9 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     N = plan.noise_values(noise_entries)
     F = V.shape[1]
     factors = plan.signal_factors(V)
-    d, k = plan.detector, plan.detector.size
-    if plan.use_basis:
-        basis = np.zeros((m, k), complex)
-        basis[d, np.arange(k)] = 1.0
-        Z = factors.solve(np.broadcast_to(basis, (F, m, k)), trans="T")
-        Y = np.conj(Z @ np.conj(w[d]))
-        if k < DETECTOR_WIDTH:
-            Z = np.concatenate([Z, np.zeros((F, m, DETECTOR_WIDTH - k), complex)], axis=2)
-    else:
-        Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
-        # S^-H w = conj(S^-T conj(w))
-        Y = np.conj(factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T"))[:, :, 0]
+    # S^-H w = conj(S^-T conj(w))
+    Y = factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T")[:, :, 0]
+    np.conjugate(Y, out=Y)
     q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
     qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
     power = np.einsum("fm,fm->f", np.conj(Y), q).real
@@ -927,75 +902,178 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     signal = np.ascontiguousarray(solutions[:, :, 0].T)
     MU = np.ascontiguousarray(solutions[:, :, 1])
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, signal, noise, Y, MU, Z, (carrier_lu, V, pre)
+    return carrier, signal, noise, Y, MU, (carrier_lu, V, pre, factors)
 
 
-def _signal_adjoint(plan, V, Z, signal_bar):
-    """lam_f = S_f^-T signal_bar_f for every frequency; `signal_bar` and the result have shape (m, F)."""
+class _ReverseLayout:
+    """
+    The signal matrix entries the reverse pass visits, and what it needs from each of them.
+
+    Only entries written by component functions or scaled by the carrier pass a cotangent on;
+    the constant entries of the pattern are never visited. Of the written entries the caller reads
+    the ones in `wanted` (the entries with a design variable behind them, see `_EntryBlock`).
+    They form the first rows of the block of cotangents, in the order given. An entry that is
+    scaled by the carrier also contributes to the cotangent of the carrier, through the sum over
+    the frequencies of its cotangent times its value before the scaling. For an entry that nobody
+    reads this sum is all that is needed. If its value is the same at every frequency (`varying`
+    is False for it, or it is a constant of the pattern), only the sum of its cotangent is formed
+    (`sum_*`), otherwise it gets a row at the end of the block.
+    """
+
+    def __init__(self, plan, wanted, varying):
+        position, live = plan.update_positions, plan.update_live
+        entries = position.size
+        if wanted is None:
+            wanted = np.arange(entries)
+        if varying is None:
+            varying = np.ones(entries, bool)
+        self.count = count = wanted.size
+        block_row = np.full(entries, -1)
+        block_row[wanted] = np.arange(count)
+        self.dead = np.nonzero(~live[wanted])[0]  # overwritten by a later write: no cotangent
+        writer = np.full(plan.size, -1)  # the entry that sets each pattern position
+        writer[position[live]] = np.nonzero(live)[0]
+        scaled = np.nonzero(plan.placing_live)[0]  # placing entries: pattern value = -value * carrier
+        source = writer[plan.placing_positions[scaled]]
+        written = source >= 0
+        in_block = written & (block_row[source] >= 0)
+        extra = written & ~in_block & varying[source]
+        summed = ~in_block & ~extra
+
+        positions = np.concatenate([position[wanted], plan.placing_positions[scaled[extra]]])
+        self.rows, cols = plan.rows[positions], plan.cols[positions]
+        self.right_hand_side = np.nonzero(cols == plan.m)[0]
+        self.cols = np.minimum(cols, plan.m - 1)
+        self.conjugated = plan.conjugated[positions]
+        self.placed = np.concatenate([block_row[source[in_block]], count + np.arange(int(extra.sum()))])
+        self.placed_entries = np.concatenate([scaled[in_block], scaled[extra]])
+        self.placed_carrier = plan.signal_carrier_indices[self.placed_entries]
+
+        positions = plan.placing_positions[scaled[summed]]
+        self.sum_rows, cols = plan.rows[positions], plan.cols[positions]
+        self.sum_right_hand_side = cols == plan.m
+        self.sum_cols = np.minimum(cols, plan.m - 1)
+        self.sum_conjugated = plan.conjugated[positions]
+        self.sum_entries = scaled[summed]
+        self.sum_carrier = plan.signal_carrier_indices[self.sum_entries]
+
+
+def _signal_adjoint(plan, carrier, signal, Y, MU, signal_bar, g, V, factors):
+    """
+    The cotangent of the signal matrices as a sum of products: entry (r, c) of S_f gets
+    sum_k left_k[r, f] * right_k[c, f], with arrays of shape (m, F). Also returns lam = S^-T
+    signal_bar as a function of the rows wanted, shape (rows, F).
+
+    The complete expression is -lam[r] signal[c] - 2 g conj(Y[r]) MU[c]. A sensitivity (noise
+    over signal at the same detector) puts a cotangent on the signal that is a multiple alpha_f
+    of conj(w) at every frequency, because signal and noise are read through the same weights w.
+    Then lam_f = alpha_f conj(Y_f) without another solve, and the two products share their left
+    factor: conj(Y[r]) * -(alpha signal[c] + 2 g MU[c]).
+
+    Any other cotangent takes one more solve with the factorization of the forward pass
+    (`factors`), or with a new one if that is gone.
+    """
+    m, F = signal.shape
+    Y_rows = np.empty((m, F), complex)
+    np.conjugate(Y.T, out=Y_rows)  # conj(Y), one row per unknown
+    right = np.ascontiguousarray(MU.T)
+    right *= -2.0 * g
+    weights = np.conj(plan.detector_weights(carrier))
+    read = np.nonzero(weights)[0]
     support = np.nonzero(np.any(signal_bar != 0, axis=1))[0]
-    d, k = plan.detector, plan.detector.size
-    if plan.use_basis and np.isin(support, d).all():
-        return np.einsum("fmk,kf->mf", Z[:, :, :k], signal_bar[d])
-    lam = np.empty(signal_bar.shape, complex)
-    for f in range(V.shape[1]):
-        lam[:, f] = plan.signal_lu(V[:, f]).solve(signal_bar[:, f].astype(complex), trans="T")
-    return lam
+    if read.size and np.isin(support, read).all():
+        cotangent, weights = signal_bar[read], weights[read]
+        alpha = (np.conj(weights) @ cotangent) / (np.conj(weights) @ weights).real
+        rest = np.abs(cotangent - weights[:, None] * alpha).max(axis=0)
+        if (rest <= PARALLEL_TOLERANCE * np.abs(cotangent).max(axis=0)).all():
+            right -= signal * alpha
+            return [(Y_rows, right)], lambda rows: Y_rows[rows] * alpha
+    if factors is None:
+        factors = plan.signal_factors(V)
+    lam = factors.solve(np.ascontiguousarray(signal_bar.T, dtype=complex)[:, :, None], trans="T", overwrite=True)
+    lam = np.ascontiguousarray(lam[:, :, 0].T)
+    return [(lam, -signal), (Y_rows, right)], lambda rows: lam[rows]
 
 
 def backward(
-    plan, carrier_entries, signal_entries, carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, kept=None
+    plan,
+    carrier_entries,
+    signal_entries,
+    carrier,
+    signal,
+    noise,
+    Y,
+    MU,
+    carrier_bar,
+    signal_bar,
+    noise_bar,
+    kept=None,
+    wanted=None,
+    varying=None,
 ):
     """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
 
     `signal` and `signal_bar` have shape (m, F), the adjoint helpers Y and MU (F, m). `kept` is the
-    last return value of `forward` for the same inputs, when it is still available. The work on
-    the signal matrix entries runs entry by entry, on arrays of shape (entries, F).
+    last return value of `forward` for the same inputs, when it is still available.
+
+    The cotangent of the signal entries has one row per entry in `wanted` (default: every entry,
+    in order). `varying` marks the signal entries whose value differs between the frequencies
+    (default: all of them). See `_ReverseLayout` for what this saves. The work on the signal
+    matrix entries runs entry by entry, on arrays of shape (entries, F).
     """
     n, m = plan.n, plan.m
     if kept is None:
         carrier_lu, _ = plan.carrier_matrix(carrier_entries)
         V, pre = plan.signal_values(signal_entries, carrier)
+        factors = None
     else:
-        carrier_lu, V, pre = kept
-    F = V.shape[1]
+        carrier_lu, V, pre, factors = kept
+    F = Y.shape[0]
+    layout = plan.reverse_layout(wanted, varying)
     carrier_bar = carrier_bar.astype(complex).copy()
-    V_bar = np.empty((plan.size, F), complex)
     g = noise_bar * NOISE_SCALE / noise  # d noise / d power
-    rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
-    lam = _signal_adjoint(plan, V, Z, signal_bar)
-    Y_rows, MU_rows = np.ascontiguousarray(Y.T), np.ascontiguousarray(MU.T)
-    # V_bar = -lam[rows] * signal[cols] - 2 g conj(Y[rows]) * MU[cols] on the matrix entries,
-    # built in place: every temporary here has 2 500 x F elements.
-    entries = rows.size
-    matrix_bar = V_bar[:entries] if plan.in_matrix[:entries].all() else np.empty((entries, F), complex)
-    np.take(lam, rows, axis=0, out=matrix_bar, mode="clip")  # "clip" writes straight into `out`
-    np.negative(matrix_bar, out=matrix_bar)
-    matrix_bar *= signal[cols]
-    noise_part = np.conjugate(Y_rows[rows])
-    noise_part *= 2 * g
-    noise_part *= MU_rows[cols]
-    matrix_bar -= noise_part
-    if matrix_bar.base is not V_bar:
-        V_bar[plan.in_matrix] = matrix_bar
-    V_bar[~plan.in_matrix] = lam[plan.rhs_rows]
-    w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
+    terms, lam_rows = _signal_adjoint(plan, carrier, signal, Y, MU, signal_bar, g, V, factors)
+
+    # Cotangents of the visited matrix entries, built in place: sum_k left_k[rows] * right_k[cols].
+    rows, cols = layout.rows, layout.cols
+    block = np.empty((rows.size, F), complex)
+    work = None
+    for left, right in terms:
+        if work is None:
+            np.take(left, rows, axis=0, out=block, mode="clip")  # "clip" writes straight into `out`
+            work = np.take(right, cols, axis=0)
+            block *= work
+        else:
+            more = np.take(left, rows, axis=0)
+            np.take(right, cols, axis=0, out=work, mode="clip")
+            more *= work
+            block += more
+    if layout.right_hand_side.size:  # entries of the right-hand side column
+        block[layout.right_hand_side] = lam_rows(rows[layout.right_hand_side])
+    if layout.conjugated.any():
+        np.negative(block.imag, out=block.imag, where=layout.conjugated[:, None])  # conjugate those rows in place
+    # Entries scaled by the carrier: value = -pre * carrier.
+    placed, sources = layout.placed, layout.placed_carrier
+    placed_bar = block[placed]
+    carrier_parts = [np.einsum("ef,ef->e", placed_bar, pre[layout.placed_entries])]
+    placed_bar *= -carrier[sources, None]
+    block[placed] = placed_bar
+    if layout.sum_rows.size:  # the same for entries that are equal at every frequency and that nobody reads
+        sums = sum(np.einsum("ef,ef->e", left[layout.sum_rows], right[layout.sum_cols]) for left, right in terms)
+        if layout.sum_right_hand_side.any():
+            sums[layout.sum_right_hand_side] = lam_rows(layout.sum_rows[layout.sum_right_hand_side]).sum(axis=1)
+        sums = np.where(layout.sum_conjugated, np.conj(sums), sums)
+        carrier_parts.append(sums * pre[layout.sum_entries, 0])
+        sources = np.concatenate([sources, layout.sum_carrier])
+    np.subtract.at(carrier_bar, sources, np.concatenate(carrier_parts))
+    block[layout.dead] = 0.0
+    signal_entries_bar = block[: layout.count]
 
     N_bar = g[:, None] * np.conj(Y[:, plan.noise_rows]) * Y[:, plan.noise_cols]
     noise_entries_bar = np.zeros((plan.noise_live.size, F), complex)
     noise_entries_bar[plan.noise_live] = N_bar[:, plan.noise_base.size :].T
 
-    np.negative(V_bar.imag, out=V_bar.imag, where=plan.conjugated[:, None])  # conjugate those rows in place
-    live = plan.placing_live
-    placed = plan.placing_positions[live]
-    sci = plan.signal_carrier_indices[live]
-    placed_bar = V_bar[placed]
-    np.add.at(carrier_bar, sci, -(placed_bar * (pre if live.all() else pre[live])).sum(1))
-    np.negative(placed_bar, out=placed_bar)
-    placed_bar *= carrier[sci, None]
-    V_bar[placed] = placed_bar
-    signal_entries_bar = V_bar[plan.update_positions]
-    signal_entries_bar[~plan.update_live] = 0.0
-
+    w_bar = 2 * np.conj(g @ MU)  # sum over the frequencies of 2 g conj(MU)
     s = plan.selection
     carrier_bar += w_bar[:n] * s[:n] + np.conj(w_bar[n : 2 * n]) * s[n : 2 * n]
     lam_c = carrier_lu.solve(carrier_bar, trans="T")
@@ -1063,21 +1141,21 @@ def _output_shapes(arrays):
 
 
 # Work of the forward pass that the backward pass can reuse: both plans, the matrix entries
-# with their Jacobian tape, the signal matrix values, the carrier factorization, and the results
-# with the adjoint helpers Y, MU and Z. With the cache on, a forward pass that is followed by a
+# with their Jacobian tape, the signal matrix values, both factorizations, and the results
+# with the adjoint helpers Y and MU. With the cache on, a forward pass that is followed by a
 # pullback leaves all of this on the host and hands JAX only the outputs and a key; the pullback
 # finds its forward pass through the key. Nothing depends on the entry still being there: when
 # it is gone the backward callback runs the forward pass again from its own inputs.
 #
 # With `FORWARD_CACHE = False` (read when a function is traced) the callbacks keep no state:
-# Y, MU and Z flow through JAX as residuals and the backward callback rebuilds the rest.
+# Y and MU flow through JAX as residuals and the backward callback rebuilds the rest.
 FORWARD_CACHE = True
 _FORWARD_CACHE_SIZE = 2
 _forward_cache = {}
 
 
 def _run_forward(optimized_parameters, host_arrays, taped):
-    """The forward pass on the host: results (carrier, signal, noise, Y, MU, Z) and the reusable work."""
+    """The forward pass on the host: results (carrier, signal, noise, Y, MU) and the reusable work."""
     A = dict(zip(HOST_KEYS, host_arrays))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
     if taped:  # a pullback will follow: evaluate the entries with derivatives once, here
@@ -1090,7 +1168,7 @@ def _run_forward(optimized_parameters, host_arrays, taped):
 
 def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, noise_bar):
     """The backward pass on the host, from the results and the work of the forward pass."""
-    carrier, signal, noise, Y, MU, Z = results
+    carrier, signal, noise, Y, MU = results
     entry_plan, plan, entries, tape, kept = work
     F = Y.shape[0]
     entries_bar = backward(
@@ -1102,20 +1180,21 @@ def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, 
         noise,
         Y,
         MU,
-        Z,
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar),
         np.asarray(noise_bar, float).reshape(F),
         kept=kept,
+        wanted=entry_plan.signal.wanted,  # only the entries the pullback reads
+        varying=entry_plan.signal.entry_varying,
     )
-    gradient = entry_plan.pullback(tape, *entries_bar, value_count=optimized_parameters.shape[0])
+    gradient = entry_plan.pullback(tape, *entries_bar, value_count=optimized_parameters.shape[0], compact=True)
     return gradient.astype(optimized_parameters.dtype)
 
 
 def _host_forward(optimized_parameters, *host_arrays):
-    """Stateless forward callback: the outputs and the adjoint helpers Y, MU, Z."""
-    (carrier, signal, noise, Y, MU, Z), _ = _run_forward(optimized_parameters, host_arrays, taped=False)
-    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z
+    """Stateless forward callback: the outputs and the adjoint helpers Y and MU."""
+    (carrier, signal, noise, Y, MU), _ = _run_forward(optimized_parameters, host_arrays, taped=False)
+    return carrier[:, None], signal, noise.reshape(-1), Y, MU
 
 
 def _host_forward_plain(optimized_parameters, *host_arrays):
@@ -1137,11 +1216,11 @@ def _host_forward_cached(optimized_parameters, *host_arrays):
 def _host_backward(optimized_parameters, *rest):
     """Stateless backward callback: everything comes from the residuals."""
     k = len(HOST_KEYS)
-    carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
+    carrier, signal, noise, Y, MU, carrier_bar, signal_bar, noise_bar = rest[k:]
     A = dict(zip(HOST_KEYS, rest[:k]))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
     entries, tape = entry_plan.entries(optimized_parameters)
-    results = (np.asarray(carrier)[:, 0], np.asarray(signal), np.asarray(noise).reshape(-1), np.asarray(Y), np.asarray(MU), np.asarray(Z))
+    results = (np.asarray(carrier)[:, 0], np.asarray(signal), np.asarray(noise).reshape(-1), np.asarray(Y), np.asarray(MU))
     return _run_backward(optimized_parameters, results, (entry_plan, plan, entries, tape, None), carrier_bar, signal_bar, noise_bar)
 
 
@@ -1165,11 +1244,7 @@ def _result_shapes(host):
         jax.ShapeDtypeStruct((m, F), jnp.complex128),
         jax.ShapeDtypeStruct((F,), jnp.float64),
     )
-    helpers = (
-        jax.ShapeDtypeStruct((F, m), jnp.complex128),
-        jax.ShapeDtypeStruct((F, m), jnp.complex128),
-        jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
-    )
+    helpers = (jax.ShapeDtypeStruct((F, m), jnp.complex128), jax.ShapeDtypeStruct((F, m), jnp.complex128))
     return outputs, helpers, noise_shape
 
 
@@ -1218,8 +1293,8 @@ def _fast_fwd(optimized_parameters, host, others):
         key = jax.ShapeDtypeStruct((), jnp.float64)
         carrier, signal, noise, token = _call_host(_host_forward_cached, outputs + (key,), p, host)
         return (carrier, signal, noise.reshape(noise_shape)), (p, host, token)
-    carrier, signal, noise, Y, MU, Z = _call_host(_host_forward, outputs + helpers, p, host)
-    return (carrier, signal, noise.reshape(noise_shape)), (p, host, carrier, signal, noise, Y, MU, Z)
+    carrier, signal, noise, Y, MU = _call_host(_host_forward, outputs + helpers, p, host)
+    return (carrier, signal, noise.reshape(noise_shape)), (p, host, carrier, signal, noise, Y, MU)
 
 
 def _fast_bwd(residuals, cotangents):
