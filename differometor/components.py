@@ -937,17 +937,17 @@ XLA needs about 50 ms to compile it (plus the index arithmetic around both), whi
 the gradient stage of the benchmark.
 
 True (default, only together with `HOST_DETECTORS`): inside a traced function the output of
-`signal_detector` handles `output[integer array]` itself. The rows are picked in NumPy through
-`jax.pure_callback`, and the reverse rule adds the cotangent rows into a zero array in NumPy.
-The result is what JAX indexing gives (negative ports count from the end, ports outside are
-clamped and get no cotangent, repeated ports add up). Every other use of the output is
-unchanged: it stays the tracer JAX returned.
+`signal_detector` handles `output[integer array]` itself. The detector formula is evaluated in
+NumPy for the selected ports only, through one `jax.pure_callback`, and the reverse rule adds
+the cotangents of those ports into zero arrays for carrier and signal in NumPy
+(`_port_signals`). The result is what JAX indexing of the complete output gives (negative ports
+count from the end, ports outside are clamped and get no cotangent, repeated ports add up).
+Every other use of the output is unchanged: it stays the tracer JAX returned, and the complete
+output is only computed when something else reads it.
 
 This uses one JAX internal: the tracer is given a subclass of its own class that differs in
 `__getitem__` only (`_pick_ports_on_host`). False restores plain JAX indexing.
 """
-
-_PORT_PICKING_CLASSES = {}
 
 
 def _port_rows(index, size):
@@ -987,27 +987,73 @@ def _row_picker(shape, dtype):
     return pick
 
 
+@functools.lru_cache(maxsize=None)
+def _port_signals(carrier_shape, signal_shape, carrier_dtype, signal_dtype):
+    """`signal_detector(carrier, signal)[index]` for arrays of these shapes, evaluated on the host for the ports in `index` only."""
+    n = carrier_shape[0]
+    tail = np.broadcast_shapes(carrier_shape[1:], signal_shape[1:])
+    dtype = np.result_type(carrier_dtype, signal_dtype)
+
+    def ports_host(carrier, signal, index):
+        carrier, signal = np.asarray(carrier), np.asarray(signal)
+        rows, _ = _port_rows(index, n)
+        field = carrier[rows]
+        return np.conj(field) * signal[rows] + field * signal[n + rows]
+
+    def ports_host_pullback(carrier, signal, index, cotangent):
+        # The rows of `_signal_host_pullback` for the selected ports, added into zero arrays.
+        carrier, signal = np.asarray(carrier), np.asarray(signal)
+        rows, inside = _port_rows(index, n)
+        cotangent = np.asarray(cotangent)[inside]
+        rows = rows[inside]
+        field, upper, lower = carrier[rows], signal[rows], signal[n + rows]
+        carrier_bar = np.zeros(carrier_shape, carrier_dtype)
+        np.add.at(carrier_bar, rows, _unbroadcast(np.conj(cotangent * upper) + cotangent * lower, field.shape))
+        signal_bar = np.zeros(signal_shape, signal_dtype)
+        np.add.at(signal_bar, rows, _unbroadcast(cotangent * np.conj(field), upper.shape))
+        np.add.at(signal_bar, n + rows, _unbroadcast(cotangent * field, lower.shape))
+        return carrier_bar, signal_bar
+
+    @jax.custom_vjp
+    def ports(carrier, signal, index):
+        result = jax.ShapeDtypeStruct(tuple(index.shape) + tail, dtype)
+        return jax.pure_callback(ports_host, result, carrier, signal, index, vmap_method="sequential")
+
+    def ports_fwd(carrier, signal, index):
+        return ports(carrier, signal, index), (carrier, signal, index)
+
+    def ports_bwd(residuals, cotangent):
+        carrier, signal, index = residuals
+        result = (jax.ShapeDtypeStruct(carrier_shape, carrier_dtype), jax.ShapeDtypeStruct(signal_shape, signal_dtype))
+        bars = jax.pure_callback(ports_host_pullback, result, carrier, signal, index, cotangent, vmap_method="sequential")
+        return (*bars, None)
+
+    ports.defvjp(ports_fwd, ports_bwd)
+    return ports
+
+
 def _is_port_index(item) -> bool:
     """A one-dimensional integer array, traced or not: the way detector ports are selected."""
     return isinstance(item, (np.ndarray, jax.Array)) and item.ndim == 1 and np.issubdtype(item.dtype, np.integer)
 
 
-def _pick_ports_on_host(output):
+def _pick_ports_on_host(output, carrier, signal):
     """Make `output[integer array]` of a traced detector output run on the host (see `HOST_DETECTOR_PORTS`)."""
     kind = type(output)
     if not isinstance(output, jax.core.Tracer) or kind.__name__ == "BatchTracer" or output.ndim == 0:
         return output  # concrete arrays and batches keep plain JAX indexing
-    picking = _PORT_PICKING_CLASSES.get(kind)
-    if picking is None:
+    if carrier.ndim == signal.ndim:  # the usual shapes: evaluate the detector for the selected ports only
+        pick = lambda item: _port_signals(tuple(carrier.shape), tuple(signal.shape), np.dtype(carrier.dtype), np.dtype(signal.dtype))(carrier, signal, item)
+    else:  # any other broadcasting: pick the rows out of the complete output
+        pick = lambda item: _row_picker(tuple(output.shape), np.dtype(output.dtype))(output, item)
 
-        def __getitem__(self, item):
-            if HOST_DETECTOR_PORTS and _is_port_index(item):
-                return _row_picker(tuple(self.shape), np.dtype(self.dtype))(self, item)
-            return kind.__getitem__(self, item)
+    def __getitem__(self, item):
+        if HOST_DETECTOR_PORTS and _is_port_index(item):
+            return pick(item)
+        return kind.__getitem__(self, item)
 
-        picking = _PORT_PICKING_CLASSES[kind] = type(kind.__name__, (kind,), {"__slots__": (), "__getitem__": __getitem__})
-    try:
-        output.__class__ = picking
+    try:  # a subclass of the tracer's own class that only differs in `__getitem__`
+        output.__class__ = type(kind.__name__, (kind,), {"__slots__": (), "__getitem__": __getitem__})
     except TypeError:  # a tracer class with another layout: leave it as it is
         pass
     return output
@@ -1069,7 +1115,7 @@ def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
     carrier, signal = jnp.asarray(carrier), jnp.asarray(signal)
     if _use_host_detector(carrier, signal) and signal.shape[0] >= 2 * carrier.shape[0]:
         output = _signal_detector_host(carrier, signal)
-        return _pick_ports_on_host(output) if HOST_DETECTOR_PORTS else output
+        return _pick_ports_on_host(output, carrier, signal) if HOST_DETECTOR_PORTS else output
     return signal_detector_jax(carrier, signal)
 
 

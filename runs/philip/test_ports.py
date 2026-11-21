@@ -99,7 +99,13 @@ power = lambda pick: jax.vmap(jax.grad(lambda c, s: jnp.sum(jnp.abs(pick(c, s)) 
 assert close(jax.jit(power(picked))(carriers, signals), power(picked_reference)(carriers, signals))
 branch = jax.jit(lambda c, s, flag: jax.lax.cond(flag, lambda: df.signal_detector(c, s)[ports], lambda: jnp.zeros((3, F), complex)))
 assert close(branch(carrier, signal, True), value_ref) and same(branch(carrier, signal, False), np.zeros((3, F)))
-print("vjp with a given cotangent, jit, vmap, grad under vmap and cond agree with plain JAX")
+# Other shapes: vectors (same number of dimensions, the detector runs for the picked ports only)
+# and a carrier with one more dimension than the signal (rows are picked from the complete output).
+for c, s in ((complex_array(n), complex_array(2 * n)), (complex_array(n, 1), complex_array(2 * n)), (complex_array(n, F), complex_array(2 * n + 1, F))):
+    loss = lambda detector: jax.jit(jax.value_and_grad(lambda c, s: jnp.sum(jnp.abs(detector(c, s)[ports]) ** 2), argnums=(0, 1)))
+    host, plain = loss(df.signal_detector)(c, s), loss(components.signal_detector_jax)(c, s)
+    assert all(close(a, b) for a, b in zip(jax.tree_util.tree_leaves(host), jax.tree_util.tree_leaves(plain))), (c.shape, s.shape)
+print("vjp with a given cotangent, jit, vmap, grad under vmap, cond and other array shapes agree with plain JAX")
 
 
 # 3. Everything else behaves as before (compared with the switch off, bit for bit).
