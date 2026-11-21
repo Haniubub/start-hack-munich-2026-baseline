@@ -337,6 +337,13 @@ class _EntryBlock:
                     self.groups.append((int(k), members, varying, columns))
         # Scatter from entries to (call, output) slots; several entries may share a slot.
         self.scatter = _grouping(self.outputs[0] * 4 + self.outputs[1])
+        # Per group: the entries that read its calls, as (entry, call within the group, output).
+        self.readers = []
+        for _, members, _, _ in self.groups:
+            local = np.full(self.inputs.shape[0], -1)
+            local[members] = np.arange(members.size)
+            entries = np.nonzero(local[self.outputs[0]] >= 0)[0]
+            self.readers.append((entries, local[self.outputs[0][entries]], self.outputs[1][entries]))
 
     # Entries are stored entry by entry, shape (E, R): one contiguous row of R values (the sweep)
     # per matrix entry. Selecting or writing a set of entries then moves whole rows.
@@ -345,34 +352,29 @@ class _EntryBlock:
         """Function inputs of the calls `members`, shape (members, R, k), for parameters (R, P)."""
         return np.moveaxis(source.T[self.inputs[members]], 1, 2)
 
-    def _gather(self, values):
-        """Outputs (calls, 4, R) -> entries (E, R)."""
-        return values[self.outputs[0], self.outputs[1]]
-
     def values(self, parameters):
         """parameters: (R, P) -> entries (E, R), no derivatives."""
-        rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((calls, 4, rows), complex)
-        for function_index, members, varying, _ in self.groups:
+        entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
+        for (function_index, members, varying, _), (readers, call, output) in zip(self.groups, self.readers):
             source = parameters if varying else parameters[:1]
-            values[members] = np.moveaxis(_evaluate_values(function_index, self._inputs(source, members)), 1, 2)
-        return self._gather(values)
+            outputs = _evaluate_values(function_index, self._inputs(source, members))
+            entries[readers] = outputs[call, :, output]
+        return entries
 
     def run(self, parameters):
         """parameters: (R, P). Returns entries (E, R) and the Jacobian tape for the reverse pass."""
-        rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((calls, 4, rows), complex)
+        entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
         tape = []
-        for function_index, members, varying, columns in self.groups:
+        for (function_index, members, varying, columns), (readers, call, output) in zip(self.groups, self.readers):
             source = parameters if varying else parameters[:1]
             inputs = self._inputs(source, members)
             if columns.size:
                 outputs, jacobian = _evaluate(function_index, inputs, columns)
             else:
                 outputs, jacobian = _evaluate_values(function_index, inputs), None
-            values[members] = np.moveaxis(outputs, 1, 2)
+            entries[readers] = outputs[call, :, output]
             tape.append(jacobian)
-        return self._gather(values), tape
+        return entries, tape
 
     def back(self, tape, entries_bar, parameter_count):
         """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,)."""
@@ -824,10 +826,16 @@ class _CondensedLU:
         self.lu = _BlockLU(n, np.ascontiguousarray(store[ids[gather]].T), rows[gather], ordered_ptr)
         self.ordered = rest[order]
 
-    def solve(self, b, trans="N"):
-        """x with S_f x_f = b_f (`trans="N"`) or S_f^T x_f = b_f (`trans="T"`)."""
+    def solve(self, b, trans="N", overwrite=False):
+        """x with S_f x_f = b_f (`trans="N"`) or S_f^T x_f = b_f (`trans="T"`).
+
+        With `overwrite`, a contiguous complex `b` is used as the work array and returned.
+        """
         transposed = trans == "T"
-        x = np.array(b, dtype=complex, order="C")
+        if overwrite and isinstance(b, np.ndarray) and b.dtype == np.complex128 and b.flags.c_contiguous and b.flags.writeable:
+            x = b
+        else:
+            x = np.array(b, dtype=complex, order="C")
         for stage in self.stages:  # right-hand side of the remaining system
             (stage.upper if transposed else stage.lower).subtract(x, transposed)
         if transposed:
@@ -864,7 +872,7 @@ def _scatter_sum(values, grouping, size):
 
 
 def forward(plan, carrier_entries, signal_entries, noise_entries):
-    """Carrier, signal and noise outputs plus the adjoint helpers Y = S^-H w, MU and Z.
+    """Carrier (n,), signal (m, F) and noise (F,) outputs plus the adjoint helpers Y = S^-H w, MU and Z.
 
     Z[f] = S_f^-T [e_d for d in plan.detector] (zero-padded to DETECTOR_WIDTH columns). It gives
     Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
@@ -888,13 +896,15 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     F = V.shape[1]
     factors = plan.signal_factors(V)
     d, k = plan.detector, plan.detector.size
-    Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
     if plan.use_basis:
         basis = np.zeros((m, k), complex)
         basis[d, np.arange(k)] = 1.0
-        Z[:, :, :k] = factors.solve(np.broadcast_to(basis, (F, m, k)), trans="T")
-        Y = np.conj(Z[:, :, :k] @ np.conj(w[d]))
+        Z = factors.solve(np.broadcast_to(basis, (F, m, k)), trans="T")
+        Y = np.conj(Z @ np.conj(w[d]))
+        if k < DETECTOR_WIDTH:
+            Z = np.concatenate([Z, np.zeros((F, m, DETECTOR_WIDTH - k), complex)], axis=2)
     else:
+        Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
         # S^-H w = conj(S^-T conj(w))
         Y = np.conj(factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T"))[:, :, 0]
     q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
@@ -903,11 +913,11 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     right_hand_sides = np.zeros((F, m, 2), complex)
     right_hand_sides[:, plan.rhs_rows, 0] = V[~plan.in_matrix].T
     right_hand_sides[:, :, 1] = 0.5 * (q + qh)
-    solutions = factors.solve(right_hand_sides)
-    X = np.ascontiguousarray(solutions[:, :, 0])
+    solutions = factors.solve(right_hand_sides, overwrite=True)
+    signal = np.ascontiguousarray(solutions[:, :, 0].T)
     MU = np.ascontiguousarray(solutions[:, :, 1])
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, X, noise, Y, MU, Z, (carrier_lu, V, pre)
+    return carrier, signal, noise, Y, MU, Z, (carrier_lu, V, pre)
 
 
 def _signal_adjoint(plan, V, Z, signal_bar):
@@ -1064,8 +1074,8 @@ def _run_forward(optimized_parameters, host_arrays, taped):
         entries, tape = entry_plan.entries(optimized_parameters)
     else:
         entries, tape = entry_plan.values(optimized_parameters), None
-    carrier, X, noise, Y, MU, Z, kept = forward(plan, *entries)
-    return (carrier, np.ascontiguousarray(X.T), noise, Y, MU, Z), (entry_plan, plan, entries, tape, kept)
+    *results, kept = forward(plan, *entries)
+    return tuple(results), (entry_plan, plan, entries, tape, kept)
 
 
 def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, noise_bar):
