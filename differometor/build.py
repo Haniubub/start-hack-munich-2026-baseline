@@ -82,6 +82,21 @@ def _device_array(values, dtype=None) -> jnp.ndarray:
     """Convert on the host, then transfer (`jnp.array(..., dtype=...)` compiles a conversion)."""
     return jnp.asarray(np.asarray(values, dtype=dtype))
 
+
+def _aligned_zeros(shape, dtype=complex, alignment=64) -> np.ndarray:
+    """
+    Zero-filled array whose memory starts at a multiple of `alignment` bytes.
+
+    On the CPU `jnp.asarray` adopts such an array as it is, while it has to copy an ordinary
+    NumPy array (16-byte alignment). The large system matrices are almost empty, so most of their
+    memory is then never written at all. The array must not be changed after it was handed to JAX.
+    """
+    dtype = np.dtype(dtype)
+    size = int(np.prod(shape)) * dtype.itemsize
+    raw = np.zeros(size + alignment, np.uint8)
+    offset = -raw.__array_interface__["data"][0] % alignment
+    return raw[offset : offset + size].view(dtype).reshape(shape)
+
 # ---------------------------------------------------------------------
 # Global state for parameter linking
 # ---------------------------------------------------------------------
@@ -658,7 +673,7 @@ def build(setup: Setup):
     detectors = {}
 
     # Carrier matrix: identity on the left block, with a separate right-hand-side column.
-    carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
+    carrier_matrix = _aligned_zeros((system_size, system_size + 1))
     carrier_matrix[:, :system_size] = np.eye(system_size, dtype=complex)
 
     # Ensure signal_size is at least 1 to avoid conditional logic later.
@@ -666,11 +681,12 @@ def build(setup: Setup):
         signal_size = 1
 
     # Signal matrix includes two carrier-sized blocks plus appended signal block, plus a right-hand-side column.
-    signal_matrix = np.zeros((system_size * 2 + signal_size, system_size * 2 + signal_size + 1), dtype=complex)
-    signal_matrix[:, : system_size * 2 + signal_size] = np.eye(system_size * 2 + signal_size, dtype=complex)
+    full_size = system_size * 2 + signal_size
+    signal_matrix = _aligned_zeros((full_size, full_size + 1))
+    signal_matrix.reshape(-1)[: full_size * (full_size + 1) : full_size + 2] = 1.0  # unit diagonal of the left block
 
     # Noise matrix has the same shape as the signal matrix without the right-hand side.
-    noise_matrix = np.zeros(signal_matrix[:, :-1].shape)
+    noise_matrix = _aligned_zeros((full_size, full_size))
     noise_detectors = {}
 
     # Selection vectors map fields to detector readouts for quantum noise calculations.
