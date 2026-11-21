@@ -548,11 +548,14 @@ class SystemPlan:
         """Nonzero values of the augmented signal matrices, shape (size, F), plus placing pre-values."""
         V = np.empty((self.size, signal_entries.shape[1]), complex)
         V[:] = self.signal_base[:, None]
-        V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
+        if self.update_live.all():
+            V[self.update_positions] = signal_entries
+        else:
+            V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
         pre = V[self.placing_positions]
         live = self.placing_live
         V[self.placing_positions[live]] = -pre[live] * carrier[self.signal_carrier_indices[live], None]
-        V[self.conjugated] = np.conj(V[self.conjugated])
+        np.negative(V.imag, out=V.imag, where=self.conjugated[:, None])  # conjugate those rows in place
         return V, pre
 
     def _set_order(self, values_row):
@@ -941,7 +944,19 @@ def backward(
     rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
     lam = _signal_adjoint(plan, V, Z, signal_bar)
     Y_rows, MU_rows = np.ascontiguousarray(Y.T), np.ascontiguousarray(MU.T)
-    V_bar[plan.in_matrix] = -lam[rows] * signal[cols] - 2 * g * np.conj(Y_rows[rows]) * MU_rows[cols]
+    # V_bar = -lam[rows] * signal[cols] - 2 g conj(Y[rows]) * MU[cols] on the matrix entries,
+    # built in place: every temporary here has 2 500 x F elements.
+    entries = rows.size
+    matrix_bar = V_bar[:entries] if plan.in_matrix[:entries].all() else np.empty((entries, F), complex)
+    np.take(lam, rows, axis=0, out=matrix_bar, mode="clip")  # "clip" writes straight into `out`
+    np.negative(matrix_bar, out=matrix_bar)
+    matrix_bar *= signal[cols]
+    noise_part = np.conjugate(Y_rows[rows])
+    noise_part *= 2 * g
+    noise_part *= MU_rows[cols]
+    matrix_bar -= noise_part
+    if matrix_bar.base is not V_bar:
+        V_bar[plan.in_matrix] = matrix_bar
     V_bar[~plan.in_matrix] = lam[plan.rhs_rows]
     w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
 
@@ -949,14 +964,17 @@ def backward(
     noise_entries_bar = np.zeros((plan.noise_live.size, F), complex)
     noise_entries_bar[plan.noise_live] = N_bar[:, plan.noise_base.size :].T
 
-    V_bar[plan.conjugated] = np.conj(V_bar[plan.conjugated])
+    np.negative(V_bar.imag, out=V_bar.imag, where=plan.conjugated[:, None])  # conjugate those rows in place
     live = plan.placing_live
     placed = plan.placing_positions[live]
     sci = plan.signal_carrier_indices[live]
-    np.add.at(carrier_bar, sci, -(V_bar[placed] * pre[live]).sum(1))
-    V_bar[placed] = -V_bar[placed] * carrier[sci, None]
-    signal_entries_bar = np.zeros_like(signal_entries)
-    signal_entries_bar[plan.update_live] = V_bar[plan.update_positions[plan.update_live]]
+    placed_bar = V_bar[placed]
+    np.add.at(carrier_bar, sci, -(placed_bar * (pre if live.all() else pre[live])).sum(1))
+    np.negative(placed_bar, out=placed_bar)
+    placed_bar *= carrier[sci, None]
+    V_bar[placed] = placed_bar
+    signal_entries_bar = V_bar[plan.update_positions]
+    signal_entries_bar[~plan.update_live] = 0.0
 
     s = plan.selection
     carrier_bar += w_bar[:n] * s[:n] + np.conj(w_bar[n : 2 * n]) * s[n : 2 * n]
