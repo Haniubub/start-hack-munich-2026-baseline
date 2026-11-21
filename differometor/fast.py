@@ -85,6 +85,34 @@ def _load_superlu():
 _superlu = _load_superlu()
 
 
+def _load_sparsetools():
+    """
+    SciPy's compiled CSR kernels (`csr_matvecs`, `csc_matvecs`), loaded like `_load_superlu`
+    without importing `scipy.sparse`. Returns None when the module cannot be found; the fast path
+    then skips the pre-elimination in `_CondensedLU` and factorizes the full systems.
+    """
+    name = "scipy.sparse._sparsetools"
+    if name in sys.modules:
+        return sys.modules[name]
+    try:
+        root = importlib.util.find_spec("scipy").submodule_search_locations[0]
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            path = os.path.join(root, "sparse", "_sparsetools" + suffix)
+            if os.path.exists(path):
+                loader = importlib.machinery.ExtensionFileLoader(name, path)
+                spec = importlib.util.spec_from_loader(name, loader, origin=path)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                if hasattr(module, "csr_matvecs") and hasattr(module, "csc_matvecs"):
+                    return module
+    except Exception:
+        pass
+    return None
+
+
+_sparsetools = _load_sparsetools()
+
+
 def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", small_supernodes=False):
     """
     LU factorization of a square CSC matrix, with the options `scipy.sparse.linalg.splu` passes.
@@ -528,11 +556,8 @@ class SystemPlan:
         self.order = order
 
     def signal_factors(self, V):
-        """SuperLU factorization of B_f = S_f[:, order] for every frequency (rows of `V`), as a `_BlockLU`."""
-        if self.order is None:
-            self._set_order(V[0])
-        values = np.ascontiguousarray(V[:, self.ordered_values])
-        return _BlockLU(self.m, values, self.ordered_rows, self.ordered_ptr)
+        """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
+        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, np.ascontiguousarray(V.T[self.in_matrix]))
 
     def signal_lu(self, values_row):
         if self.order is None:
@@ -592,6 +617,174 @@ class _BlockLU:
         return x
 
 
+def _eliminable(size, rows, cols, values):
+    """
+    Mask of unknowns that can be eliminated exactly before the LU, without pivoting.
+
+    Unknown i qualifies when the diagonal entry of row i is exactly 1 at every frequency and
+    either all other entries of row i have modulus <= 1, or no other row refers to unknown i.
+    Subtracting multiples of such a row from another row never enlarges that row beyond its own
+    scale, so the elimination is as stable as LU with pivoting. The selected unknowns are not
+    coupled to each other: their block of the matrix is the identity.
+
+    `values` has shape (entries, F). Also returns the mask of entries that are nonzero anywhere.
+    """
+    magnitude = (values.real**2 + values.imag**2).max(axis=1)
+    diagonal = rows == cols
+    unit = np.zeros(size, bool)
+    unit[rows[diagonal]] = (values[diagonal] == 1).all(axis=1)
+    live = magnitude > 0
+    off = live & ~diagonal
+    r, c = rows[off], cols[off]
+    row_max = np.zeros(size)
+    np.maximum.at(row_max, r, magnitude[off])
+    row_count, column_count = np.bincount(r, minlength=size), np.bincount(c, minlength=size)
+    undecided = unit & ((row_max <= 1 + 1e-9) | (column_count == 0))
+    # Independent set, built in rounds: an undecided unknown is picked when it has the lowest
+    # priority (expected fill, then index) among its undecided neighbours.
+    priority = (row_count * column_count).astype(np.int64) * size + np.arange(size)
+    last = np.iinfo(np.int64).max
+    picked = np.zeros(size, bool)
+    while undecided.any():
+        p = np.where(undecided, priority, last)
+        lowest = p.copy()
+        np.minimum.at(lowest, r, p[c])
+        np.minimum.at(lowest, c, p[r])
+        new = undecided & (lowest == p)
+        picked |= new
+        neighbours = np.zeros(size, bool)
+        neighbours[r[new[c]]] = True
+        neighbours[c[new[r]]] = True
+        undecided &= ~(new | neighbours)
+    return picked, live
+
+
+class _BlockCSR:
+    """
+    The sparse matrices -A_f of all frequencies as one CSR matrix over the index (f, unknown).
+
+    `subtract(x)` computes x[rows] -= A x[cols] in place for x of shape (F, size, k), and with
+    `transposed=True` x[cols] -= A^T x[rows]. Rows and columns of A must not overlap.
+    """
+
+    def __init__(self, size, rows, cols, values):
+        entries, F = values.shape
+        order = np.argsort(rows, kind="stable")
+        count = np.bincount(rows, minlength=size)
+        blocks = np.arange(F)[:, None]
+        self.pointers = np.empty(F * size + 1, np.intc)
+        self.pointers[:-1] = ((np.cumsum(count) - count)[None, :] + entries * blocks).ravel()
+        self.pointers[-1] = entries * F
+        self.indices = (cols[order][None, :] + size * blocks).astype(np.intc).ravel()
+        self.data = np.ascontiguousarray(-values[order].T).ravel()
+        self.total = F * size
+
+    def subtract(self, x, transposed=False):
+        flat = x.reshape(-1)
+        kernel = _sparsetools.csc_matvecs if transposed else _sparsetools.csr_matvecs
+        kernel(self.total, self.total, x.shape[2], self.pointers, self.indices, self.data, flat, flat)
+
+
+class _Elimination:
+    """
+    One exact elimination step. With the unknowns ordered as (I, J) the matrix is
+
+        S = [[1, S_IJ], [S_JI, S_JJ]],
+
+    so x_I = b_I - S_IJ x_J and the remaining system is (S_JJ - S_JI S_IJ) x_J = b_J - S_JI b_I.
+    The transposed system reduces to the transpose of the same matrix. Unknowns keep their
+    numbers; `rows`, `cols` and `values` (entries, F) describe the remaining system in CSC order.
+    """
+
+    def __init__(self, size, rows, cols, values, picked, live):
+        row_in, col_in = picked[rows], picked[cols]
+        ij = np.nonzero(live & row_in & ~col_in)[0]
+        ji = np.nonzero(live & ~row_in & col_in)[0]
+        jj = np.nonzero(live & ~row_in & ~col_in)[0]
+        self.upper = _BlockCSR(size, rows[ij], cols[ij], values[ij])  # S_IJ
+        self.lower = _BlockCSR(size, rows[ji], cols[ji], values[ji])  # S_JI
+        # S_JI S_IJ: every entry (r, i) meets every entry (i, j) of the same eliminated unknown i.
+        by_unknown = np.argsort(rows[ij], kind="stable")
+        count = np.bincount(rows[ij], minlength=size)
+        start = np.cumsum(count) - count
+        unknown = cols[ji]
+        partners = count[unknown]
+        left = np.repeat(np.arange(ji.size), partners)
+        offset = np.arange(left.size) - np.repeat(np.cumsum(partners) - partners, partners)
+        right = by_unknown[start[unknown[left]] + offset]
+        kept = cols[jj] * size + rows[jj]
+        filled = cols[ij[right]] * size + rows[ji[left]]
+        keys, position = np.unique(np.concatenate([kept, filled]), return_inverse=True)
+        self.cols, self.rows = np.divmod(keys, size)
+        self.values = np.zeros((keys.size, values.shape[1]), complex)
+        self.values[position[: jj.size]] = values[jj]
+        if left.size:
+            order, starts, slots = _grouping(position[jj.size :])
+            products = values[ji[left[order]]] * values[ij[right[order]]]
+            self.values[slots] -= np.add.reduceat(products, starts, axis=0)
+
+
+class _CondensedLU:
+    """
+    Solves S_f x = b and S_f^T z = b for F matrices that share one sparsity pattern.
+
+    SuperLU spends a fixed amount of work on every column, and for systems this sparse (about
+    3.5 entries per row) that fixed work dominates. Most unknowns of an interferometer signal
+    matrix are simple, though: sources, read-only ports and fields that are a combination of a
+    few others with coefficients of modulus <= 1. `_eliminable` picks such unknowns, and
+    `_Elimination` removes them exactly with array operations over all frequencies. This repeats
+    while a stage still removes a good share of the system. SuperLU (with partial pivoting, as
+    before) only factorizes what is left: 200 of 751 unknowns for the benchmark setup.
+
+    `values` has shape (entries, F) for the CSC pattern (`rows`, `cols`). Right-hand sides and
+    solutions have shape (F, size, k).
+    """
+
+    MAX_STAGES = 3
+    MIN_SHARE = 0.25  # stop when a stage would remove less than this share of the unknowns
+    ORDERING = "COLAMD"
+
+    def __init__(self, size, rows, cols, values):
+        self.stages = []
+        remaining = np.ones(size, bool)
+        while _sparsetools is not None and len(self.stages) < self.MAX_STAGES:
+            picked, live = _eliminable(size, rows, cols, values)
+            if picked.sum() < self.MIN_SHARE * remaining.sum():
+                break
+            stage = _Elimination(size, rows, cols, values, picked, live)
+            self.stages.append(stage)
+            remaining &= ~picked
+            rows, cols, values = stage.rows, stage.cols, stage.values
+        # What is left goes to SuperLU, renumbered 0..n-1. The column order comes from one
+        # matrix and is reused for all frequencies (shared pattern).
+        self.rest = rest = np.nonzero(remaining)[0]
+        n = rest.size
+        number = np.cumsum(remaining) - 1
+        rows, cols = number[rows].astype(np.intc), number[cols]
+        pointers = np.searchsorted(cols, np.arange(n + 1)).astype(np.intc)
+        first = _splu(n, np.ascontiguousarray(values[:, 0]), rows, pointers, self.ORDERING)
+        order = np.argsort(first.perm_c)
+        counts = np.diff(pointers)[order]
+        ordered_ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.intc)
+        gather = np.repeat(pointers[order] - ordered_ptr[:-1], counts) + np.arange(ordered_ptr[-1])
+        self.lu = _BlockLU(n, np.ascontiguousarray(values[gather].T), rows[gather], ordered_ptr)
+        self.ordered = rest[order]
+
+    def solve(self, b, trans="N"):
+        """x with S_f x_f = b_f (`trans="N"`) or S_f^T x_f = b_f (`trans="T"`)."""
+        transposed = trans == "T"
+        x = np.array(b, dtype=complex, order="C")
+        for stage in self.stages:  # right-hand side of the remaining system
+            (stage.upper if transposed else stage.lower).subtract(x, transposed)
+        if transposed:
+            x[:, self.rest] = self.lu.solve(x[:, self.ordered], trans="T")
+        else:
+            x[:, self.ordered] = self.lu.solve(x[:, self.rest])
+        for stage in reversed(self.stages):  # eliminated unknowns from the ones solved for
+            (stage.lower if transposed else stage.upper).subtract(x, transposed)
+        return x
+
+
 class _OrderedLU:
     """LU of B = A[:, order]; solves with A, A^T and A^H."""
 
@@ -624,9 +817,10 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     second factorization, whenever the cotangent of the signal lives on the detector rows.
 
     Per frequency this takes one factorization and two solves with two right-hand sides each:
-    first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. All frequencies go through
-    SuperLU together as one block-diagonal system (`_BlockLU`), and everything between the two
-    solves is evaluated for all frequencies at once.
+    first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Simple unknowns are eliminated
+    exactly beforehand and the rest goes through SuperLU as one block-diagonal system for all
+    frequencies (`_CondensedLU`). Everything between the two solves is evaluated for all
+    frequencies at once.
     """
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
@@ -636,17 +830,16 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     N = plan.noise_values(noise_entries)
     F = V.shape[0]
     factors = plan.signal_factors(V)
-    order = plan.order
     d, k = plan.detector, plan.detector.size
     Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
     if plan.use_basis:
         basis = np.zeros((m, k), complex)
         basis[d, np.arange(k)] = 1.0
-        basis = basis[order]
         Z[:, :, :k] = factors.solve(np.broadcast_to(basis, (F, m, k)), trans="T")
         Y = np.conj(Z[:, :, :k] @ np.conj(w[d]))
     else:
-        Y = factors.solve(np.broadcast_to(w[order][:, None], (F, m, 1)), trans="H")[:, :, 0]
+        # S^-H w = conj(S^-T conj(w))
+        Y = np.conj(factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T"))[:, :, 0]
     q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
     qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
     power = np.einsum("fm,fm->f", np.conj(Y), q).real
@@ -654,10 +847,8 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     right_hand_sides[:, plan.rhs_rows, 0] = V[:, ~plan.in_matrix]
     right_hand_sides[:, :, 1] = 0.5 * (q + qh)
     solutions = factors.solve(right_hand_sides)
-    X = np.empty((F, m), complex)
-    MU = np.empty((F, m), complex)
-    X[:, order] = solutions[:, :, 0]
-    MU[:, order] = solutions[:, :, 1]
+    X = np.ascontiguousarray(solutions[:, :, 0])
+    MU = np.ascontiguousarray(solutions[:, :, 1])
     noise = np.sqrt(2 * power * NOISE_SCALE)
     return carrier, X, noise, Y, MU, Z
 
