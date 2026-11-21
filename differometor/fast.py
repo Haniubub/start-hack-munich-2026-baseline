@@ -269,40 +269,6 @@ def _rebind_component_functions():
 FUNCTIONS_NUMPY = _rebind_component_functions()
 
 
-def _evaluate(function_index, arguments, lead, columns):
-    """
-    Values (*lead, 4) and Jacobians (*lead, 4, len(columns)) of one component function.
-
-    `arguments` holds one array per function input, each broadcastable to `lead` (calls, rows).
-    Only the inputs listed in `columns` carry a derivative; the others are plain values.
-    """
-    width = len(columns)
-    seed = np.eye(width)
-    arguments = list(arguments)
-    for position, j in enumerate(columns):
-        arguments[j] = Dual(arguments[j], seed[position].reshape((width,) + (1,) * len(lead)))
-    outputs = FUNCTIONS_NUMPY[function_index](arguments)
-    values = np.empty(lead + (4,), complex)
-    jacobian = np.zeros(lead + (4, width), complex)
-    for o, item in enumerate(outputs):
-        if isinstance(item, Dual):
-            values[..., o] = item.val
-            if not np.isscalar(item.tan):
-                jacobian[..., o, :] = np.moveaxis(np.broadcast_to(item.tan, (width,) + lead), 0, -1)
-        else:
-            values[..., o] = item
-    return values, jacobian
-
-
-def _evaluate_values(function_index, arguments, lead):
-    """Values only (no derivatives), shape (*lead, 4)."""
-    outputs = FUNCTIONS_NUMPY[function_index](list(arguments))
-    values = np.empty(lead + (4,), complex)
-    for o, item in enumerate(outputs):
-        values[..., o] = item
-    return values
-
-
 def _group_sum(values, order, starts):
     """Sum the columns of `values` (R, E) that share a target slot (`order`/`starts` from `_grouping`)."""
     return np.add.reduceat(values[:, order], starts, axis=1)
@@ -346,27 +312,31 @@ class _EntryBlock:
                     columns = np.nonzero(needed[members].any(axis=0))[0]
                     self.groups.append((int(k), members, varying, columns))
                     self.swept.append(swept[members].any(axis=0))
-        # Per group: the entries that read its calls, as (entry, call within the group, output),
-        # and the scatter from those entries back to (call, output) slots for the reverse pass.
-        # Several entries may share a slot.
-        self.readers, self.scatter = [], []
+        # Per group and per function output that some entry reads: the entries (sorted by call), the
+        # call each of them reads, the distinct calls and where each call starts among the entries
+        # (several entries may read the same output of the same call).
         # `wanted`: the entries whose cotangent `back` reads (those of groups with a design variable
         # among their inputs), in the order it reads them; `slices` is the part of each group.
         # `entry_varying` marks the entries that differ between the rows.
-        wanted, self.slices, count = [], [], 0
+        self.readers, wanted, self.slices, count = [], [], [], 0
         self.entry_varying = np.zeros(self.outputs.shape[1], bool)
         for _, members, varying, columns in self.groups:
             local = np.full(self.inputs.shape[0], -1)
             local[members] = np.arange(members.size)
             entries = np.nonzero(local[self.outputs[0]] >= 0)[0]
             call, output = local[self.outputs[0][entries]], self.outputs[1][entries]
-            self.readers.append((entries, call, output))
-            order, starts, slots = _grouping(call * 4 + output)
-            self.scatter.append((entries[order], starts, slots))
+            order = np.lexsort((call, output))
+            entries, call, output = entries[order], call[order], output[order]
+            parts = []
+            for o in np.unique(output):
+                pick = output == o
+                calls, starts = np.unique(call[pick], return_index=True)
+                parts.append((int(o), entries[pick], call[pick], calls, starts))
+            self.readers.append(parts)
             self.entry_varying[entries] = varying
             read = entries.size if columns.size else 0
             self.slices.append((count, count + read))
-            wanted.append(entries[order][:read])
+            wanted.append(entries[:read])
             count += read
         self.wanted = np.concatenate(wanted) if wanted else np.empty(0, np.intp)
 
@@ -389,24 +359,37 @@ class _EntryBlock:
 
     def values(self, parameters):
         """parameters: (R, P) -> entries (E, R), no derivatives."""
-        entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
-        for (function_index, members, _, _), swept, (readers, call, output) in zip(self.groups, self.swept, self.readers):
-            outputs = _evaluate_values(function_index, *self._inputs(parameters, members, swept))
-            entries[readers] = outputs[call, :, output]
-        return entries
+        return self.run(parameters, derivatives=False)[0]
 
-    def run(self, parameters):
-        """parameters: (R, P). Returns entries (E, R) and the Jacobian tape for the reverse pass."""
+    def run(self, parameters, derivatives=True):
+        """
+        parameters: (R, P). Returns the entries (E, R) and the tape for the reverse pass.
+
+        The tape has, per group and per output that is read, the derivative of that output with
+        respect to the differentiated inputs, shape (inputs, calls, R) or (inputs, calls, 1) when
+        it is the same in every row. A group without differentiated inputs has None, and so has an
+        output that depends on none of them.
+        """
         entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
         tape = []
-        for (function_index, members, _, columns), swept, (readers, call, output) in zip(self.groups, self.swept, self.readers):
+        for (function_index, members, _, columns), swept, parts in zip(self.groups, self.swept, self.readers):
             arguments, lead = self._inputs(parameters, members, swept)
-            if columns.size:
-                outputs, jacobian = _evaluate(function_index, arguments, lead, columns)
-            else:
-                outputs, jacobian = _evaluate_values(function_index, arguments, lead), None
-            entries[readers] = outputs[call, :, output]
-            tape.append(jacobian)
+            width = columns.size if derivatives else 0
+            for position, j in enumerate(columns[:width]):  # only these inputs carry a derivative
+                seed = np.zeros((width, 1, 1))
+                seed[position] = 1.0
+                arguments[j] = Dual(arguments[j], seed)
+            outputs = FUNCTIONS_NUMPY[function_index](arguments)
+            slopes = []
+            for o, readers, call, _, _ in parts:
+                item = outputs[o]
+                value, slope = (item.val, item.tan) if isinstance(item, Dual) else (item, 0.0)
+                entries[readers] = np.broadcast_to(value, lead)[call]
+                if np.ndim(slope) == 0:  # a constant: no derivative
+                    slopes.append(None)
+                else:
+                    slopes.append(np.broadcast_to(slope, (width, lead[0], slope.shape[-1])))
+            tape.append(slopes if width else None)
         return entries, tape
 
     def back(self, tape, entries_bar, parameter_count, compact=False):
@@ -414,23 +397,27 @@ class _EntryBlock:
 
         With `compact`, `entries_bar` has one row per entry of `self.wanted`, in that order.
         """
-        rows = entries_bar.shape[1]
         parameters_bar = np.zeros(parameter_count)
-        for (function_index, members, varying, columns), jacobian, (entries, starts, slots), (start, stop) in zip(
-            self.groups, tape, self.scatter, self.slices
+        for (function_index, members, varying, columns), slopes, parts, (start, _) in zip(
+            self.groups, tape, self.readers, self.slices
         ):
-            if jacobian is None:  # no design variable among the inputs of this group
+            if slopes is None:  # no design variable among the inputs of this group
                 continue
-            outputs_bar = np.zeros((members.size * 4, rows), complex)
-            if slots.size:
-                group_bar = entries_bar[start:stop] if compact else entries_bar[entries]
-                outputs_bar[slots] = np.add.reduceat(group_bar, starts, axis=0)
-            outputs_bar = outputs_bar.reshape(members.size, 4, rows)
-            if varying:
-                inputs_bar = np.einsum("cor,croj->cj", outputs_bar, jacobian).real
-            else:  # identical Jacobian in every row
-                inputs_bar = np.einsum("co,coj->cj", outputs_bar.sum(2), jacobian[:, 0]).real
-            parameters_bar += np.bincount(self.inputs[members][:, columns].ravel(), inputs_bar.ravel(), parameter_count)
+            inputs_bar = np.zeros((columns.size, members.size))
+            for (o, readers, _, calls, starts), slope in zip(parts, slopes):
+                stop = start + readers.size
+                if slope is not None:
+                    bar = entries_bar[start:stop] if compact else entries_bar[readers]
+                    if starts.size != readers.size:  # entries that read the same output of the same call
+                        bar = np.add.reduceat(bar, starts, axis=0)
+                    if calls.size != members.size:
+                        slope = slope[:, calls]
+                    if slope.shape[2] == 1:  # the same derivative in every row
+                        inputs_bar[:, calls] += (bar.sum(axis=1) * slope[:, :, 0]).real
+                    else:
+                        inputs_bar[:, calls] += np.einsum("cr,jcr->jc", bar, slope).real
+                start = stop
+            parameters_bar += np.bincount(self.inputs[members][:, columns].T.ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
 
