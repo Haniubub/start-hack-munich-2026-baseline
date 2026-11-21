@@ -16,7 +16,7 @@ sys.path.insert(0, str(root))
 os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ["JAX_ENABLE_X64"] = "true"
 
-import statistics  # noqa: E402, F401  the carrier, as in benchmark.py
+import argparse  # noqa: E402, F401  the carrier, as in benchmark.py
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402

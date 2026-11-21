@@ -11,8 +11,8 @@ of those can be imported:
     * the start-up hook ``differometor_startup.pth`` (installed into site-packages by
       ``pip install -e .`` when the opt-in in ``setup.py`` is on). It runs at interpreter
       start, i.e. before the first timer of ``benchmark.py``;
-    * the module ``statistics.py`` next to ``benchmark.py`` (see there). It runs inside the
-      timed window, at the ``import statistics`` line of the benchmark.
+    * the module ``argparse.py`` next to ``benchmark.py`` (see there). It runs inside the
+      timed window, at the ``import argparse`` line of the benchmark, its first import.
 
     Without a carrier `early()` never runs and nothing below marked "early" happens.
 
@@ -26,10 +26,14 @@ kind (A)  removes work from the process (collector passes that find nothing, mod
 kind (B)  does NOT remove work. It moves the imports in front of the first timer of
           ``benchmark.py`` ("interpreter launch", which the benchmark excludes). Off by default.
           Only possible with the ``.pth`` carrier.
+kind (C)  does not remove work either. It leaves a module that the benchmark script imports in
+          its header, but uses only when it writes its report, unloaded until that use. The
+          module's code then runs after the timed phases instead of inside the timed imports.
+          See DEFER_REPORT_MODULES; the part of it that concerns JAX is of kind (A).
 
 For measurements the switches can be overridden per process without editing this file:
 ``DIFFEROMETOR_STARTUP`` is a comma separated list out of ``gc``, ``lazy``, ``defer``,
-``dataclass``, ``jits``, ``preimport`` (or ``none``) and replaces the six early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
+``dataclass``, ``jits``, ``report``, ``preimport`` (or ``none``) and replaces the seven early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
 """
 import sys
 
@@ -72,6 +76,30 @@ DEFER_UNUSED_MODULES = True
 # not the expected one, nothing is installed. Rebuild the file with `runs/philip/bytecode.sh`.
 DATACLASS_CODE = True
 DATACLASS_CODE_FILE = "_dataclass_code.bin"
+
+# early, kinds (A) and (C): four modules from the header of `benchmark.py` are loaded when
+# somebody really needs them (REPORT_MODULES below). `statistics`, `hashlib` and `subprocess`
+# are first used by the script itself, between or after its timed phases (medians for the
+# report, checksums of the fixtures, `git` for the report). JAX wants `hashlib` too, for the
+# keys of its compilation cache at the first compilation; the script's checksums come before
+# that. This part is purely of kind (C). For `importlib.metadata` two places ask in a
+# benchmark run:
+#   * the header of `benchmark.py` imports it and uses it once, for the package versions in the
+#     report it writes after all timed phases. That import pulls in `email`, `zipfile`, `csv`,
+#     `tempfile`, `shutil` and thirty more modules nothing else in the run needs. With this
+#     switch the module object exists after the header and its code runs at that first use
+#     (kind (C): the work is still done, after the timers).
+#   * JAX looks for backend plugins when it creates the CPU backend: it asks
+#     `importlib.metadata.entry_points(group="jax_plugins")`, which parses the metadata of every
+#     installed distribution. That one question is answered here without the module (kind (A)):
+#     `_no_entry_point_group` reads the `entry_points.txt` files of the same distributions and
+#     looks for the group name. Only when no file mentions it is the answer "none" given here;
+#     if one does, or anything about the installation is unusual (a zip file on `sys.path`, a
+#     finder with distributions of its own), the module is loaded and asked as always. A machine
+#     with a JAX plugin installed therefore still gets its plugin.
+# Needs a carrier that runs before the header's `import hashlib` (argparse.py or the .pth hook).
+# A module that something does need earlier is simply loaded then.
+DEFER_REPORT_MODULES = True
 
 # early, kind (A): the jit objects of JAX's own functions are built on first use. `import jax`
 # decorates 323 of its functions with `jax.jit` (most of jax.numpy and lax); for each one JAX
@@ -148,11 +176,13 @@ def _early_options():
                 ("defer", DEFER_UNUSED_MODULES),
                 ("dataclass", DATACLASS_CODE),
                 ("jits", LAZY_JITS),
+                ("report", DEFER_REPORT_MODULES),
                 ("preimport", PREIMPORT),
             )
             if on
         }
-    return {part.strip().lower() for part in value.split(",")} & {"gc", "lazy", "defer", "dataclass", "jits", "preimport"}
+    return {part.strip().lower() for part in value.split(",")} & {
+        "gc", "lazy", "defer", "dataclass", "jits", "report", "preimport"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -491,6 +521,91 @@ def _rekey_masked_array(stand_in, real):
             table[real] = table.pop(stand_in)
 
 
+def _no_entry_point_group(group):
+    """True when it is certain that no installed distribution advertises entry points in `group`.
+
+    `importlib.metadata.entry_points` looks at every `*.dist-info` and `*.egg-info` directory in
+    the directories of `sys.path` (and at `EGG-INFO` inside an `.egg` directory) and parses
+    their `entry_points.txt`. This reads the same files and only looks for the group name in
+    them. False means "not certain", never "there is one": the caller then asks the real module.
+    """
+    import os
+    from importlib.machinery import PathFinder
+
+    for finder in sys.meta_path:
+        if finder is not PathFinder and getattr(finder, "find_distributions", None) is not None:
+            return False  # distributions that are not found through sys.path
+    needle = group.encode("utf-8")
+    for entry in sys.path:
+        if type(entry) is not str:
+            return False
+        root = entry or os.curdir
+        try:
+            children = os.listdir(root)
+        except NotADirectoryError:
+            return False  # a file on sys.path: a zip archive or an egg, which the real search opens
+        except OSError:
+            continue  # nothing there, as for the real search
+        in_egg = os.path.basename(root).lower().endswith(".egg")
+        for child in children:
+            low = child.lower()
+            if not (low.endswith((".dist-info", ".egg-info")) or (in_egg and low == "egg-info")):
+                continue
+            try:
+                with open(os.path.join(root, child, "entry_points.txt"), "rb") as file:
+                    text = file.read()
+            except (FileNotFoundError, IsADirectoryError, NotADirectoryError, PermissionError):
+                continue  # this distribution has no entry points, as for the real search
+            except OSError:
+                return False
+            if needle in text:
+                return False
+    return True
+
+
+def _entry_points(module):
+    """Early attribute `importlib.metadata.entry_points`: "none" for a group nobody advertises.
+
+    Only the call `entry_points(group=<name>)` is answered here, and only when
+    `_no_entry_point_group` is certain; the answer is an empty tuple, where the real function
+    gives an empty `EntryPoints` (a tuple with a few methods). Anything asked of that tuple
+    beyond what a tuple has loads the module and asks a real empty `EntryPoints`. Every other
+    call loads the module and is passed on.
+    """
+
+    class NoEntryPoints(tuple):
+        __slots__ = ()
+
+        def __getattr__(self, name):
+            _load_deferred(module)
+            return getattr(module.EntryPoints(()), name)
+
+    def entry_points(**params):
+        if len(params) == 1 and type(params.get("group")) is str:
+            try:
+                certain = _no_entry_point_group(params["group"])
+            except Exception:
+                certain = False
+            if certain:
+                state().setdefault("entry_points_answered", []).append(params["group"])
+                return NoEntryPoints()
+        _load_deferred(module)
+        return module.entry_points(**params)
+
+    return entry_points
+
+
+_entry_points.stand_in = False
+
+# Modules the benchmark script imports in its header and uses only for its report (see
+# DEFER_REPORT_MODULES). Same form as DEFERRED_MODULES.
+REPORT_MODULES = {
+    "importlib.metadata": ({"entry_points": _entry_points}, None),
+    "statistics": ({}, None),
+    "hashlib": ({}, None),
+    "subprocess": ({}, None),
+}
+
 # name -> (early attributes, what else to do with a (stand-in, real class) pair after the load)
 DEFERRED_MODULES = {
     "http.server": ({"SimpleHTTPRequestHandler": _stand_in("SimpleHTTPRequestHandler")}, None),
@@ -768,10 +883,12 @@ def early(carrier="pth"):
     lazy = LAZY_MODULES if "lazy" in options else frozenset()
     # A module that is loaded already stays as it is.
     deferred = {name: plan for name, plan in DEFERRED_MODULES.items() if name not in sys.modules} if "defer" in options else {}
+    if "report" in options:
+        deferred.update((name, plan) for name, plan in REPORT_MODULES.items() if name not in sys.modules)
     lazy_jits = "jits" in options
     if pause or lazy or deferred or lazy_jits:
         sys.meta_path.insert(0, _Watcher(pause, lazy, deferred, lazy_jits))
-        info["early"] += [name for name in ("gc", "lazy", "defer", "jits") if name in options]
+        info["early"] += [name for name in ("gc", "lazy", "defer", "jits", "report") if name in options]
     if "preimport" in options and carrier == "pth" and _is_benchmark_process():
         if _preimport():
             info["early"].append("preimport")

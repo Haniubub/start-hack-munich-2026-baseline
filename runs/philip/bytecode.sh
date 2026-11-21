@@ -1,5 +1,5 @@
 #!/bin/bash
-# Erzeugt die mitgelieferten Bytecode-Dateien neu. Nach JEDER Änderung an differometor/*.py oder statistics.py
+# Erzeugt die mitgelieferten Bytecode-Dateien neu. Nach JEDER Änderung an differometor/*.py oder argparse.py
 # ausführen (mit Python 3.12, im Wurzelverzeichnis des Repos), sonst geht der Gewinn stillschweigend verloren:
 #
 #   bash runs/philip/bytecode.sh [python]
@@ -7,7 +7,7 @@
 # 1. differometor/_dataclass_code.bin: Code der Dataclass-Methoden, die ein Benchmark-Lauf erzeugt
 #    (differometor/_startup.py, DATACLASS_CODE). Vorhandene Einträge bleiben, neue kommen dazu; die Datei darf
 #    also nacheinander mit mehreren Python-3.12-Versionen gefüllt werden (hier 3.12.3 und 3.12.11).
-# 2. __pycache__ mit Hash-geprüften .pyc für differometor/ und statistics.py.
+# 2. __pycache__ mit Hash-geprüften .pyc für differometor/ und argparse.py (den Träger der Start-Massnahmen).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 PY="${1:-python}"
@@ -24,7 +24,7 @@ sys.argv = ["benchmark.py", "--repeats", "3", "--output", report]
 runpy.run_path("benchmark.py", run_name="__main__")
 PYTHON
 find differometor -maxdepth 2 -name '*.cpython-312.pyc' -delete
-rm -f __pycache__/statistics.cpython-312.pyc
-"$PY" -m compileall -q --invalidation-mode checked-hash differometor statistics.py >/dev/null
-git add -f differometor/_dataclass_code.bin differometor/__pycache__/*.cpython-312.pyc __pycache__/statistics.cpython-312.pyc 2>/dev/null || true
+rm -f __pycache__/argparse.cpython-312.pyc __pycache__/statistics.cpython-312.pyc
+"$PY" -m compileall -q --invalidation-mode checked-hash differometor argparse.py >/dev/null
+git add -f differometor/_dataclass_code.bin differometor/__pycache__/*.cpython-312.pyc __pycache__/argparse.cpython-312.pyc 2>/dev/null || true
 echo "Bytecode neu erzeugt. Mit git status prüfen und committen."
