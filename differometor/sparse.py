@@ -133,12 +133,15 @@ def device_array(value):
 
 
 def flat_nonzero(matrix):
-    """Row-major flat indices of the nonzero entries (for complex input faster than `np.flatnonzero`)."""
+    """Row-major flat indices of the nonzero entries (much faster than `np.flatnonzero` on complex input)."""
     matrix = np.ascontiguousarray(matrix)
     if matrix.dtype == np.complex128:
-        parts = matrix.view(np.float64).reshape(-1, 2) != 0
-        return np.flatnonzero(parts[:, 0] | parts[:, 1])
-    return np.flatnonzero(matrix)
+        # One comparison over the real and imaginary parts, then two parts -> one entry.
+        index = np.flatnonzero(matrix.view(np.float64).reshape(-1) != 0) >> 1
+        if index.size:
+            index = index[np.concatenate(([True], index[1:] != index[:-1]))]
+        return index
+    return np.flatnonzero(matrix.reshape(-1) != 0)
 
 
 class BaseMatrix:

@@ -269,15 +269,16 @@ def _rebind_component_functions():
 FUNCTIONS_NUMPY = _rebind_component_functions()
 
 
-def _evaluate(function_index, inputs, columns):
+def _evaluate(function_index, arguments, lead, columns):
     """
-    inputs: (..., rows, k) -> values (..., rows, 4) and Jacobians (..., rows, 4, len(columns)).
+    Values (*lead, 4) and Jacobians (*lead, 4, len(columns)) of one component function.
 
-    Only the input columns listed in `columns` carry a derivative; the others are plain values.
+    `arguments` holds one array per function input, each broadcastable to `lead` (calls, rows).
+    Only the inputs listed in `columns` carry a derivative; the others are plain values.
     """
-    lead, width = inputs.shape[:-1], len(columns)
+    width = len(columns)
     seed = np.eye(width)
-    arguments = [inputs[..., j] for j in range(inputs.shape[-1])]
+    arguments = list(arguments)
     for position, j in enumerate(columns):
         arguments[j] = Dual(arguments[j], seed[position].reshape((width,) + (1,) * len(lead)))
     outputs = FUNCTIONS_NUMPY[function_index](arguments)
@@ -293,10 +294,10 @@ def _evaluate(function_index, inputs, columns):
     return values, jacobian
 
 
-def _evaluate_values(function_index, inputs):
-    """Values only (no derivatives): inputs (..., rows, k) -> (..., rows, 4)."""
-    outputs = FUNCTIONS_NUMPY[function_index]([inputs[..., j] for j in range(inputs.shape[-1])])
-    values = np.empty(inputs.shape[:-1] + (4,), complex)
+def _evaluate_values(function_index, arguments, lead):
+    """Values only (no derivatives), shape (*lead, 4)."""
+    outputs = FUNCTIONS_NUMPY[function_index](list(arguments))
+    values = np.empty(lead + (4,), complex)
     for o, item in enumerate(outputs):
         values[..., o] = item
     return values
@@ -330,18 +331,21 @@ class _EntryBlock:
         self.inputs = np.asarray(function_input_indices)
         function_indices = np.asarray(function_indices)
         self.outputs = np.asarray(output_indices)
-        self.varying = np.isin(self.inputs, np.asarray(changing, int)).any(axis=1)
         if differentiable is None:
             needed = np.ones(self.inputs.shape, bool)
         else:
             needed = differentiable[self.inputs]
+        swept = np.isin(self.inputs, np.asarray(changing, int))
+        self.varying = swept.any(axis=1)
         self.groups = []  # (function index, members, varying, differentiated input columns)
+        self.swept = []  # per group: which function inputs change along the rows
         for k in np.unique(function_indices):
             for varying in (True, False):
                 members = np.nonzero((function_indices == k) & (self.varying == varying))[0]
                 if members.size:
                     columns = np.nonzero(needed[members].any(axis=0))[0]
                     self.groups.append((int(k), members, varying, columns))
+                    self.swept.append(swept[members].any(axis=0))
         # Per group: the entries that read its calls, as (entry, call within the group, output),
         # and the scatter from those entries back to (call, output) slots for the reverse pass.
         # Several entries may share a slot.
@@ -369,16 +373,25 @@ class _EntryBlock:
     # Entries are stored entry by entry, shape (E, R): one contiguous row of R values (the sweep)
     # per matrix entry. Selecting or writing a set of entries then moves whole rows.
 
-    def _inputs(self, source, members):
-        """Function inputs of the calls `members`, shape (members, R, k), for parameters (R, P)."""
-        return np.moveaxis(source.T[self.inputs[members]], 1, 2)
+    def _inputs(self, parameters, members, swept):
+        """
+        Function inputs of the calls `members` for parameters (R, P), and the shape of the result.
+
+        One array per input: (members, R) for an input that changes along the rows (`swept`),
+        (members, 1) for one that does not. The component functions are scalar formulas and
+        broadcast, so every part of them that does not depend on the sweep is computed once per
+        call instead of once per row. A group without swept inputs gives a single row.
+        """
+        indices = self.inputs[members]
+        first, by_slot = parameters[0], parameters.T
+        arguments = [by_slot[indices[:, j]] if swept[j] else first[indices[:, j], None] for j in range(indices.shape[1])]
+        return arguments, (members.size, parameters.shape[0] if swept.any() else 1)
 
     def values(self, parameters):
         """parameters: (R, P) -> entries (E, R), no derivatives."""
         entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
-        for (function_index, members, varying, _), (readers, call, output) in zip(self.groups, self.readers):
-            source = parameters if varying else parameters[:1]
-            outputs = _evaluate_values(function_index, self._inputs(source, members))
+        for (function_index, members, _, _), swept, (readers, call, output) in zip(self.groups, self.swept, self.readers):
+            outputs = _evaluate_values(function_index, *self._inputs(parameters, members, swept))
             entries[readers] = outputs[call, :, output]
         return entries
 
@@ -386,13 +399,12 @@ class _EntryBlock:
         """parameters: (R, P). Returns entries (E, R) and the Jacobian tape for the reverse pass."""
         entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
         tape = []
-        for (function_index, members, varying, columns), (readers, call, output) in zip(self.groups, self.readers):
-            source = parameters if varying else parameters[:1]
-            inputs = self._inputs(source, members)
+        for (function_index, members, _, columns), swept, (readers, call, output) in zip(self.groups, self.swept, self.readers):
+            arguments, lead = self._inputs(parameters, members, swept)
             if columns.size:
-                outputs, jacobian = _evaluate(function_index, inputs, columns)
+                outputs, jacobian = _evaluate(function_index, arguments, lead, columns)
             else:
-                outputs, jacobian = _evaluate_values(function_index, inputs), None
+                outputs, jacobian = _evaluate_values(function_index, arguments, lead), None
             entries[readers] = outputs[call, :, output]
             tape.append(jacobian)
         return entries, tape
