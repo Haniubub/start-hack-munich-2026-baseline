@@ -528,15 +528,18 @@ class SystemPlan:
         self.order = order
 
     def signal_factors(self, V):
-        """One SuperLU factorization of B_f = S_f[:, order] per frequency (rows of `V`)."""
+        """SuperLU factorization of B_f = S_f[:, order] for every frequency (rows of `V`), as a `_BlockLU`."""
         if self.order is None:
             self._set_order(V[0])
         values = np.ascontiguousarray(V[:, self.ordered_values])
-        rows, pointers, m = self.ordered_rows, self.ordered_ptr, self.m
-        return [_splu(m, row, rows, pointers, "NATURAL", small_supernodes=True) for row in values]
+        return _BlockLU(self.m, values, self.ordered_rows, self.ordered_ptr)
 
     def signal_lu(self, values_row):
-        return _OrderedLU(self.signal_factors(values_row[None])[0], self.order)
+        if self.order is None:
+            self._set_order(values_row)
+        values = np.ascontiguousarray(values_row[self.ordered_values])
+        lu = _splu(self.m, values, self.ordered_rows, self.ordered_ptr, "NATURAL", small_supernodes=True)
+        return _OrderedLU(lu, self.order)
 
     def noise_values(self, noise_entries):
         F = noise_entries.shape[0]
@@ -549,6 +552,44 @@ class SystemPlan:
         w[:n] = s[:n] * carrier
         w[n : 2 * n] = np.conj(s[n : 2 * n] * carrier)
         return w
+
+
+class _BlockLU:
+    """
+    LU factorizations of F square matrices that share one sparsity pattern.
+
+    The matrices are factorized as one block-diagonal system diag(B_0, ..., B_{F-1}) per chunk of
+    frequencies, with a single SuperLU call instead of F. Pivoting never leaves a block, so the
+    factors and every solution are bit-identical to F separate factorizations. What is saved is
+    the fixed cost of each SuperLU call (setup, work arrays, Python round trip).
+    """
+
+    MAX_ROWS = 1 << 18  # rows per SuperLU call; bounds the size of one block-diagonal system
+
+    def __init__(self, m, values, rows, pointers):
+        F, entries = values.shape
+        self.m, self.F = m, F
+        step = max(1, self.MAX_ROWS // m)
+        self.chunks = []
+        for start in range(0, F, step):
+            count = min(step, F - start)
+            blocks = np.arange(count)[:, None]
+            block_rows = (rows[None, :] + m * blocks).astype(np.intc).ravel()
+            block_ptr = np.empty(count * m + 1, np.intc)
+            block_ptr[:-1] = (pointers[None, :-1] + entries * blocks).ravel()
+            block_ptr[-1] = count * entries
+            block_values = values[start : start + count].ravel()
+            lu = _splu(count * m, block_values, block_rows, block_ptr, "NATURAL", small_supernodes=True)
+            self.chunks.append((start, count, lu))
+
+    def solve(self, b, trans="N"):
+        """Solve B_f x_f = b_f (or the transposed systems) for b of shape (F, m, k)."""
+        m, k = self.m, b.shape[2]
+        x = np.empty((self.F, m, k), complex)
+        for start, count, lu in self.chunks:
+            block = np.ascontiguousarray(b[start : start + count], dtype=complex).reshape(count * m, k)
+            x[start : start + count] = lu.solve(block, trans=trans).reshape(count, m, k)
+        return x
 
 
 class _OrderedLU:
@@ -582,9 +623,10 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
     second factorization, whenever the cotangent of the signal lives on the detector rows.
 
-    Per frequency this takes one factorization and two SuperLU solve calls with two right-hand
-    sides each: first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Everything between
-    the two solves is evaluated for all frequencies at once.
+    Per frequency this takes one factorization and two solves with two right-hand sides each:
+    first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. All frequencies go through
+    SuperLU together as one block-diagonal system (`_BlockLU`), and everything between the two
+    solves is evaluated for all frequencies at once.
     """
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
@@ -601,23 +643,17 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
         basis = np.zeros((m, k), complex)
         basis[d, np.arange(k)] = 1.0
         basis = basis[order]
-        for f, lu in enumerate(factors):
-            Z[f, :, :k] = lu.solve(basis, trans="T")
+        Z[:, :, :k] = factors.solve(np.broadcast_to(basis, (F, m, k)), trans="T")
         Y = np.conj(Z[:, :, :k] @ np.conj(w[d]))
     else:
-        w_ordered = w[order]
-        Y = np.empty((F, m), complex)
-        for f, lu in enumerate(factors):
-            Y[f] = lu.solve(w_ordered, trans="H")
+        Y = factors.solve(np.broadcast_to(w[order][:, None], (F, m, 1)), trans="H")[:, :, 0]
     q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
     qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
     power = np.einsum("fm,fm->f", np.conj(Y), q).real
     right_hand_sides = np.zeros((F, m, 2), complex)
     right_hand_sides[:, plan.rhs_rows, 0] = V[:, ~plan.in_matrix]
     right_hand_sides[:, :, 1] = 0.5 * (q + qh)
-    solutions = np.empty((F, m, 2), complex)
-    for f, lu in enumerate(factors):
-        solutions[f] = lu.solve(right_hand_sides[f])
+    solutions = factors.solve(right_hand_sides)
     X = np.empty((F, m), complex)
     MU = np.empty((F, m), complex)
     X[:, order] = solutions[:, :, 0]
