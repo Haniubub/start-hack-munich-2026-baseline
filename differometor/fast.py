@@ -88,7 +88,7 @@ def _load_superlu():
 _superlu = _load_superlu()
 
 
-def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", small_supernodes=False):
+def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", small_supernodes=False, diagonal_threshold=None):
     """
     LU factorization of a square CSC matrix, with the options `scipy.sparse.linalg.splu` passes.
 
@@ -96,10 +96,13 @@ def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", sma
 
     `small_supernodes` sets SuperLU's `Relax` and `PanelSize` to 1. The systems here have about
     3.5 entries per row. With the default relaxed supernodes SuperLU pads the factors with explicit
-    zeros (13120 stored entries instead of 8330 for the benchmark setup), which makes both the
-    factorization and every solve slower. Pivoting is unchanged (partial pivoting).
+    zeros, which makes both the factorization and every solve slower. Pivoting is unchanged.
+
+    `diagonal_threshold` is SuperLU's `DiagPivotThresh` (`splu(..., diag_pivot_thresh=u)`): the
+    diagonal entry is the pivot whenever its magnitude is at least `u` times the largest one in
+    its column, otherwise the largest entry is. The default is 1, plain partial pivoting.
     """
-    options = dict(DiagPivotThresh=None, ColPerm=column_order, PanelSize=None, Relax=None)
+    options = dict(DiagPivotThresh=diagonal_threshold, ColPerm=column_order, PanelSize=None, Relax=None)
     if column_order == "NATURAL":
         options["SymmetricMode"] = True
     if small_supernodes:
@@ -119,6 +122,42 @@ def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", sma
 
 # Columns of the detector basis Z = S^-T [e_d] kept per frequency (upper + lower sideband of one port).
 DETECTOR_WIDTH = 2
+
+# Threshold pivoting for the signal systems (see `SystemPlan._analyze`).
+DIAGONAL_PIVOT_THRESHOLD = 0.1
+BALANCE_SWEEPS = 6
+
+
+def _balance(magnitudes, rows, cols, size, sweeps=BALANCE_SWEEPS):
+    """
+    log2 of a diagonal scaling d such that D^-1 A D has off-diagonal row and column maxima of
+    similar size (matrix balancing on the entry magnitudes, as before an eigenvalue computation).
+
+    `rows`/`cols` are the positions of `magnitudes` and have to be sorted by column. The scaling
+    is a power of two per unknown, so applying it is exact. It leaves the diagonal untouched.
+    Damped simultaneous sweeps: an unknown is rescaled by half of the square root of the ratio of
+    its largest row and column entry, which removes most of the imbalance within a few sweeps.
+    """
+    keep = (rows != cols) & (magnitudes > 0)
+    rows, cols = rows[keep], cols[keep]
+    log_d = np.zeros(size)
+    if not rows.size:
+        return log_d
+    log_a = np.log2(magnitudes[keep])
+    by_row = np.argsort(rows, kind="stable")
+    row_slots, row_starts = np.unique(rows[by_row], return_index=True)
+    col_slots, col_starts = np.unique(cols, return_index=True)
+    has_row = np.zeros(size, bool)
+    has_row[row_slots] = True
+    weight = np.full(size, 0.5)
+    weight[col_slots[has_row[col_slots]]] = 0.25  # unknowns with row and column entries: meet in the middle
+    for _ in range(sweeps):
+        scaled = log_a + log_d[cols] - log_d[rows]
+        step = np.zeros(size)
+        step[row_slots] = np.maximum.reduceat(scaled[by_row], row_starts)
+        step[col_slots] -= np.maximum.reduceat(scaled, col_starts)
+        log_d += weight * step
+    return np.clip(np.round(log_d), -500, 500)
 
 
 # ---------------------------------------------------------------------
@@ -548,27 +587,54 @@ class SystemPlan:
         pre[:, written] = signal_entries[:, writer[written]]
         return pre
 
-    def _set_order(self, values_row):
-        """Column order from COLAMD on one matrix, reused for all frequencies (shared pattern)."""
-        first = _splu(self.m, values_row[self.in_matrix], self.matrix_rows, self.matrix_ptr)
-        order = np.argsort(first.perm_c)
-        counts = np.diff(self.matrix_ptr)[order]
-        self.ordered_ptr = np.concatenate([[0], np.cumsum(counts)]).astype(np.intc)
-        gather = np.repeat(self.matrix_ptr[order] - self.ordered_ptr[:-1], counts) + np.arange(self.ordered_ptr[-1])
-        self.ordered_rows = self.matrix_rows[gather]
-        self.ordered_values = np.nonzero(self.in_matrix)[0][gather]
-        self.order = order
+    def _analyze(self, values_row):
+        """
+        Scaling and elimination order, found on one matrix and reused for all frequencies.
+
+        Every equation of the signal system has the form x_i = sum_j m_ij x_j + b_i, so the
+        diagonal is 1 and eliminating unknown i with its own equation is a substitution. Doing
+        that in a minimum-degree order of the pattern of S + S^T gives far fewer factor entries
+        than an order that has to be safe for arbitrary row exchanges (6100 instead of 8330
+        for the benchmark setup). SuperLU still checks every pivot: the diagonal is only used
+        while it is at least DIAGONAL_PIVOT_THRESHOLD times the largest entry of its column,
+        otherwise the largest entry is taken (threshold partial pivoting).
+
+        That test compares entries of one column, which only means something if the unknowns
+        have comparable units. Here they do not (fields, forces and displacements: entries
+        from 1e-11 to 1e13), so the system is first balanced with D^-1 S D.
+
+        The factorized matrix is B = D^-1 S[order][:, order] D, with rows and columns in
+        elimination order.
+        """
+        m = self.m
+        rows, cols = self.matrix_rows, self.matrix_cols
+        values = values_row[self.in_matrix]
+        log_scale = _balance(np.abs(values), rows, cols, m)
+        entry_scale = np.exp2(log_scale[cols] - log_scale[rows])
+        first = _splu(
+            m, values * entry_scale, rows, self.matrix_ptr, "MMD_AT_PLUS_A", True, DIAGONAL_PIVOT_THRESHOLD
+        )
+        position = np.asarray(first.perm_c, np.intp)  # unknown -> place in the elimination order
+        new_rows, new_cols = position[rows], position[cols]
+        layout = np.lexsort((new_rows, new_cols))
+        self.ordered_rows = new_rows[layout].astype(np.intc)
+        self.ordered_ptr = np.searchsorted(new_cols[layout], np.arange(m + 1)).astype(np.intc)
+        self.ordered_values = np.nonzero(self.in_matrix)[0][layout]
+        self.ordered_scale = entry_scale[layout]
+        self.position = position
+        self.order = np.argsort(position)  # place -> unknown
+        self.scale = np.exp2(log_scale)  # d, per unknown
 
     def signal_factors(self, V):
-        """One SuperLU factorization of B_f = S_f[:, order] per frequency (rows of `V`)."""
+        """One SuperLU factorization of B_f = D^-1 S_f[order][:, order] D per frequency (rows of `V`)."""
         if self.order is None:
-            self._set_order(V[0])
-        values = np.ascontiguousarray(V[:, self.ordered_values])
+            self._analyze(V[0])
+        values = V[:, self.ordered_values] * self.ordered_scale
         rows, pointers, m = self.ordered_rows, self.ordered_ptr, self.m
-        return [_splu(m, row, rows, pointers, "NATURAL", small_supernodes=True) for row in values]
+        return [_splu(m, row, rows, pointers, "NATURAL", True, DIAGONAL_PIVOT_THRESHOLD) for row in values]
 
     def signal_lu(self, values_row):
-        return _OrderedLU(self.signal_factors(values_row[None])[0], self.order)
+        return _OrderedLU(self.signal_factors(values_row[None])[0], self.order, self.scale)
 
     def noise_values(self, noise_entries):
         F = noise_entries.shape[0]
@@ -584,18 +650,20 @@ class SystemPlan:
 
 
 class _OrderedLU:
-    """LU of B = A[:, order]; solves with A, A^T and A^H."""
+    """LU of B = D^-1 A[order][:, order] D with a real diagonal D; solves with A, A^T and A^H."""
 
-    def __init__(self, lu, order):
-        self.lu, self.order = lu, order
+    def __init__(self, lu, order, scale):
+        self.lu, self.order, self.scale = lu, order, scale[order]
 
     def solve(self, b, trans="N"):
-        if trans == "N":
-            y = self.lu.solve(b)
-            x = np.empty_like(y)
-            x[self.order] = y
-            return x
-        return self.lu.solve(b[self.order], trans=trans)
+        scale = self.scale.reshape((-1,) + (1,) * (b.ndim - 1))
+        if trans == "N":  # B (D^-1 x) = D^-1 b
+            y = self.lu.solve(b[self.order] / scale) * scale
+        else:  # B^T (D x) = D b, and the same with B^H
+            y = self.lu.solve(b[self.order] * scale, trans=trans) / scale
+        x = np.empty_like(y)
+        x[self.order] = y
+        return x
 
 
 def _scatter_sum(values, grouping, size):
@@ -617,6 +685,10 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     Per frequency this takes one factorization and two SuperLU solve calls with two right-hand
     sides each: first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Everything between
     the two solves is evaluated for all frequencies at once.
+
+    SuperLU factorizes B = D^-1 S[order][:, order] D (see `SystemPlan._analyze`), so
+    S x = b becomes B (D^-1 x) = D^-1 b and S^T z = c becomes B^T (D z) = D c, with all vectors in
+    elimination order. The quantities between the two solves stay in that order (suffix `_o`).
     """
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
@@ -626,34 +698,42 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     N = plan.noise_values(noise_entries)
     F = V.shape[0]
     factors = plan.signal_factors(V)
-    order = plan.order
+    order, position = plan.order, plan.position
+    scale = plan.scale[order]
     d, k = plan.detector, plan.detector.size
-    Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
+    Z_o = np.zeros((F, m, DETECTOR_WIDTH), complex)
     if plan.use_basis:
         basis = np.zeros((m, k), complex)
-        basis[d, np.arange(k)] = 1.0
-        basis = basis[order]
+        basis[position[d], np.arange(k)] = plan.scale[d]
         for f, lu in enumerate(factors):
-            Z[f, :, :k] = lu.solve(basis, trans="T")
-        Y = np.conj(Z[:, :, :k] @ np.conj(w[d]))
+            Z_o[f, :, :k] = lu.solve(basis, trans="T")
+        Z_o[:, :, :k] /= scale[:, None]
+        Y_o = np.conj(Z_o[:, :, :k] @ np.conj(w[d]))
     else:
-        w_ordered = w[order]
-        Y = np.empty((F, m), complex)
+        w_o = w[order] * scale
+        Y_o = np.empty((F, m), complex)
         for f, lu in enumerate(factors):
-            Y[f] = lu.solve(w_ordered, trans="H")
-    q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
-    qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
-    power = np.einsum("fm,fm->f", np.conj(Y), q).real
+            Y_o[f] = lu.solve(w_o, trans="H")
+        Y_o /= scale
+    by_row, by_col = plan.noise_by_row, plan.noise_by_col
+    q_o = _scatter_sum(N * Y_o[:, position[plan.noise_cols]], (*by_row[:2], position[by_row[2]]), m)  # N y
+    qh_o = _scatter_sum(np.conj(N) * Y_o[:, position[plan.noise_rows]], (*by_col[:2], position[by_col[2]]), m)  # N^H y
+    power = np.einsum("fm,fm->f", np.conj(Y_o), q_o).real
     right_hand_sides = np.zeros((F, m, 2), complex)
-    right_hand_sides[:, plan.rhs_rows, 0] = V[:, ~plan.in_matrix]
-    right_hand_sides[:, :, 1] = 0.5 * (q + qh)
+    right_hand_sides[:, position[plan.rhs_rows], 0] = V[:, ~plan.in_matrix] / plan.scale[plan.rhs_rows]
+    right_hand_sides[:, :, 1] = (q_o + qh_o) * (0.5 / scale)
     solutions = np.empty((F, m, 2), complex)
     for f, lu in enumerate(factors):
         solutions[f] = lu.solve(right_hand_sides[f])
+    solutions *= scale[:, None]
     X = np.empty((F, m), complex)
     MU = np.empty((F, m), complex)
+    Y = np.empty((F, m), complex)
+    Z = np.empty((F, m, DETECTOR_WIDTH), complex)
     X[:, order] = solutions[:, :, 0]
     MU[:, order] = solutions[:, :, 1]
+    Y[:, order] = Y_o
+    Z[:, order] = Z_o
     noise = np.sqrt(2 * power * NOISE_SCALE)
     return carrier, X, noise, Y, MU, Z
 
