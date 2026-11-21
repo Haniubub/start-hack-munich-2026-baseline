@@ -335,15 +335,18 @@ class _EntryBlock:
                 if members.size:
                     columns = np.nonzero(needed[members].any(axis=0))[0]
                     self.groups.append((int(k), members, varying, columns))
-        # Scatter from entries to (call, output) slots; several entries may share a slot.
-        self.scatter = _grouping(self.outputs[0] * 4 + self.outputs[1])
-        # Per group: the entries that read its calls, as (entry, call within the group, output).
-        self.readers = []
+        # Per group: the entries that read its calls, as (entry, call within the group, output),
+        # and the scatter from those entries back to (call, output) slots for the reverse pass.
+        # Several entries may share a slot.
+        self.readers, self.scatter = [], []
         for _, members, _, _ in self.groups:
             local = np.full(self.inputs.shape[0], -1)
             local[members] = np.arange(members.size)
             entries = np.nonzero(local[self.outputs[0]] >= 0)[0]
-            self.readers.append((entries, local[self.outputs[0][entries]], self.outputs[1][entries]))
+            call, output = local[self.outputs[0][entries]], self.outputs[1][entries]
+            self.readers.append((entries, call, output))
+            order, starts, slots = _grouping(call * 4 + output)
+            self.scatter.append((entries[order], starts, slots))
 
     # Entries are stored entry by entry, shape (E, R): one contiguous row of R values (the sweep)
     # per matrix entry. Selecting or writing a set of entries then moves whole rows.
@@ -378,20 +381,21 @@ class _EntryBlock:
 
     def back(self, tape, entries_bar, parameter_count):
         """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,)."""
-        rows, calls = entries_bar.shape[1], self.inputs.shape[0]
-        order, starts, slots = self.scatter
-        outputs_bar = np.zeros((calls * 4, rows), complex)
-        if order.size:
-            outputs_bar[slots] = np.add.reduceat(entries_bar[order], starts, axis=0)
-        outputs_bar = outputs_bar.reshape(calls, 4, rows)
+        rows = entries_bar.shape[1]
         parameters_bar = np.zeros(parameter_count)
-        for (function_index, members, varying, columns), jacobian in zip(self.groups, tape):
-            if jacobian is None:
+        for (function_index, members, varying, columns), jacobian, (entries, starts, slots) in zip(
+            self.groups, tape, self.scatter
+        ):
+            if jacobian is None:  # no design variable among the inputs of this group
                 continue
+            outputs_bar = np.zeros((members.size * 4, rows), complex)
+            if slots.size:
+                outputs_bar[slots] = np.add.reduceat(entries_bar[entries], starts, axis=0)
+            outputs_bar = outputs_bar.reshape(members.size, 4, rows)
             if varying:
-                inputs_bar = np.einsum("cor,croj->cj", outputs_bar[members], jacobian).real
+                inputs_bar = np.einsum("cor,croj->cj", outputs_bar, jacobian).real
             else:  # identical Jacobian in every row
-                inputs_bar = np.einsum("co,coj->cj", outputs_bar[members].sum(2), jacobian[:, 0]).real
+                inputs_bar = np.einsum("co,coj->cj", outputs_bar.sum(2), jacobian[:, 0]).real
             parameters_bar += np.bincount(self.inputs[members][:, columns].ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
