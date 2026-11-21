@@ -34,6 +34,8 @@ to match phase conventions and signs.
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -925,6 +927,92 @@ def _use_host_detector(*arrays) -> bool:
     return HOST_DETECTORS and all(np.issubdtype(array.dtype, np.complexfloating) for array in arrays)
 
 
+HOST_DETECTOR_PORTS = True
+"""
+Whether `signal_detector(...)[ports]` picks the detector ports on the host.
+
+A readout takes the rows of a few detector ports out of the detector output with an integer
+index array. In reverse mode the transpose of that selection is a scatter into a zero array, and
+XLA needs about 50 ms to compile it (plus the index arithmetic around both), which is most of
+the gradient stage of the benchmark.
+
+True (default, only together with `HOST_DETECTORS`): inside a traced function the output of
+`signal_detector` handles `output[integer array]` itself. The rows are picked in NumPy through
+`jax.pure_callback`, and the reverse rule adds the cotangent rows into a zero array in NumPy.
+The result is what JAX indexing gives (negative ports count from the end, ports outside are
+clamped and get no cotangent, repeated ports add up). Every other use of the output is
+unchanged: it stays the tracer JAX returned.
+
+This uses one JAX internal: the tracer is given a subclass of its own class that differs in
+`__getitem__` only (`_pick_ports_on_host`). False restores plain JAX indexing.
+"""
+
+_PORT_PICKING_CLASSES = {}
+
+
+def _port_rows(index, size):
+    """Rows for an integer index the way JAX reads it, and which of them were inside the array."""
+    index = np.asarray(index)
+    index = np.where(index < 0, index + size, index)
+    return np.clip(index, 0, size - 1), (index >= 0) & (index < size)
+
+
+@functools.lru_cache(maxsize=None)
+def _row_picker(shape, dtype):
+    """`rows = output[index]` for an output of this shape and dtype, evaluated on the host."""
+
+    def pick_host(output, index):
+        rows, _ = _port_rows(index, shape[0])
+        return np.asarray(output)[rows]
+
+    def pick_host_pullback(index, cotangent):
+        rows, inside = _port_rows(index, shape[0])
+        output_bar = np.zeros(shape, dtype)
+        np.add.at(output_bar, rows[inside], np.asarray(cotangent)[inside])
+        return output_bar
+
+    @jax.custom_vjp
+    def pick(output, index):
+        result = jax.ShapeDtypeStruct(tuple(index.shape) + shape[1:], dtype)
+        return jax.pure_callback(pick_host, result, output, index, vmap_method="sequential")
+
+    def pick_fwd(output, index):
+        return pick(output, index), index
+
+    def pick_bwd(index, cotangent):
+        result = jax.ShapeDtypeStruct(shape, dtype)
+        return jax.pure_callback(pick_host_pullback, result, index, cotangent, vmap_method="sequential"), None
+
+    pick.defvjp(pick_fwd, pick_bwd)
+    return pick
+
+
+def _is_port_index(item) -> bool:
+    """A one-dimensional integer array, traced or not: the way detector ports are selected."""
+    return isinstance(item, (np.ndarray, jax.Array)) and item.ndim == 1 and np.issubdtype(item.dtype, np.integer)
+
+
+def _pick_ports_on_host(output):
+    """Make `output[integer array]` of a traced detector output run on the host (see `HOST_DETECTOR_PORTS`)."""
+    kind = type(output)
+    if not isinstance(output, jax.core.Tracer) or kind.__name__ == "BatchTracer" or output.ndim == 0:
+        return output  # concrete arrays and batches keep plain JAX indexing
+    picking = _PORT_PICKING_CLASSES.get(kind)
+    if picking is None:
+
+        def __getitem__(self, item):
+            if HOST_DETECTOR_PORTS and _is_port_index(item):
+                return _row_picker(tuple(self.shape), np.dtype(self.dtype))(self, item)
+            return kind.__getitem__(self, item)
+
+        picking = _PORT_PICKING_CLASSES[kind] = type(kind.__name__, (kind,), {"__slots__": (), "__getitem__": __getitem__})
+    try:
+        output.__class__ = picking
+    except TypeError:  # a tracer class with another layout: leave it as it is
+        pass
+    return output
+
+
 def power_detector(solution: jnp.ndarray) -> jnp.ndarray:
     """
     Convert complex field amplitude to optical power.
@@ -975,11 +1063,13 @@ def signal_detector(carrier: jnp.ndarray, signal: jnp.ndarray) -> jnp.ndarray:
     Matches:
     finesse > detectors > compute > power.pyx > c_pd1_AC_output
 
-    Evaluated on the host by default, see `HOST_DETECTORS`.
+    Evaluated on the host by default, see `HOST_DETECTORS`. Selecting ports from the result with
+    an integer array also runs on the host, see `HOST_DETECTOR_PORTS`.
     """
     carrier, signal = jnp.asarray(carrier), jnp.asarray(signal)
     if _use_host_detector(carrier, signal) and signal.shape[0] >= 2 * carrier.shape[0]:
-        return _signal_detector_host(carrier, signal)
+        output = _signal_detector_host(carrier, signal)
+        return _pick_ports_on_host(output) if HOST_DETECTOR_PORTS else output
     return signal_detector_jax(carrier, signal)
 
 
