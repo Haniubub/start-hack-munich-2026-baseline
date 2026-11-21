@@ -16,6 +16,7 @@ Messumgebung für alle Zahlen: x86-64 Linux, Intel Xeon 2,1 GHz (Emerald Rapids,
 | 6 | Grössere Supernodes für SuperLU auf dem Restsystem (200 Unbekannte) | 17,7–23,2 ms statt 16,9 ms | schlechter |
 | 7 | `np.take(..., out=...)` ohne `mode="clip"` im Rückwärtslauf | Gradient im Erstlauf 34,0 → 36,3 ms | schlechter |
 | 8 | Mehr Eliminationsstufen oder ein lockereres Kriterium (Einträge bis Betrag 2, 10, 100) | Restsystem 125–133 statt 200 Unbekannte, aber 44–61 ms statt 37 ms | schlechter |
+| 9 | Kompilier-Einstellungen von JAX selbst (`jax_optimization_level`, `jax_exec_time_optimization_effort`, `jax_memory_fitting_effort`) | Readout bleibt bei 180–190 ms | nichts gebracht |
 
 ## Die Versuche im Einzelnen
 
@@ -86,6 +87,10 @@ Nach drei Stufen bleiben 200 Unbekannte für SuperLU. Zwei Wege, noch weiter zu 
 | bis 6 Stufen, Einträge bis Betrag 100 | 6 | 125 | 60,8 ms |
 
 Jede weitere Stufe kostet mehr an Verwaltung (Schur-Komplement, zwei CSR-Blöcke, vier Aufrufe beim Lösen), als SuperLU an den wenigen Spalten spart. Das lockerere Kriterium bringt kaum zusätzliche Unbekannte: Was nach drei Stufen übrig ist, hat entweder keine Diagonale 1 mehr oder gehört zur Mechanik.
+
+### 9. Kompilier-Einstellungen von JAX
+
+JAX 0.9 hat eigene Schalter für den Kompilieraufwand (`jax.config`: `jax_optimization_level`, `jax_exec_time_optimization_effort`, `jax_memory_fitting_effort`). Nur gemessen, nicht eingebaut, weil auch das unter Frage B6 fiele. Auf der CPU ändern sie nichts: Der Readout kompiliert mit `O0`, `O1` oder Aufwand −1 weiter in 180–190 ms, der Gradient in 85–100 ms.
 
 ## Nicht ausprobiert, weil es an den Regeln hängt
 

@@ -38,6 +38,8 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 kostet das Kompilieren 
 | 8 | Rückwärtsformeln an Ort und Stelle rechnen | `fast.py` | Warm Gradient 21,1 → 18,8 ms, Erstlauf Gradient 33,4 → 32,8 ms (14 Läufe) |
 | 9 | Mit Zwischenspeicher bleiben Y, MU und Z auf der Host-Seite | `fast.py` | Gradient 33,9 → 26,3 ms, Vorwärts 78,9 → 76,9 ms (14 Läufe) |
 | 10 | Einheitsblöcke im Build ohne dichtes Zwischenfeld | `build.py` | Build 84,0 → 78,6 ms (12 Läufe) |
+| 11 | Komponenten schreiben ihre Einträge direkt, drei Kopien im Vorwärtslauf entfallen | `fast.py` | Warm Vorwärts 68,1 → 65,5 ms, Erstlauf unverändert (14 Läufe) |
+| 12 | Rückweg der Einträge nur für Gruppen mit Designvariablen | `fast.py` | Warm Gradient 18,2 → 17,2 ms, Erstlauf Gradient 25,4 → 24,9 ms (14 Läufe) |
 
 ### 1. Basismatrizen sparse
 
@@ -93,7 +95,8 @@ Der Rückwärts-Callback hat beide Pläne neu aufgebaut, die Werte der Signalmat
 - Der Rückwärts-Callback benutzt den Eintrag, wenn er da ist und die Parameter übereinstimmen. Ist er verdrängt, rechnet er den Vorwärtslauf aus seinen eigenen Eingaben noch einmal.
 - Reine Vorwärtsaufrufe von `simulate` geben nur noch die drei Ausgaben zurück.
 - `fast.FORWARD_CACHE = False` (wird beim Tracen gelesen) schaltet auf das zustandslose Verhalten von vorher zurück: Y, MU und Z fliessen als Residuen durch JAX.
-- Die Resultate sind in allen Fällen bit-identisch. `test_forward_cache.py` prüft Treffer, verdrängte Einträge, mehrfach benutzte Pullbacks und `jit` gegen den zustandslosen Weg.
+- Unter `vmap` laufen alle Vorwärtsläufe eines Stapels vor dem ersten Pullback. Zwei Plätze würden dann nur den letzten beiden nützen. Gestapelte Aufrufe nehmen deshalb automatisch den zustandslosen Weg.
+- Die Resultate sind in allen Fällen bit-identisch. `test_forward_cache.py` prüft Treffer, verdrängte Einträge, mehrfach benutzte Pullbacks, `jit` und `vmap` gegen den zustandslosen Weg.
 
 Damit sind die Callbacks im Normalfall nicht mehr zustandslos, wie es in Noels Beschreibung von `fast.py` stand. Der Zwischenspeicher ist aber nur eine Abkürzung: Fehlt ein Eintrag, kostet das Zeit, kein Resultat hängt davon ab.
 
