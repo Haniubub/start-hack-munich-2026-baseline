@@ -40,10 +40,14 @@ the first time costs a page fault per 4 kB. Therefore:
   (`SystemPlan.base_residuals`).
 - Both passes work on one block of frequencies at a time, which keeps the intermediate arrays
   small, and the component functions write their outputs straight into the matrix entries.
+- Every array that crosses a callback or program boundary also has a fixed cost (lowering,
+  compilation, one copy per call). The 22 small arrays the reverse pass needs therefore travel as
+  two packed residuals (`_pack`, `_unpack`).
 """
 
 import importlib.machinery
 import importlib.util
+import math
 import os
 import sys
 
@@ -997,7 +1001,71 @@ HOST_KEYS = (
 
 # The reverse pass reads neither the dense signal matrix nor the dense noise matrix (see
 # `SystemPlan`). Every array handed to a callback is copied, so both are left out of the residuals.
-BACKWARD_KEYS = tuple(key for key in HOST_KEYS if key not in ("signal_matrix", "noise_matrix"))
+# Of the remaining arrays only the carrier matrix is large. It goes to the reverse callback as it
+# is. All others reach it as two residuals that the forward callback packs (`_pack`), because every
+# array that crosses a callback or program boundary costs time, however small it is.
+BACKWARD_KEYS = ("carrier_matrix",)
+PACKED_KEYS = tuple(key for key in HOST_KEYS if key not in ("carrier_matrix", "signal_matrix", "noise_matrix"))
+
+
+def _packed_sizes(host):
+    """Lengths of the two arrays `_pack` returns, from the static shapes and dtypes of the host arrays."""
+    integers, reals = 1, 0
+    for key in PACKED_KEYS:
+        shape, kind = host[key].shape, np.dtype(host[key].dtype).kind
+        integers += 2 + len(shape)
+        if kind in "iub":
+            integers += math.prod(shape)
+        else:
+            reals += math.prod(shape) * (2 if kind == "c" else 1)
+    return integers, reals
+
+
+def _pack(A):
+    """
+    The arrays `A[key]` for PACKED_KEYS as two flat arrays; `_unpack` restores them exactly.
+
+    Integer and boolean arrays go into an int64 array, behind a header: its length, then dtype,
+    number of dimensions and shape of every array. Real and complex arrays go into a float64
+    array, where a complex number takes two places.
+    """
+    header, integers, reals = [], [], []
+    for key in PACKED_KEYS:
+        array = np.asarray(A[key])
+        header += [ord(array.dtype.char), array.ndim, *array.shape]
+        kind = array.dtype.kind
+        if kind in "iub":
+            integers.append(array.reshape(-1))
+        elif kind == "c":
+            reals.append(np.ascontiguousarray(array, np.complex128).reshape(-1).view(np.float64))
+        else:
+            reals.append(array.reshape(-1))
+    packed_integers = np.concatenate([np.asarray([len(header) + 1, *header], np.int64), *integers], dtype=np.int64)
+    packed_reals = np.concatenate(reals, dtype=np.float64) if reals else np.empty(0)
+    return packed_integers, packed_reals
+
+
+def _unpack(packed_integers, packed_reals):
+    """The dictionary of arrays that `_pack` packed, as views wherever the dtype allows it."""
+    A = {}
+    integer_at, real_at, at = int(packed_integers[0]), 0, 1
+    header = packed_integers[:integer_at].tolist()
+    for key in PACKED_KEYS:
+        dtype, ndim = np.dtype(chr(header[at])), header[at + 1]
+        shape = tuple(header[at + 2 : at + 2 + ndim])
+        at += 2 + ndim
+        size = math.prod(shape)
+        if dtype.kind in "iub":
+            flat = packed_integers[integer_at : integer_at + size]
+            integer_at += size
+        else:
+            width = 2 if dtype.kind == "c" else 1
+            flat = packed_reals[real_at : real_at + size * width]
+            real_at += size * width
+            if width == 2:
+                flat = flat.view(np.complex128)
+        A[key] = flat.astype(dtype, copy=False).reshape(shape)
+    return A
 
 
 def supports(arrays):
@@ -1029,13 +1097,15 @@ def _host_forward(optimized_parameters, *host_arrays):
     plan = SystemPlan(A)
     carrier, signal, noise, Y, MU, Z = forward(plan, *entries)
     base = plan.base_residuals(BASE_ENTRIES_PER_UNKNOWN * plan.m)
-    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z, *base
+    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z, *base, *_pack(A)
 
 
 def _host_backward(optimized_parameters, *rest):
     k = len(BACKWARD_KEYS)
-    A = dict(zip(BACKWARD_KEYS, rest[:k]))
-    carrier, signal, noise, Y, MU, Z, placing_base, base_keys, base_values, carrier_bar, signal_bar, noise_bar = rest[k:]
+    carrier, signal, noise, Y, MU, Z, placing_base, base_keys, base_values, packed_integers, packed_reals = rest[k:-3]
+    carrier_bar, signal_bar, noise_bar = rest[-3:]
+    A = _unpack(np.asarray(packed_integers), np.asarray(packed_reals))
+    A.update(zip(BACKWARD_KEYS, rest[:k]))
     F = Y.shape[0]
     entry_plan = EntryPlan(A)
     (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
@@ -1076,10 +1146,11 @@ def _host_backward(optimized_parameters, *rest):
 
 
 def _forward_callback(optimized_parameters, host):
-    """The simulation outputs and the residuals of the reverse pass (Y, MU, Z and `base_residuals`)."""
+    """The simulation outputs and the residuals of the reverse pass (Y, MU, Z, `base_residuals`, `_pack`)."""
     n, m, F, noise_shape = _output_shapes(host)
     placing_count = jax.tree_util.tree_leaves(host["signal_carrier_placing_indices"])[0].shape[-1]
     base_capacity = BASE_ENTRIES_PER_UNKNOWN * m
+    packed_integers, packed_reals = _packed_sizes(host)
     result_shapes = (
         jax.ShapeDtypeStruct((n, 1), jnp.complex128),
         jax.ShapeDtypeStruct((m, F), jnp.complex128),
@@ -1090,6 +1161,8 @@ def _forward_callback(optimized_parameters, host):
         jax.ShapeDtypeStruct((placing_count,), jnp.complex128),
         jax.ShapeDtypeStruct((base_capacity,), jnp.int64),
         jax.ShapeDtypeStruct((base_capacity,), jnp.complex128),
+        jax.ShapeDtypeStruct((packed_integers,), jnp.int64),
+        jax.ShapeDtypeStruct((packed_reals,), jnp.float64),
     )
     carrier, signal, noise, *residuals = jax.pure_callback(
         _host_forward, result_shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), vmap_method="sequential"
