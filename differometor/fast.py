@@ -660,18 +660,13 @@ class SystemPlan:
             base_values[: keys.size] = values
         return self.signal_base[self.placing_positions], base_keys, base_values
 
-    def signal_pre(self, signal_entries, placing_base):
-        """Values of the placing slots before the placement, shape (F, placing count)."""
-        F = signal_entries.shape[0]
-        pre = np.empty((F, self.placing_positions.size), complex)
-        pre[:] = placing_base
-        # Signal entry (or -1 for the base value) that sets each placing slot before the placement.
+    def placing_writers(self):
+        """For the placing slots a signal entry writes to: the slots and the entries (last writer)."""
         writer = np.full(self.size, -1)
         writer[self.update_positions[self.update_live]] = np.nonzero(self.update_live)[0]
         writer = writer[self.placing_positions]
-        written = writer >= 0
-        pre[:, written] = signal_entries[:, writer[written]]
-        return pre
+        written = np.nonzero(writer >= 0)[0]
+        return written, writer[written]
 
     def _analyze(self, values_row):
         """
@@ -758,15 +753,17 @@ def _scatter_sum(values, grouping, size):
 
 
 def forward(plan, carrier_entries, signal_entries, noise_entries):
-    """Carrier, signal and noise outputs plus the adjoint helpers Y = S^-H w, MU and Z.
+    """Carrier, signal (m, F) and noise outputs plus the adjoint helpers Y = S^-H w, MU and Z.
 
     Z[f] = S_f^-T [e_d for d in plan.detector] (zero-padded to DETECTOR_WIDTH columns). It gives
     Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
     second factorization, whenever the cotangent of the signal lives on the detector rows.
 
-    Per frequency this takes one factorization and two SuperLU solve calls with two right-hand
-    sides each: first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Everything between
-    the two solves is evaluated for all frequencies at once.
+    The frequencies are processed in blocks of BLOCK_FREQUENCIES. A block takes one factorization
+    call and two solve calls with two right-hand sides per frequency: first S^T Z = [e_d], then
+    S [X, MU] = [rhs, (N + N^H) Y / 2]. Everything else is evaluated for the whole block at once.
+    Working block by block keeps the intermediate arrays small: all of them together would be
+    several times larger than the results, and freshly allocated memory is slow.
 
     SuperLU factorizes B = D^-1 S[order][:, order] D (see `SystemPlan._analyze`), so
     S x = b becomes B (D^-1 x) = D^-1 b and S^T z = c becomes B^T (D z) = D c, with all vectors in
@@ -775,47 +772,53 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
     carrier = carrier_lu.solve(carrier_rhs)
-    V = plan.signal_values(signal_entries, carrier)
     w = plan.detector_weights(carrier)
-    N = plan.noise_values(noise_entries)
-    F = V.shape[0]
-    factors = plan.signal_factors(V)
-    order, position = plan.order, plan.position
-    scale = plan.scale[order]
+    F = signal_entries.shape[0]
     d, k = plan.detector, plan.detector.size
-    if plan.use_basis:
-        basis = np.zeros((F, m, k), complex)
-        basis[:, position[d], np.arange(k)] = plan.scale[d]
-        Z_o = factors.solve(basis, trans="T")
-        Z_o /= scale[:, None]
-        Y_o = np.conj(Z_o @ np.conj(w[d]))
-        if k < DETECTOR_WIDTH:
-            Z_o = np.concatenate([Z_o, np.zeros((F, m, DETECTOR_WIDTH - k), complex)], axis=2)
-    else:
-        Z_o = np.zeros((F, m, DETECTOR_WIDTH), complex)
-        w_o = np.empty((F, m, 1), complex)
-        w_o[:, :, 0] = w[order] * scale
-        Y_o = factors.solve(w_o, trans="H")[:, :, 0]
-        Y_o /= scale
-    by_row, by_col = plan.noise_by_row, plan.noise_by_col
-    q_o = _scatter_sum(N * Y_o[:, position[plan.noise_cols]], (*by_row[:2], position[by_row[2]]), m)  # N y
-    qh_o = _scatter_sum(np.conj(N) * Y_o[:, position[plan.noise_rows]], (*by_col[:2], position[by_col[2]]), m)  # N^H y
-    power = np.einsum("fm,fm->f", np.conj(Y_o), q_o).real
-    right_hand_sides = np.zeros((F, m, 2), complex)
-    right_hand_sides[:, position[plan.rhs_rows], 0] = V[:, ~plan.in_matrix] / plan.scale[plan.rhs_rows]
-    right_hand_sides[:, :, 1] = (q_o + qh_o) * (0.5 / scale)
-    solutions = factors.solve(right_hand_sides)
-    solutions *= scale[:, None]
-    X = np.empty((F, m), complex)
+    signal = np.empty((m, F), complex)
     MU = np.empty((F, m), complex)
     Y = np.empty((F, m), complex)
-    Z = np.empty((F, m, DETECTOR_WIDTH), complex)
-    X[:, order] = solutions[:, :, 0]
-    MU[:, order] = solutions[:, :, 1]
-    Y[:, order] = Y_o
-    Z[:, order] = Z_o
+    Z = np.zeros((F, m, DETECTOR_WIDTH), complex)
+    power = np.empty(F)
+    for start in range(0, F, BLOCK_FREQUENCIES):
+        block = slice(start, start + BLOCK_FREQUENCIES)
+        V = plan.signal_values(signal_entries[block], carrier)
+        N = plan.noise_values(noise_entries[block])
+        count = V.shape[0]
+        if start == 0:
+            plan._analyze(V[0])
+            order, position = plan.order, plan.position
+            scale = plan.scale[order]
+            rhs_places, rhs_scale = position[plan.rhs_rows], plan.scale[plan.rhs_rows]
+            by_row = (*plan.noise_by_row[:2], position[plan.noise_by_row[2]])
+            by_col = (*plan.noise_by_col[:2], position[plan.noise_by_col[2]])
+            noise_row_places, noise_col_places = position[plan.noise_rows], position[plan.noise_cols]
+        factors = plan.signal_factors(V)
+        if plan.use_basis:
+            basis = np.zeros((count, m, k), complex)
+            basis[:, position[d], np.arange(k)] = plan.scale[d]
+            Z_o = factors.solve(basis, trans="T")
+            Z_o /= scale[:, None]
+            Y_o = np.conj(Z_o @ np.conj(w[d]))
+            Z[block][:, order, :k] = Z_o
+        else:
+            w_o = np.empty((count, m, 1), complex)
+            w_o[:, :, 0] = w[order] * scale
+            Y_o = factors.solve(w_o, trans="H")[:, :, 0]
+            Y_o /= scale
+        q_o = _scatter_sum(N * Y_o[:, noise_col_places], by_row, m)  # N y
+        qh_o = _scatter_sum(np.conj(N) * Y_o[:, noise_row_places], by_col, m)  # N^H y
+        power[block] = np.einsum("fm,fm->f", np.conj(Y_o), q_o).real
+        right_hand_sides = np.zeros((count, m, 2), complex)
+        right_hand_sides[:, rhs_places, 0] = V[:, ~plan.in_matrix] / rhs_scale
+        right_hand_sides[:, :, 1] = (q_o + qh_o) * (0.5 / scale)
+        solutions = factors.solve(right_hand_sides)
+        solutions *= scale[:, None]
+        signal[order, block] = solutions[:, :, 0].T
+        MU[block][:, order] = solutions[:, :, 1]
+        Y[block][:, order] = Y_o
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, X, noise, Y, MU, Z
+    return carrier, signal, noise, Y, MU, Z
 
 
 def _signal_adjoint(plan, Z, signal_bar, general_adjoint):
@@ -854,40 +857,57 @@ def backward(
     """
     n, m = plan.n, plan.m
     carrier_lu, _ = plan.carrier_matrix(carrier_entries)
-    pre = plan.signal_pre(signal_entries, placing_base)
     F = signal_entries.shape[0]
     carrier_bar = carrier_bar.astype(complex)
-    V_bar = np.empty((F, plan.size), complex)
     g = noise_bar * NOISE_SCALE / noise  # d noise / d power
-    rows, cols = plan.rows[plan.in_matrix], plan.cols[plan.in_matrix]
     lam = _signal_adjoint(plan, Z, signal_bar, general_adjoint)
-    # -lam X - 2 g conj(Y) MU on the matrix pattern, evaluated in place (same operation order).
-    first = lam[:, rows]
-    first *= X[:, cols]
-    np.negative(first, out=first)
-    second = Y[:, rows]
-    np.conj(second, out=second)
-    second *= 2 * g[:, None]
-    second *= MU[:, cols]
-    first -= second
-    V_bar[:, plan.in_matrix] = first
-    V_bar[:, ~plan.in_matrix] = lam[:, plan.rhs_rows]
-    w_bar = 2 * (g[:, None] * np.conj(MU)).sum(0)
-
-    N_bar = g[:, None] * np.conj(Y[:, plan.noise_rows]) * Y[:, plan.noise_cols]
-    noise_entries_bar = np.zeros((F, plan.noise_live.size), complex)
-    noise_entries_bar[:, plan.noise_live] = N_bar[:, plan.noise_base.size :]
-
-    V_bar[:, plan.conjugated] = np.conj(V_bar[:, plan.conjugated])
-    live = plan.placing_live
+    in_matrix, off_matrix = np.nonzero(plan.in_matrix)[0], np.nonzero(~plan.in_matrix)[0]
+    rows, cols = plan.rows[in_matrix], plan.cols[in_matrix]
+    conjugated = np.nonzero(plan.conjugated)[0]
+    live = np.nonzero(plan.placing_live)[0]
     placed = plan.placing_positions[live]
     sci = plan.signal_carrier_indices[live]
-    placed_bar = V_bar[:, placed]
-    np.add.at(carrier_bar, sci, -(placed_bar * pre[:, live]).sum(0))
-    placed_bar *= carrier[sci]
-    V_bar[:, placed] = np.negative(placed_bar, out=placed_bar)
+    update_live = np.nonzero(plan.update_live)[0]
+    updated = plan.update_positions[update_live]
+    noise_live = np.nonzero(plan.noise_live)[0]
+    written, writers = plan.placing_writers()
+    placing_base = placing_base.astype(complex)
     signal_entries_bar = np.zeros_like(signal_entries)
-    signal_entries_bar[:, plan.update_live] = V_bar[:, plan.update_positions[plan.update_live]]
+    noise_entries_bar = np.zeros((F, plan.noise_live.size), complex)
+    placed_sum = np.zeros(placed.size, complex)
+    # Frequency blocks keep the intermediate arrays small, as in `forward`.
+    for start in range(0, F, BLOCK_FREQUENCIES):
+        block = slice(start, start + BLOCK_FREQUENCIES)
+        lam_b, Y_b, g_b = lam[block], Y[block], g[block, None]
+        count = lam_b.shape[0]
+        # -lam X - 2 g conj(Y) MU on the matrix pattern, evaluated in place.
+        first = lam_b[:, rows]
+        first *= X[block][:, cols]
+        np.negative(first, out=first)
+        second = Y_b[:, rows]
+        np.conj(second, out=second)
+        second *= 2 * g_b
+        second *= MU[block][:, cols]
+        first -= second
+        V_bar = np.empty((count, plan.size), complex)
+        V_bar[:, in_matrix] = first
+        V_bar[:, off_matrix] = lam_b[:, plan.rhs_rows]
+
+        N_bar = g_b * np.conj(Y_b[:, plan.noise_rows]) * Y_b[:, plan.noise_cols]
+        noise_entries_bar[block][:, noise_live] = N_bar[:, plan.noise_base.size :]
+
+        V_bar[:, conjugated] = np.conj(V_bar[:, conjugated])
+        # Values of the placing slots before the placement: a signal entry or the constant base.
+        pre = np.empty((count, plan.placing_positions.size), complex)
+        pre[:] = placing_base
+        pre[:, written] = signal_entries[block][:, writers]
+        placed_bar = V_bar[:, placed]
+        placed_sum += (placed_bar * pre[:, live]).sum(0)
+        placed_bar *= carrier[sci]
+        V_bar[:, placed] = np.negative(placed_bar, out=placed_bar)
+        signal_entries_bar[block][:, update_live] = V_bar[:, updated]
+    np.add.at(carrier_bar, sci, -placed_sum)
+    w_bar = 2 * np.conj(g @ MU)  # sum over the frequencies of 2 g conj(MU); g is real
 
     s = plan.selection
     carrier_bar += w_bar[:n] * s[:n] + np.conj(w_bar[n : 2 * n]) * s[n : 2 * n]
@@ -963,9 +983,9 @@ def _host_forward(optimized_parameters, *host_arrays):
     A = dict(zip(HOST_KEYS, host_arrays))
     entries = EntryPlan(A).values(optimized_parameters)  # derivatives are only taped in the backward pass
     plan = SystemPlan(A)
-    carrier, X, noise, Y, MU, Z = forward(plan, *entries)
+    carrier, signal, noise, Y, MU, Z = forward(plan, *entries)
     base = plan.base_residuals(BASE_ENTRIES_PER_UNKNOWN * plan.m)
-    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z, *base
+    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z, *base
 
 
 def _host_backward(optimized_parameters, *rest):
