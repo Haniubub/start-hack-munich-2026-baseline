@@ -51,7 +51,7 @@ Runde 6 gegen Runde 5 (`45a2328` → `7d12ba7`), eigene Messreihen, Median, weit
 
 Die Benchmark-Ausgaben (Carrier, Signal, Noise, Sensitivity, Powers, Gradient) sind bitgleich zum Stand davor.
 
-Die Reports `mac-neu.json`, `mac-neu.png` und `docker-neu.json` zeigen weiterhin den Stand `ba8f1f2` (Erstlauf 433,5 ms bzw. 505,7 ms, warm 30,8 bzw. 41,3 ms). Der Mac-Report ist der mittlere von drei Läufen (424,1 bis 435,4 ms), der Docker-Report der mittlere von fünf (499,5 bis 514,8 ms). Der Rechner war dabei am Netz und ruhiger als in den Messreihen oben. Für `45a2328` sind sie nicht neu erzeugt: Auf Akku lagen drei volle Läufe bei 456,6 bis 465,0 ms (alle `PASS`), der alte Stand in denselben Minuten bei 457,5 bis 463,2 ms. Ein Versuch für `7d12ba7` am 21.11. um 09:24 ist verworfen: Der Laptop ging währenddessen in den Ruhezustand (Läufe mit 515 bis 1'160 ms). Neu erzeugen, sobald der Rechner am Netz und in Ruhe ist. Die `*-vorher`-Reports zeigen Philip + Max.
+Die Reports `mac-neu.json`, `mac-neu.png` und `docker-neu.json` zeigen weiterhin den Stand `ba8f1f2` (Erstlauf 433,5 ms bzw. 505,7 ms, warm 30,8 bzw. 41,3 ms). Der Mac-Report ist der mittlere von drei Läufen (424,1 bis 435,4 ms), der Docker-Report der mittlere von fünf (499,5 bis 514,8 ms). Der Rechner war dabei am Netz und ruhiger als in den Messreihen oben. Für `45a2328` sind sie nicht neu erzeugt: Auf Akku lagen drei volle Läufe bei 456,6 bis 465,0 ms (alle `PASS`), der alte Stand in denselben Minuten bei 457,5 bis 463,2 ms. Zwei Versuche für `7d12ba7` am 21.11. sind verworfen. Um 09:24 ging der Laptop währenddessen in den Ruhezustand (Läufe mit 515 bis 1'160 ms). Um 10:12 war er wach, aber in Gebrauch: sieben volle Läufe je Umgebung, alle `PASS`, Mac 434 bis 907 ms (Median 448 ms, warm 30 ms), Docker 512 bis 616 ms (Median 525 ms, warm 37 ms). Neu erzeugen, sobald der Rechner am Netz und in Ruhe ist. Die `*-vorher`-Reports zeigen Philip + Max.
 
 ## Was in Runde 6 geändert wurde
 
@@ -326,7 +326,7 @@ Joels README nennt für seinen Stand auf einem AMD EPYC (x86-Linux, 1 CPU) 762 m
 - Noel hat am 21.11. freigegeben: Jede Runde committet ihre behaltenen Änderungen und pusht sie auf `origin/noel`.
 - Nur der Branch `noel`. Kein Merge von `noel` in andere Branches, kein Pull Request, kein Force-Push, keine anderen Branches anfassen.
 - Noel hat am 21.11. um 08:30 entschieden: Die Bündelung der kleinen Arrays (Nr. 18) wird eingebaut, obwohl die warmen Wiederholungen in Docker damit langsamer sind. Für die Wertung zählt der Erstlauf.
-- Seit Runde 6 (21.11., `7d12ba7`) liefert `run_build_step` die drei Systemmatrizen als `SparseMatrix`. Wer Branches zusammenführt, die den Build oder den JAX-Weg ändern, muss das beachten. Noel hat dazu nicht eigens Ja gesagt: Die Runde hat es im Rahmen der Freigabe für behaltene Änderungen eingebaut und gemeldet.
+- Seit Runde 6 (21.11., `7d12ba7`) liefert `run_build_step` die drei Systemmatrizen als `SparseMatrix`. Wer Branches zusammenführt, die den Build oder den JAX-Weg ändern, muss das beachten. Die Runde hat das im Rahmen der Freigabe für behaltene Änderungen eingebaut. Noel hat am 21.11. um 10:10 bestätigt: bleibt drin.
 - Verworfene Versuche werden nicht committet.
 - Eine Änderung bleibt nur, wenn sie im Wechselvergleich schneller ist und alle Prüfungen unverändert gut ausfallen.
 - `benchmark.py`, Fixtures und `requirements.txt` bleiben unangetastet. Keine Caches, nichts vorberechnen.
