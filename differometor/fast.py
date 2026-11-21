@@ -163,7 +163,16 @@ PARALLEL_TOLERANCE = 1e-13
 
 
 class Dual:
-    """Value plus derivatives with respect to k real inputs; `tan` has shape (k, *val.shape) or is 0."""
+    """
+    Value plus derivatives with respect to k real inputs; `tan` has shape (k, *val.shape) or is 0.
+
+    Most operations in the component formulas combine a Dual with a plain number or array (a
+    parameter that is no design variable, a constant). Those have no derivative, so the product
+    rule needs one term only and a sum leaves the derivative as it is. Leaving the zero terms out
+    also keeps a derivative that is the same at every frequency in its compact shape, when only
+    the value picks up a frequency dependence. Duals are never changed in place, so a result may
+    share its `tan` with an operand.
+    """
 
     __slots__ = ("val", "tan")
     __array_priority__ = 1000
@@ -179,32 +188,36 @@ class Dual:
         return Dual(-self.val, -self.tan)
 
     def __add__(self, other):
-        other = Dual.lift(other)
-        return Dual(self.val + other.val, self.tan + other.tan)
+        if isinstance(other, Dual):
+            return Dual(self.val + other.val, self.tan + other.tan)
+        return Dual(self.val + other, self.tan)
 
     __radd__ = __add__
 
     def __sub__(self, other):
-        other = Dual.lift(other)
-        return Dual(self.val - other.val, self.tan - other.tan)
+        if isinstance(other, Dual):
+            return Dual(self.val - other.val, self.tan - other.tan)
+        return Dual(self.val - other, self.tan)
 
     def __rsub__(self, other):
-        other = Dual.lift(other)
-        return Dual(other.val - self.val, other.tan - self.tan)
+        return Dual(other - self.val, -self.tan)
 
     def __mul__(self, other):
-        other = Dual.lift(other)
-        return Dual(self.val * other.val, self.tan * other.val + self.val * other.tan)
+        if isinstance(other, Dual):
+            return Dual(self.val * other.val, self.tan * other.val + self.val * other.tan)
+        return Dual(self.val * other, self.tan * other)
 
     __rmul__ = __mul__
 
     def __truediv__(self, other):
-        other = Dual.lift(other)
-        quotient = self.val / other.val
-        return Dual(quotient, (self.tan - quotient * other.tan) / other.val)
+        if isinstance(other, Dual):
+            quotient = self.val / other.val
+            return Dual(quotient, (self.tan - quotient * other.tan) / other.val)
+        return Dual(self.val / other, self.tan / other)
 
     def __rtruediv__(self, other):
-        return Dual.lift(other).__truediv__(self)
+        quotient = other / self.val
+        return Dual(quotient, -(quotient * self.tan) / self.val)
 
     def __pow__(self, exponent):
         if isinstance(exponent, Dual):
@@ -1089,15 +1102,6 @@ class _PatternLU:
         return x
 
 
-def _scatter_sum(values, grouping, size):
-    """Scatter-add the columns of `values` (F, E) into (F, size) target slots."""
-    order, starts, slots = grouping
-    result = np.zeros((values.shape[0], size), complex)
-    if order.size:
-        result[:, slots] = _group_sum(values, order, starts)
-    return result
-
-
 def forward(plan, carrier_entries, signal_entries, noise_entries):
     """Carrier (n,), signal (m, F) and noise (F,) outputs plus the adjoint helpers Y = S^-H w and MU.
 
@@ -1126,10 +1130,21 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     # S^-H w = conj(S^-T conj(w))
     Y = factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T")[:, :, 0]
     np.conjugate(Y, out=Y)
-    q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
-    qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
-    power = np.einsum("fm,fm->f", np.conj(Y), q).real
-    right_hand_sides[:, :, 1] = 0.5 * (q + qh)
+    # N y and N^H y have few entries. They go straight into the second right-hand side
+    # (N + N^H) y / 2, which is still zero, and the noise power y^H N y is summed over the noise
+    # entries instead of over all unknowns.
+    from_rows = Y[:, plan.noise_rows]
+    products = N * Y[:, plan.noise_cols]  # the terms of N y
+    power = np.einsum("fe,fe->f", np.conj(from_rows), products).real
+    half = right_hand_sides[:, :, 1]
+    order, starts, slots = plan.noise_by_row
+    if order.size:
+        half[:, slots] = 0.5 * _group_sum(products, order, starts)
+    order, starts, slots = plan.noise_by_col
+    if order.size:
+        np.conjugate(N, out=N)  # N is not used again
+        N *= from_rows  # the terms of N^H y
+        half[:, slots] += 0.5 * _group_sum(N, order, starts)
     solutions = factors.solve(right_hand_sides, overwrite=True)
     signal = np.ascontiguousarray(solutions[:, :, 0].T)
     MU = np.ascontiguousarray(solutions[:, :, 1])
