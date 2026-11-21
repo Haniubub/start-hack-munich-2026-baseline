@@ -167,9 +167,24 @@ Was man dazu wissen muss:
 
 - **In der Gesamtzeit ist der Gewinn nicht nachweisbar.** Die Import-Phase (rund 320 ms, fast alles `import jax`) streut um ±3 ms. Die Gesamtzeiten der drei Reihen: 461,2 → 461,6 ms, 534,7 → 535,3 ms und 548,5 → 535,5 ms. Die Messung lief auf Akku, darum liegen alle Werte rund 5 % höher als in den Runden davor.
 - **Die warmen Wiederholungen werden in Docker 3 bis 7 ms langsamer.** Das ist der bewusst in Kauf genommene Preis: Für die Wertung zählt der Erstlauf.
-- **Der grössere Teil des Gewinns hängt am Speicherlayout.** In Docker fallen im Erstlauf rund 6'000 Seitenfehler weniger an (rund 3,5 ms), dafür in jedem warmen Aufruf mehr. Beides hängt davon ab, wann glibc Speicher ans System zurückgibt, und kann auf einer x86-Maschine anders ausfallen. Sicher übertragbar ist rund 1 ms (weniger Argumente beim Lowering und Kompilieren). Darum sollten beide Stände (`6b67cfd` ohne, `45a2328` mit Bündelung) auf x86 im Wechsel gemessen werden. Ist die Bündelung dort nicht schneller, genügt `git revert 45a2328`.
+- **Der grössere Teil des Gewinns hängt am Speicherlayout.** In Docker fallen im Erstlauf rund 6'000 Seitenfehler weniger an (rund 3,5 ms), dafür in jedem warmen Aufruf mehr. Beides hängt davon ab, wann glibc Speicher ans System zurückgibt, und kann auf einer x86-Maschine anders ausfallen. Sicher übertragbar ist rund 1 ms (weniger Argumente beim Lowering und Kompilieren). Darum sollten beide Stände (`6b67cfd` ohne, `45a2328` mit Bündelung) auf x86 im Wechsel gemessen werden. Nachtrag: Seit der sechsten Runde ist die Bündelung fester Teil des Entwurfs, und ihr Nachteil im Warmlauf ist weg.
 
 Die Ausgaben aller Prüfskripte sind Zeile für Zeile gleich wie zuvor. Neu ist `runs/noel/test_pack.py`: Es prüft, dass das Packen jedes Array exakt wiederherstellt.
+
+## Sechste Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung: Der Build übergibt die drei Systemmatrizen (Träger, Signal, Rauschen) in Koordinatenform statt als dichte Arrays. Dafür gibt es den Typ `differometor.fast.SparseMatrix` (Zeilen und Spalten, Werte, feste Form). Die dichte Signal- und Rauschmatrix belegten im Benchmark-Setup je 9 MB, für 1'539 bzw. 0 konstante Einträge. JAX kopierte beide bei jedem Forward-Aufruf in den Callback.
+
+| Umgebung | Erstlauf gesamt | Forward-Phase | Gradient-Phase | Warm |
+|---|---|---|---|---|
+| Apple M4, macOS (16 Läufe im Wechsel) | 0,441 → **0,433 s** | 26,7 → 23,6 ms | 10,3 → 9,8 ms | 31,3 → 29,5 ms |
+| Docker, Linux aarch64, `--cpus 1` (16 Läufe im Wechsel) | 0,515 → **0,512 s** | 35,1 → 29,7 ms | 13,6 → 13,3 ms | 43,3 → 35,2 ms |
+| Docker, zweite Reihe (12 Läufe, Reihenfolge getauscht) | 0,518 → **0,507 s** | 34,8 → 29,4 ms | 14,0 → 13,1 ms | 43,4 → 35,4 ms |
+
+- **Korrektheit:** Die Benchmark-Ausgaben (Carrier, Signal, Noise, Sensitivity, Powers, Gradient) sind bitgleich zum Stand davor. Die Build-Ausgaben von fünf Setups sind als dichte Arrays identisch. Alle Prüfskripte geben dieselben Zahlen aus. Neu ist `runs/noel/test_sparse.py`.
+- **Was sich an der Schnittstelle ändert:** `arrays["carrier_matrix"]`, `arrays["signal_matrix"]` und `arrays["noise_matrix"]` aus `run_build_step` sind `SparseMatrix`-Objekte. `np.asarray(matrix)` und `matrix.dense()` liefern die dichte Matrix wie bisher. Der Original-JAX-Weg (`simulate_jax`) wandelt sie am Eingang selbst um. Wer `simulate` dichte Matrizen übergibt, bekommt dieselben Resultate über den JAX-Weg.
+- **Nebenwirkung:** Die warmen Wiederholungen in Docker sind jetzt schneller als vor der fünften Runde. Die feste Obergrenze für konstante Einträge im Rückwärtslauf gibt es nicht mehr.
+- **Zurücknehmen:** `git revert 7d12ba7`.
 
 ## Wo die verbleibende Zeit steckt
 

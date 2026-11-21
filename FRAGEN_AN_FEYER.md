@@ -1,13 +1,13 @@
 # Fragen an Feyer
 
-Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` und `nacht` plus vier Optimierungsrunden vom 21.11.).
+Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` und `nacht` plus sechs Optimierungsrunden vom 21.11.).
 Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
 
 ## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
 
 - Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
 - Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
-- Gemessen auf einem Apple M4: Original 12,8 s → 0,45 s auf macOS und 0,52 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung dieses Branches auf x86 fehlt noch.
+- Gemessen auf einem Apple M4: Original 12,8 s → 0,43 s auf macOS und 0,51 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung dieses Branches auf x86 fehlt noch.
 
 ## Die sechs wichtigsten Fragen
 
@@ -36,13 +36,14 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den ersten fünf hängt ab, ob unsere
 | A8 | Wir laden den kompilierten SuperLU-Löser direkt aus dem SciPy-Paket (`scipy/sparse/linalg/_dsolve/_superlu`), ohne `import scipy.sparse.linalg`. Das spart rund 90 ms Import. Ist das in Ordnung? | Es ist ein internes Modul von SciPy. Falls nein, kostet uns der normale Import etwa 15 % der Gesamtzeit. |
 | A9 | `df.signal_detector` und `df.power_detector` rechnen bei uns in NumPy (Host-Callback) statt in JAX, mit eigener Rückwärtsregel. Das spart rund 30 ms Kompilierzeit im Readout. Zählt das? | Die Formeln sind unverändert, Forward-Mode geht damit aber nur noch über einen Schalter (`HOST_DETECTORS = False`). |
 | A10 | Dürfen wir Einstellungen des Lösers ändern? Wir nutzen SuperLU mit `Relax=1`, `PanelSize=1`, skalieren das System vorher (`D⁻¹·S·D` mit Zweierpotenzen) und lassen die Diagonale als Pivot zu, solange sie 10 % des grössten Spalteneintrags erreicht. Je 16 Frequenzen übergeben wir dem Löser gemeinsam als ein Block-Diagonalsystem. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7). Die Zerlegung wird insgesamt etwa doppelt so schnell, und bei veränderten Designvariablen ist sie genauer als ohne Skalierung. Das Bündeln ändert das Ergebnis nicht (bitgleich). |
+| A11 | Der Build übergibt die Systemmatrizen bei uns in Koordinatenform (Zeile, Spalte, Wert) statt als dichte Arrays. Die Einträge sind dieselben, die dichte Signal- und Rauschmatrix (je 9 MB, fast nur Nullen) entstehen nicht mehr. `arrays` aus `run_build_step` enthält dafür drei Objekte eines eigenen Typs. In Ordnung? | `benchmark.py` reicht `arrays` nur durch und läuft unverändert. Wer die Matrizen dicht braucht, bekommt sie mit `np.asarray(...)`. Die Resultate sind bitgleich. Gewinn: rund 5 ms im Erstlauf. |
 
 ## B. Wie wird gemessen?
 
 | Nr. | Frage | Warum wir fragen |
 | --- | --- | --- |
 | B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
-| B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? Zählt die warme Laufzeit für die Rangliste gar nicht, auch nicht bei Gleichstand? | Der «first-run total» entsteht nur einmal pro Prozess. Seit dem 21.11. haben wir eine Änderung drin, die den Erstlauf in Docker um rund 3 ms verkürzt und die warmen Wiederholungen um 3 bis 7 ms verlängert. |
+| B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? Zählt die warme Laufzeit für die Rangliste gar nicht, auch nicht bei Gleichstand? | Der «first-run total» entsteht nur einmal pro Prozess. Wir optimieren auf den Erstlauf. Die warme Laufzeit liegt bei 30 ms (macOS) bzw. 35 ms (Docker). |
 | B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf je nach Zustand der Maschine um bis zu 40 ms, in älteren Docker-Messungen zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
 | B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet der Import unserer Module 13 ms (fast alles Übersetzen der Quelltexte), mit Cache 1,4 ms. |
 | B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
