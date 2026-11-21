@@ -15,6 +15,7 @@ Messumgebung für alle Zahlen: x86-64 Linux, Intel Xeon 2,1 GHz (Emerald Rapids,
 | 5 | Speicherverwaltung von glibc umstellen (`mallopt`) | Gesamt 1010,6 → 1002,7 ms (Median), Minimum gleich, Build +7 ms | nichts gebracht |
 | 6 | Grössere Supernodes für SuperLU auf dem Restsystem (200 Unbekannte) | 17,7–23,2 ms statt 16,9 ms | schlechter |
 | 7 | `np.take(..., out=...)` ohne `mode="clip"` im Rückwärtslauf | Gradient im Erstlauf 34,0 → 36,3 ms | schlechter |
+| 8 | Mehr Eliminationsstufen oder ein lockereres Kriterium (Einträge bis Betrag 2, 10, 100) | Restsystem 125–133 statt 200 Unbekannte, aber 44–61 ms statt 37 ms | schlechter |
 
 ## Die Versuche im Einzelnen
 
@@ -71,6 +72,20 @@ Eine erste Messung, bei der die Varianten nacheinander statt im Wechsel liefen, 
 ### 7. `np.take` mit `out`
 
 `np.take(a, index, axis=0, out=ziel)` schreibt im Standardmodus `mode="raise"` erst in einen Puffer und kopiert dann. Im Rückwärtslauf hat das die eingesparten Zwischenfelder wieder aufgefressen (Gradient im Erstlauf 34,0 → 36,3 ms, 10 Läufe). Mit `mode="clip"` schreibt NumPy direkt ins Ziel. So ist es eingebaut.
+
+### 8. Mehr Eliminationsstufen
+
+Nach drei Stufen bleiben 200 Unbekannte für SuperLU. Zwei Wege, noch weiter zu kommen, wurden am echten System gemessen (Aufbau, Zerlegung und zwei Lösungen, bestes von 5):
+
+| Variante | Stufen | Rest für SuperLU | Zeit |
+| --- | ---: | ---: | ---: |
+| Stand: höchstens 3 Stufen, Einträge mit Betrag ≤ 1 | 3 | 200 | 37,1 ms |
+| bis 6 Stufen, sonst gleich | 5 | 133 | 46,2 ms |
+| bis 6 Stufen, Einträge bis Betrag 2 | 5 | 133 | 44,0 ms |
+| bis 6 Stufen, Einträge bis Betrag 10 | 5 | 133 | 44,1 ms |
+| bis 6 Stufen, Einträge bis Betrag 100 | 6 | 125 | 60,8 ms |
+
+Jede weitere Stufe kostet mehr an Verwaltung (Schur-Komplement, zwei CSR-Blöcke, vier Aufrufe beim Lösen), als SuperLU an den wenigen Spalten spart. Das lockerere Kriterium bringt kaum zusätzliche Unbekannte: Was nach drei Stufen übrig ist, hat entweder keine Diagonale 1 mehr oder gehört zur Mechanik.
 
 ## Nicht ausprobiert, weil es an den Regeln hängt
 
