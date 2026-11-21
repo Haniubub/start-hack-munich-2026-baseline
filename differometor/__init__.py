@@ -1,3 +1,9 @@
+from differometor import _tuning
+
+# Cheaper XLA compilation and JAX lowering for the whole process, one switch per measure in
+# _tuning.py. Has to run before the first program is compiled.
+_tuning.apply()
+
 from differometor.setups import Setup
 from differometor.simulate import run, run_build_step, run_simulation_step, simulate
 from differometor.components import power_detector, signal_detector
