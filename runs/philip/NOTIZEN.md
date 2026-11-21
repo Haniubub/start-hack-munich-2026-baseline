@@ -6,21 +6,21 @@ Stand: Sa 21.11.2026, Basis ist `origin/noel` (`c261b63`, 00:39). Was nicht funk
 
 Das ist die erste Messung des Teams auf x86. Maschine: Intel Xeon 2,1 GHz (Emerald Rapids, Nachfolge-Generation des Xeon Platinum 8468 aus dem Brief), `python benchmark.py --cpus 1 --repeats 3`, ohne `XLA_FLAGS`. 12 Läufe pro Stand, abwechselnd, jeder in einem frischen Prozess. Angegeben sind Median / Minimum in ms. Alle Läufe `PASS`.
 
-| Phase | `philip` (`ab82e42`) | `noel` (`c261b63`) | `philip-nacht` |
+| Phase | `philip` (`ab82e42`) | `noel` (`c261b63`) | `philip-nacht` (`605b73e`) |
 | --- | ---: | ---: | ---: |
-| **Erstlauf gesamt** | 1508,5 / 1459,6 | 1067,5 / 1047,5 | **983,7 / 919,8** |
-| Imports | 509,2 / 486,8 | 395,6 / 369,0 | 385,8 / 360,5 |
-| Build | 91,7 / 88,1 | 91,6 / 87,9 | 84,4 / 78,8 |
-| Trace / Lower | 73,8 / 69,5 | 55,1 / 51,6 | 55,1 / 51,5 |
-| Kompilieren | 525,3 / 500,5 | 299,2 / 287,9 | 297,3 / 282,5 |
-| Vorwärtslauf | 176,7 / 166,0 | 136,8 / 129,2 | **85,4 / 80,0** |
-| Gradient | 121,0 / 115,3 | 88,5 / 76,7 | **64,4 / 61,1** |
-| Warm gesamt | 237,7 / 226,2 | 172,9 / 168,5 | **118,2 / 111,2** |
-| Warm Vorwärtslauf | 156,2 / 148,8 | 113,6 / 109,9 | 69,3 / 65,6 |
-| Warm Gradient | 80,9 / 76,8 | 58,7 / 54,4 | 46,7 / 43,8 |
+| **Erstlauf gesamt** | 1508,5 / 1459,6 | 1044,8 / 985,9 | **914,0 / 864,7** |
+| Imports | 509,2 / 486,8 | 373,9 / 359,0 | 368,9 / 350,0 |
+| Build | 91,7 / 88,1 | 92,0 / 83,9 | 81,3 / 76,5 |
+| Trace / Lower | 73,8 / 69,5 | 52,8 / 51,2 | 54,3 / 49,9 |
+| Kompilieren | 525,3 / 500,5 | 289,3 / 280,7 | 287,3 / 278,8 |
+| Vorwärtslauf | 176,7 / 166,0 | 131,4 / 125,3 | **78,5 / 73,6** |
+| Gradient | 121,0 / 115,3 | 83,9 / 77,2 | **32,2 / 29,5** |
+| Warm gesamt | 237,7 / 226,2 | 162,9 / 156,7 | **87,0 / 82,8** |
+| Warm Vorwärtslauf | 156,2 / 148,8 | 107,7 / 102,9 | 66,2 / 62,6 |
+| Warm Gradient | 80,9 / 76,8 | 55,2 / 50,2 | 19,4 / 18,1 |
 | Fehler gegen Feyers Referenz | 5,3742e-06 | 5,3747e-06 | 5,3743e-06 |
 
-Diese Tabelle enthält die Spaltenordnung `MMD_ATA` (Änderung 4) noch nicht. Sie bringt im Vorwärtslauf weitere 4–5 ms.
+Die Spalten `noel` und `philip-nacht` stammen aus derselben Messreihe (02:35), die Spalte `philip` aus einer früheren (02:05, dort lag `noel` bei 1067,5 / 1047,5). Zwischen zwei Messreihen streut die Maschine um 20–50 ms, innerhalb einer Reihe sind die Stände vergleichbar.
 
 Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 kostet das Kompilieren rund 290 ms und damit fast ein Drittel, auf dem M4 sind es 75 ms. SuperLU ist 3,5-mal langsamer als auf dem M4.
 
@@ -32,6 +32,10 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 kostet das Kompilieren 
 | 2 | Alle Frequenzen in einer block-diagonalen SuperLU-Zerlegung (`_BlockLU`) | `fast.py` | Vorwärts 109,0 → 104,2 ms (10 Läufe) |
 | 3 | Einfache Unbekannte vor der LU exakt eliminieren (`_CondensedLU`) | `fast.py` | Vorwärts 105,8 → 82,1 ms, warm 93,7 → 67,2 ms (10 Läufe) |
 | 4 | Spaltenordnung `MMD_ATA` statt COLAMD für das Restsystem | `fast.py` | Vorwärts 85,3 → 80,7 ms, warm 70,7 → 65,6 ms (10 Läufe) |
+| 5 | Rückwärtslauf verwendet den Vorwärtslauf wieder (`FORWARD_CACHE`) | `fast.py` | Gradient 62,7 → 35,3 ms, Vorwärts 81,3 → 85,3 ms, Erstlauf 966,4 → 922,8 ms (10 Läufe) |
+| 6 | Werte aller Eliminationsstufen in einem Feld | `fast.py` | Vorwärts 82,6 → 80,0 ms, warm 74,7 → 69,5 ms (10 Läufe) |
+| 7 | Layout `(Einträge, F)` statt `(F, Einträge)` | `fast.py` | Vorwärts 79,2 → 75,6 ms, Gradient 35,0 → 33,7 ms, warm gesamt 95,7 → 90,0 ms (10 Läufe) |
+| 8 | Rückwärtsformeln an Ort und Stelle rechnen | `fast.py` | Warm Gradient 21,1 → 18,8 ms, Erstlauf Gradient 33,4 → 32,8 ms (14 Läufe) |
 
 ### 1. Basismatrizen sparse
 
@@ -78,18 +82,36 @@ Ein Nebenbefund aus `test_condensed.py`: Mit zufälligen rechten Seiten erfüllt
 
 `MMD_ATA` erzeugt auf dem Restsystem etwas weniger Fill als COLAMD. Die Resultate ändern sich im Rahmen der Rundung (Tabelle oben).
 
+### 5. Vorwärtslauf wiederverwenden
+
+Der Rückwärts-Callback hat beide Pläne neu aufgebaut, die Werte der Signalmatrix und die Carrier-Zerlegung neu gerechnet und alle Matrixeinträge ein zweites Mal ausgewertet, diesmal mit Ableitungen. Das hatte der Vorwärts-Callback kurz davor schon getan.
+
+- Folgt auf den Vorwärtslauf ein Pullback (`jax.vjp`, `jax.grad`), wertet er die Einträge gleich mit Ableitungen aus und legt Pläne, Einträge, Tape, Signalwerte und Carrier-LU in einem Zwischenspeicher mit zwei Plätzen ab.
+- Der Schlüssel dazu wandert als Residuum durch JAX. Der Rückwärts-Callback benutzt den Eintrag, wenn er da ist und die Parameter übereinstimmen. Sonst rechnet er wie bisher aus den Residuen.
+- Reine Vorwärtsaufrufe von `simulate` sind unverändert.
+- `fast.FORWARD_CACHE = False` schaltet auf das zustandslose Verhalten zurück.
+- Die Resultate sind in beiden Fällen bit-identisch. `test_forward_cache.py` prüft Treffer, verdrängte Einträge, mehrfach benutzte Pullbacks und `jit` gegen den zustandslosen Weg.
+
+Damit sind die Callbacks nicht mehr zustandslos, wie es in Noels Beschreibung von `fast.py` stand. Der Zwischenspeicher ist aber nur eine Abkürzung: Alles, was der Rückwärtslauf braucht, fliesst weiterhin als Array durch JAX.
+
+### 6. bis 8. Weniger Speicherverkehr
+
+- **Ein Feld für alle Stufen:** Jede Eliminationsstufe hat die behaltenen Einträge kopiert und ihre Beträge für alle Frequenzen neu bestimmt. Jetzt ändert eine Stufe nur die betroffenen Zeilen und hängt ihr Fill-in an.
+- **Layout `(Einträge, F)`:** Einträge, Signalwerte und ihre Kotangenten lagen als `(F, Einträge)` im Speicher. Jede Auswahl von Einträgen lief damit quer durch den Speicher. Jetzt ist ein Eintrag eine zusammenhängende Zeile. Die Ausgaben bleiben bit-identisch, der Gradient ändert sich um 2,5e-16 relativ (andere Summationsreihenfolge).
+- **Rückwärtsformeln an Ort und Stelle:** Der Kotangent der Signaleinträge entstand aus zehn Zwischenfeldern mit je 2 500 × 101 Elementen. Jetzt wird er direkt ins Ziel geschrieben.
+
 ## Wo die Zeit auf x86 jetzt steckt
 
 | Block | ms | In unserer Hand |
 | --- | ---: | --- |
-| Imports | 385 | rund 5 (`import differometor`). Der Rest ist `import jax` und `benchmark.py` |
-| Build | 84 | rund 24. Rund 55 sind drei kleine XLA-Programme, die `jnp.asarray(..., dtype=float64)` in `benchmark.py` kompiliert |
-| Trace / Lower | 55 | wenig. Jedes Modul kostet 6–9 ms allein für den MLIR-Kontext |
-| Kompilieren | 297 | nichts. Readout 186 ms, Gradient 96 ms, fast nur Operationen aus `benchmark.py` |
-| Vorwärtslauf | 81 | alles: SuperLU 20, Elimination 15, Matrixeinträge 13, Rest Übergabe und erster Aufruf |
-| Gradient | 64 | alles: Dual-Auswertung 11, Rückwärtsformeln 8, Rest Übergabe und erster Aufruf |
+| Imports | 369 | rund 5 (`import differometor`). Der Rest ist `import jax` und `benchmark.py` |
+| Build | 81 | rund 24. Rund 55 sind drei kleine XLA-Programme, die `jnp.asarray(..., dtype=float64)` in `benchmark.py` kompiliert |
+| Trace / Lower | 54 | wenig. Jedes Modul kostet 6–9 ms allein für den MLIR-Kontext |
+| Kompilieren | 287 | nichts. Readout 186 ms, Gradient 96 ms, fast nur Operationen aus `benchmark.py` |
+| Vorwärtslauf | 78 | alles: SuperLU auf dem Restsystem 21, Einträge mit Ableitungen 16, Elimination 15, Signalwerte 5, Rest Übergabe und erster Aufruf |
+| Gradient | 32 | alles: Rückwärtsformeln 14, Pullback der Einträge 5, Rest Übergabe an XLA und Readout-Rückweg |
 
-Rund 800 ms sind fix, solange `benchmark.py` unverändert bleibt und keine XLA-Flags erlaubt sind.
+Rund 800 ms sind fix, solange `benchmark.py` unverändert bleibt und keine XLA-Flags erlaubt sind. Von den 1045 ms des Stands `noel` lagen rund 245 ms in unserer Hand, jetzt sind es noch rund 115 ms.
 
 ## Prüfen und messen
 
@@ -101,6 +123,7 @@ python runs/check_fast.py runs/baseline.npz --fallback
 python runs/check_setups.py
 python runs/noel/test_detectors.py .
 python runs/philip/test_condensed.py
+python runs/philip/test_forward_cache.py
 # Wechselvergleich unter Linux mit --cpus 1 (Vergleichsstand als Git-Worktree in einem zweiten Ordner)
 python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 ```
@@ -109,7 +132,7 @@ python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 
 | Nr. | Idee | Schätzung (x86) | Haken |
 | --- | --- | --- | --- |
-| 1 | Im Rückwärtslauf nicht neu rechnen, was der Vorwärtslauf schon hatte (Pläne, `signal_values`, Dual-Auswertung der Einträge) | 10–14 ms | Braucht einen Zwischenspeicher auf der Host-Seite, die Callbacks sind dann nicht mehr zustandslos |
-| 2 | Verwaltung der Vorab-Elimination straffen (Auswahl und Schur-Komplement kosten zusammen 12 ms) | 3–6 ms | Kleinteilig |
-| 3 | Rückwärtsformeln im Layout `(Einträge, F)` rechnen statt `(F, Einträge)` | 3–4 ms | Y, MU und Z müssten als Residuen anders liegen |
+| 1 | Auswertung der Matrixeinträge mit Ableitungen straffen (16 ms im ersten Aufruf, 11 ms warm) | 3–6 ms | Die Dual-Zahlen-Auswertung ist schon auf die Designvariablen beschränkt |
+| 2 | Mehr Unbekannte vor der LU eliminieren. Von den 200 übrigen haben 165 noch Diagonale 1, aber Einträge mit Betrag > 1 | 3–5 ms | Bräuchte Pivots ungleich 1 und eine Prüfung pro Frequenz |
+| 3 | Seitenfehler im ersten Vorwärtslauf senken (rund 11 000, also 44 MB frischer Speicher) | 3–8 ms | Kleinteilig, `mallopt` hat nichts gebracht |
 | 4 | XLA-Flags für schnelleres Kompilieren | rund 100 ms. Nur zur Einordnung gemessen, nicht eingebaut: `XLA_FLAGS=--xla_backend_optimization_level=0` senkt Readout von 185 auf 120 ms und Gradient von 91 auf 68 ms | Regelfrage B6 |

@@ -13,6 +13,8 @@ Messumgebung für alle Zahlen: x86-64 Linux, Intel Xeon 2,1 GHz (Emerald Rapids,
 | 3 | Vorab-Elimination nur mit NumPy (`np.add.reduceat`) | Verwaltung kostet 36 ms, spart 41 ms | fast nichts gebracht |
 | 4 | Dasselbe mit umgedrehtem Speicherlayout `(Unbekannte, F, k)` | Verwaltung noch 30 ms | zu wenig |
 | 5 | Speicherverwaltung von glibc umstellen (`mallopt`) | Gesamt 1010,6 → 1002,7 ms (Median), Minimum gleich, Build +7 ms | nichts gebracht |
+| 6 | Grössere Supernodes für SuperLU auf dem Restsystem (200 Unbekannte) | 17,7–23,2 ms statt 16,9 ms | schlechter |
+| 7 | `np.take(..., out=...)` ohne `mode="clip"` im Rückwärtslauf | Gradient im Erstlauf 34,0 → 36,3 ms | schlechter |
 
 ## Die Versuche im Einzelnen
 
@@ -50,6 +52,25 @@ Gelöst hat es erst der Wechsel auf die kompilierten CSR-Routinen aus SciPy (`cs
 Im ersten Aufruf fallen im Vorwärtslauf rund 11 000 Seitenfehler an (44 MB frischer Speicher), im ersten Rückwärtslauf 5 700. Die Idee war, glibc mit `mallopt(M_MMAP_THRESHOLD, 32 MB)`, `M_TRIM_THRESHOLD` und `M_TOP_PAD` dazu zu bringen, freigegebenen Speicher zu behalten statt ihn dem Kernel zurückzugeben.
 
 8 Läufe im Wechsel: Gesamt 1010,6 → 1002,7 ms im Median, das Minimum ist identisch (944,4 und 944,7 ms). Der Build wird 5–7 ms langsamer, der Vorwärtslauf bleibt gleich. Kein messbarer Gewinn. Dazu wäre es ein Eingriff in den ganzen Prozess, also eher eine Regelfrage wie B6 in `FRAGEN_AN_FEYER.md`.
+
+### 6. Supernodes auf dem Restsystem
+
+Nach der Vorab-Elimination ist das Restsystem dichter (6,4 statt 3,5 Einträge pro Zeile). Grössere Supernodes hätten sich dort lohnen können. Im Wechsel gemessen, 9 Durchgänge, bestes Ergebnis für Zerlegung plus zwei Lösungen:
+
+| Einstellung | Zeit |
+| --- | ---: |
+| `PanelSize=1`, `Relax=1` (Stand) | 16,9 ms |
+| `PanelSize=1`, `Relax=2` | 17,7 ms |
+| `PanelSize=2`, `Relax=1` | 17,8 ms |
+| `PanelSize=3`, `Relax=1` | 18,6 ms |
+| `PanelSize=2`, `Relax=2` | 18,7 ms |
+| Standard von SuperLU | 23,2 ms |
+
+Eine erste Messung, bei der die Varianten nacheinander statt im Wechsel liefen, hatte für `PanelSize=2` 25 % Gewinn gezeigt. Das war nur die Reihenfolge: Die zuerst gemessene Variante lief auf kaltem Speicher. Seither wird alles im Wechsel gemessen.
+
+### 7. `np.take` mit `out`
+
+`np.take(a, index, axis=0, out=ziel)` schreibt im Standardmodus `mode="raise"` erst in einen Puffer und kopiert dann. Im Rückwärtslauf hat das die eingesparten Zwischenfelder wieder aufgefressen (Gradient im Erstlauf 34,0 → 36,3 ms, 10 Läufe). Mit `mode="clip"` schreibt NumPy direkt ins Ziel. So ist es eingebaut.
 
 ## Nicht ausprobiert, weil es an den Regeln hängt
 
