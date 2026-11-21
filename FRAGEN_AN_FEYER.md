@@ -1,23 +1,24 @@
 # Fragen an Feyer
 
-Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` plus zwei Optimierungsrunden vom 21.11.).
+Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` und `nacht` plus drei Optimierungsrunden vom 21.11.).
 Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
 
 ## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
 
 - Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
 - Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
-- Gemessen auf einem Apple M4: Original 12,8 s → 0,45 s auf macOS und 0,53 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung auf x86 fehlt noch.
+- Gemessen auf einem Apple M4: Original 12,8 s → 0,45 s auf macOS und 0,52 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung dieses Branches auf x86 fehlt noch.
 
-## Die fünf wichtigsten Fragen
+## Die sechs wichtigsten Fragen
 
-Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere Lösung überhaupt zählt.
+Wenn nur wenig Zeit ist, diese zuerst. Von den ersten fünf hängt ab, ob unsere Lösung überhaupt zählt. Die sechste ist die mit dem grössten Zeitgewinn.
 
 1. Zählt eine Lösung, deren Rechenkern in SciPy statt in JAX läuft? (A1)
 2. Wir haben schon vor dem offiziellen Start am öffentlichen Kit gearbeitet. Ist das erlaubt? (D1)
 3. Auf welcher Maschine und mit welchem Befehl wird die Wertung gemessen? (B1, B2)
 4. Wie geht ihr mit der Streuung um, wenn die Gesamtzeit unter 1,5 s liegt? (B3)
 5. Testet ihr auch andere Setups als das UIFO aus dem Benchmark? (C3)
+6. Darf unser Code eine JAX-Einstellung setzen, die den Compiler weniger optimieren lässt? Das spart in Docker 42 ms, also 8 % der Gesamtzeit. (B6)
 
 ---
 
@@ -34,7 +35,7 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | A7 | Braucht ihr `vmap` über viele Parametersätze (`run_with_parameter_sets`), Forward-Mode (`jvp`) oder höhere Ableitungen? | Der schnelle Weg kann nur Reverse-Mode nach den Designvariablen. Alles andere läuft über den Rückfall. |
 | A8 | Wir laden den kompilierten SuperLU-Löser direkt aus dem SciPy-Paket (`scipy/sparse/linalg/_dsolve/_superlu`), ohne `import scipy.sparse.linalg`. Das spart rund 90 ms Import. Ist das in Ordnung? | Es ist ein internes Modul von SciPy. Falls nein, kostet uns der normale Import etwa 15 % der Gesamtzeit. |
 | A9 | `df.signal_detector` und `df.power_detector` rechnen bei uns in NumPy (Host-Callback) statt in JAX, mit eigener Rückwärtsregel. Das spart rund 30 ms Kompilierzeit im Readout. Zählt das? | Die Formeln sind unverändert, Forward-Mode geht damit aber nur noch über einen Schalter (`HOST_DETECTORS = False`). |
-| A10 | Dürfen wir Einstellungen des Lösers ändern? Wir nutzen SuperLU mit `Relax=1`, `PanelSize=1`, skalieren das System vorher (`D⁻¹·S·D` mit Zweierpotenzen) und lassen die Diagonale als Pivot zu, solange sie 10 % des grössten Spalteneintrags erreicht. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7). Die Zerlegung wird insgesamt etwa doppelt so schnell, und bei veränderten Designvariablen ist sie genauer als ohne Skalierung. |
+| A10 | Dürfen wir Einstellungen des Lösers ändern? Wir nutzen SuperLU mit `Relax=1`, `PanelSize=1`, skalieren das System vorher (`D⁻¹·S·D` mit Zweierpotenzen) und lassen die Diagonale als Pivot zu, solange sie 10 % des grössten Spalteneintrags erreicht. Je 16 Frequenzen übergeben wir dem Löser gemeinsam als ein Block-Diagonalsystem. | Die Resultate ändern sich im Rahmen der Rundung (Signal 1e-7). Die Zerlegung wird insgesamt etwa doppelt so schnell, und bei veränderten Designvariablen ist sie genauer als ohne Skalierung. Das Bündeln ändert das Ergebnis nicht (bitgleich). |
 
 ## B. Wie wird gemessen?
 
@@ -43,9 +44,9 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
 | B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? | Der «first-run total» entsteht nur einmal pro Prozess. |
 | B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf je nach Zustand der Maschine um bis zu 40 ms, in älteren Docker-Messungen zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
-| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet allein das Übersetzen unserer Module 12,5 ms, mit Cache 1,4 ms. |
+| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet der Import unserer Module 13 ms (fast alles Übersetzen der Quelltexte), mit Cache 1,4 ms. |
 | B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
-| B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? Und dürfte unser Code selbst Einstellungen setzen (`jax.config`, Speicherverwaltung über `mallopt`)? | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». Wir setzen nichts davon. In Docker sind aber rund 100 ms reine XLA-Kompilation des Readouts aus `benchmark.py`, dort läge der grösste Rest. |
+| B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? Und dürfte unser Code selbst Einstellungen setzen (`jax.config`, Speicherverwaltung über `mallopt`)? Konkret: `jax.config.update("jax_disable_most_optimizations", True)` in `differometor/`. | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». Wir setzen nichts davon. In Docker sind aber rund 100 ms reine XLA-Kompilation des Readouts aus `benchmark.py`. Gemessen am 21.11.: Der eine Schalter spart dort 42 ms (Sensitivity-Kompilation 64 → 36,5 ms, Gradient-Kompilation 35,3 → 20,6 ms), auf dem Mac 13 ms. Loss und Gradient stimmen danach auf 11 Stellen überein. Joel hat dieselbe Variante vorbereitet (Branches `sx2`, `sx2-env`). |
 | B7 | Sind der persistente Kompilier-Cache und vorab exportierte Programme (`jax.export`) wirklich ausgeschlossen? | Wir nutzen beides nicht und wollen sicher sein, dass es auch andere nicht dürfen. |
 | B8 | Wir laden Plotly erst bei Bedarf (`df.visualize_setup` funktioniert weiter). In Ordnung? | Der Benchmark braucht `visualize_setup` nicht, der Import lief aber in der gewerteten Zeit. |
 | B9 | Dürfen wir nur in `differometor/` ändern und dort auch neue Dateien anlegen? `benchmark.py` und die Fixtures lassen wir unverändert. | Der Report speichert die Hashes dieser Dateien. |
@@ -78,6 +79,7 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 | A1 Nein (kein SciPy) | Sparse-Ansatz in reinem JAX nachbauen. Max' `lu-once` und die Rausch-Abkürzung im JAX-Pfad werden dann zur Hauptsache. |
 | A3 oder C3: andere Setups zählen | JAX-Rückfall beschleunigen (`lax.switch` ersetzen, Kopien vermeiden, Rausch-Abkürzung). |
 | B5 Ja (neue Pakete erlaubt) | Schnelleren Sparse-Löser prüfen, Import-Zeit dabei mitmessen. |
+| B6 Ja (JAX-Einstellung im Code erlaubt) | Eine Zeile in `differometor/__init__.py`: `jax.config.update("jax_disable_most_optimizations", True)`. Danach neu messen und alle Prüfungen laufen lassen. Die Änderung in der Abgabe offenlegen. |
 | A8 Nein | SuperLU wieder über `scipy.sparse.linalg` importieren (in `fast.py` reicht dafür der Rückfall in `_load_superlu`). |
 | A9 Nein | `HOST_DETECTORS = False` in `components.py` setzen. |
 | B8 Nein | Plotly-Import in `__init__.py` wieder direkt machen. |
@@ -85,5 +87,5 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den Antworten hängt ab, ob unsere L�
 
 ## Noch selbst zu erledigen (keine Frage an Feyer)
 
-- Messung auf x86-Linux mit `--cpus 1`, mehrfach in frischen Prozessen.
+- Messung von `noel` auf x86-Linux mit `--cpus 1`, mehrfach in frischen Prozessen. Joel hat eine passende Maschine (AMD EPYC). Sein eigener Stand braucht dort laut seinem README 0,76 s, auf Noels Rechner ist `noel` rund 9 % schneller als Joels Stand.
 - Erledigt am 21.11.: `runs/check_fast.py --fallback` und `runs/check_setups.py` laufen auf diesem Branch durch, auch mit Max' `lu-once` im JAX-Rückfall. Die Werte stehen in `runs/noel/NOTIZEN.md`.

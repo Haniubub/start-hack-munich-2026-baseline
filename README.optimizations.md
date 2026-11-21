@@ -115,6 +115,33 @@ Die Skalierung macht den Löser auch genauer. Bei zufällig veränderten Designv
 
 Am gespeicherten Design bleiben die Abweichungen zum Original-JAX auf dem bisherigen Niveau (Sensitivität 5,7e-9, Gradient 8,0e-8, Signal 1,2e-7). Der neue Test `runs/noel/test_adjoint.py` prüft zusätzlich den allgemeinen Rückwärtslauf mit Gewichten auf allen Ausgängen.
 
+## Dritte Runde vom 21.11. (Branch `noel`)
+
+Wieder im Wechsel gemessen, je frischer Prozess, Erstlauf gesamt als Median. Alle Läufe `PASS`.
+
+| Umgebung | Philip + Max | Runde 1 | Runde 2 | Runde 3 |
+|---|---:|---:|---:|---:|
+| Apple M4, macOS, Threads auf 1 begrenzt (12 Läufe) | 0,607 s | 0,460 s | 0,454 s | **0,446 s** |
+| Docker, Linux aarch64, `--cpus 1` (10 Läufe) | 0,717 s | 0,543 s | 0,532 s | **0,520 s** |
+
+Warm (Forward, Sensitivity und Gradient ohne Kompilation) sind es jetzt 33 ms auf dem Mac und 39 ms in Docker, nach 38 und 52 ms in Runde 2.
+
+Was geändert wurde:
+
+| Änderung | Wirkung |
+|---|---|
+| Max' Branch `max/nacht` zusammengeführt: Beispiel-Setups und der dichte JAX-Weg werden erst bei Bedarf geladen | `import differometor` ohne `.pyc` in Docker 15,5 → 13,0 ms |
+| 16 Frequenzen pro SuperLU-Aufruf als Block-Diagonalsystem (`_BlockLU`), Ergebnis bitgleich | Zerlegung und Lösen im ersten Aufruf in Docker 18,5 → 16,8 ms |
+| Die dichte Signalmatrix (9 MB) geht nicht mehr an den Rückwärtslauf, nur noch ihre konstanten Einträge in kompakter Form | zusammen mit den zwei Zeilen darüber: Forward 42,0 → 38,1 ms, Gradient 21,3 → 19,2 ms in Docker |
+| Forward- und Rückwärtslauf verarbeiten 16 Frequenzen am Stück statt alle 101 auf einmal | Forward 37,5 → 36,0 ms, Gradient 19,3 → 18,8 ms in Docker |
+| Komponentenfunktionen schreiben direkt in die Matrixeinträge, frequenzunabhängige Eingänge werden nur einmal ausgewertet | Callbacks auf dem Mac: Forward 21,6 → 20,6 ms, Rückwärts 9,1 → 7,8 ms |
+
+Der gemeinsame Nenner ist Speicher. JAX kopiert jedes Array, das in einen Callback hineingeht, und frisch angeforderter Speicher kostet unter Linux pro 4 kB einen Seitenfehler (in Docker rund 0,6 µs). Im Erstlauf fielen in der Forward-Phase rund 16'000 Seitenfehler an, jetzt sind es rund 11'000. In der Gradient-Phase sank die Zahl von rund 9'000 auf rund 6'400.
+
+Am gespeicherten Design sind alle Abweichungen zum Original-JAX unverändert (Sensitivität 5,7e-9, Gradient 8,0e-8, Signal 1,2e-7). `runs/noel/test_adjoint.py` prüft neu auch, dass die Blockgrösse das Ergebnis nicht ändert.
+
+Nicht eingebaut, weil es eine Regelfrage ist: Der Schalter `jax_disable_most_optimizations` würde die Kompilation des Readouts aus `benchmark.py` in Docker um rund 42 ms verkürzen (Mac: 13 ms). Die Frage steht als B6 in `FRAGEN_AN_FEYER.md`.
+
 ## Wo die verbleibende Zeit steckt
 
 Im First-Run (ca. 0,4 s auf macOS) steckt kaum noch Physik:
