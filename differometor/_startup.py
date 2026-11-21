@@ -28,8 +28,8 @@ kind (B)  does NOT remove work. It moves the imports in front of the first timer
           Only possible with the ``.pth`` carrier.
 
 For measurements the switches can be overridden per process without editing this file:
-``DIFFEROMETOR_STARTUP`` is a comma separated list out of ``gc``, ``lazy``, ``preimport``
-(or ``none``) and replaces the three early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
+``DIFFEROMETOR_STARTUP`` is a comma separated list out of ``gc``, ``lazy``, ``defer``,
+``dataclass``, ``preimport`` (or ``none``) and replaces the five early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
 """
 import sys
 
@@ -48,6 +48,30 @@ GC_PAUSE_JAX_IMPORT = True
 # (importlib.util.LazyLoader). `import jax` pulls them in, this workload never touches them.
 # Anything that does touch them later gets the real module, just later.
 LAZY_JAX_MODULES = True
+
+# early, kind (A): three modules outside JAX that `import jax` executes only to define things a
+# run like this never touches (DEFERRED_MODULES below): `http.server` (base class of a helper of
+# the JAX profiler; pulls in http.client, ssl, html), `numpy.ma` (JAX registers "masked arrays are
+# not supported" handlers for its array class) and `opt_einsum` (JAX subclasses one class of
+# `opt_einsum.paths`). Their code runs on first real use instead. Until then JAX sees a stand-in
+# class where it only needs a class object; when the module is really loaded, every use of the
+# stand-in is moved over to the real class (see `_DeferredModule`). Measured with
+# `python -X importtime` on the Xeon Platinum 8468: 7.6 + 4.9 + 5.0 ms inside `import jax`.
+# `numpy.unique` asks `numpy.ma.is_masked` on every call; that one function is answered without
+# loading the module (`_is_masked`).
+DEFER_UNUSED_MODULES = True
+
+# early, kind (A): compiled code for the methods of dataclasses. `dataclasses` writes __init__,
+# __repr__, __eq__ and so on of every dataclass as source text and compiles that text when the
+# class is created. `import jax` creates 68 dataclasses with 340 such methods; compiling them
+# takes 17 ms on an M4, more than a tenth of the import. The file DATACLASS_CODE_FILE next to
+# this module holds the compiled code for those texts (as `__pycache__` does for module
+# sources), keyed by the complete text: a method whose text is in the file is not compiled
+# again, any other text is compiled as always. The text is built exactly as
+# `dataclasses._create_fn` of Python 3.12 builds it; with another Python, or if that function is
+# not the expected one, nothing is installed. Rebuild the file with `runs/philip/bytecode.sh`.
+DATACLASS_CODE = True
+DATACLASS_CODE_FILE = "_dataclass_code.bin"
 
 # early, kind (B): MOVES WORK OUTSIDE THE TIMED WINDOW. When the process is `benchmark.py`, the
 # hook repeats the environment set-up of its header (JAX_PLATFORMS, JAX_ENABLE_X64, CPU affinity,
@@ -108,10 +132,330 @@ def _early_options():
     if value is None:
         return {
             name
-            for name, on in (("gc", GC_PAUSE_JAX_IMPORT), ("lazy", LAZY_JAX_MODULES), ("preimport", PREIMPORT))
+            for name, on in (
+                ("gc", GC_PAUSE_JAX_IMPORT),
+                ("lazy", LAZY_JAX_MODULES),
+                ("defer", DEFER_UNUSED_MODULES),
+                ("dataclass", DATACLASS_CODE),
+                ("preimport", PREIMPORT),
+            )
             if on
         }
-    return {part.strip().lower() for part in value.split(",")} & {"gc", "lazy", "preimport"}
+    return {part.strip().lower() for part in value.split(",")} & {"gc", "lazy", "defer", "dataclass", "preimport"}
+
+
+# --------------------------------------------------------------------------------------------
+# Compiled code for dataclass methods
+# --------------------------------------------------------------------------------------------
+
+# What identifies `dataclasses._create_fn` of Python 3.12: its variables, the names it uses and
+# its constants (see `_create_fn_shape`). The replacement below repeats that function line by line.
+_CREATE_FN_SHAPE = (
+    ("name", "args", "body", "globals", "locals", "return_type", "return_annotation", "txt", "local_vars", "ns"),
+    ("MISSING", "join", "keys", "exec"),
+    (None, "", "__dataclass_return_type__", "->__dataclass_return_type__", ",", "\n", " def ", "(", ")", ":\n", ", ",
+     "def __create_fn__(", "):\n", "\n return ", "__create_fn__", ()),
+)
+_RECORDING = "_differometor_dataclass_recording"
+
+
+def _create_fn_shape(function):
+    code = function.__code__
+    return (code.co_varnames, code.co_names, tuple(c for c in code.co_consts if c is None or isinstance(c, (str, tuple))))
+
+
+def _dataclass_code_path():
+    import os
+
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DATACLASS_CODE_FILE)
+
+
+def _read_dataclass_code(path=None):
+    """The table text -> code object from the code file, or {} if the file is not for this Python."""
+    import marshal
+
+    import _frozen_importlib_external
+
+    try:
+        with open(path or _dataclass_code_path(), "rb") as file:
+            data = file.read()
+    except OSError:
+        return {}
+    magic = _frozen_importlib_external.MAGIC_NUMBER
+    if data[: len(magic)] != magic:
+        return {}
+    try:
+        table = marshal.loads(data[len(magic):])
+    except Exception:
+        return {}
+    return table if isinstance(table, dict) else {}
+
+
+def _replace_create_fn(code_for):
+    """Put a `_create_fn` into `dataclasses` that takes the code for a text from `code_for(text)`.
+
+    Returns None, or the reason why `dataclasses` was left alone.
+    """
+    import dataclasses
+
+    if sys.version_info[:2] != (3, 12):
+        return "written for the dataclasses module of Python 3.12"
+    if sys.flags.optimize:
+        return "not with python -O"
+    if _create_fn_shape(dataclasses._create_fn) != _CREATE_FN_SHAPE:
+        return "dataclasses._create_fn is not the function this was written for"
+    MISSING = dataclasses.MISSING
+
+    def _create_fn(name, args, body, *, globals=None, locals=None, return_type=MISSING):
+        # Line by line what dataclasses._create_fn of Python 3.12 does, up to the last two lines:
+        # there the text is not always compiled, the code for a known text comes from the table.
+        if locals is None:
+            locals = {}
+        return_annotation = ''
+        if return_type is not MISSING:
+            locals['__dataclass_return_type__'] = return_type
+            return_annotation = '->__dataclass_return_type__'
+        args = ','.join(args)
+        body = '\n'.join(f'  {b}' for b in body)
+        txt = f' def {name}({args}){return_annotation}:\n{body}'
+        local_vars = ', '.join(locals.keys())
+        txt = f"def __create_fn__({local_vars}):\n{txt}\n return {name}"
+        ns = {}
+        code = code_for(txt)
+        exec(txt if code is None else code, globals, ns)
+        return ns['__create_fn__'](**locals)
+
+    dataclasses._create_fn = _create_fn
+    return None
+
+
+def _install_dataclass_code():
+    """Use the code file for dataclass methods. Returns what happened, for `state()`."""
+    if getattr(sys, _RECORDING, None) is not None:
+        return "off: the code file is being recorded"
+    table = _read_dataclass_code()
+    if not table:
+        return "off: no code file for this Python"
+    reason = _replace_create_fn(table.get)
+    return f"off: {reason}" if reason else f"on: {len(table)} texts"
+
+
+def record_dataclass_code(path=None):
+    """Tool: record the dataclass methods this process compiles and add them to the code file at exit.
+
+    Call it before anything that defines dataclasses is imported (see `runs/philip/bytecode.sh`).
+    Texts that are in the file already stay there, so the file can be filled from several
+    environments (Python 3.12 patch versions, platforms).
+    """
+    import atexit
+    import marshal
+
+    import _frozen_importlib_external
+
+    path = path or _dataclass_code_path()
+    recorded = {}
+
+    def code_for(text):
+        code = recorded.get(text)
+        if code is None:
+            # What exec(text) compiles: file name "<string>", no future features (dataclasses has none).
+            code = recorded[text] = compile(text, "<string>", "exec", dont_inherit=True)
+        return code
+
+    setattr(sys, _RECORDING, recorded)
+    reason = _replace_create_fn(code_for)
+    if reason:
+        raise RuntimeError(f"cannot record dataclass code: {reason}")
+
+    def write():
+        table = _read_dataclass_code(path)
+        before = len(table)
+        table.update(recorded)
+        with open(path, "wb") as file:
+            file.write(_frozen_importlib_external.MAGIC_NUMBER + marshal.dumps(table))
+        print(f"{path}: {len(table)} texts ({len(table) - before} new, {len(recorded)} used by this process)")
+
+    atexit.register(write)
+
+
+# --------------------------------------------------------------------------------------------
+# Deferred modules
+# --------------------------------------------------------------------------------------------
+
+# Attribute names that describe a module rather than use it. The import machinery reads them on
+# every further `import` of a module that is already in `sys.modules`.
+_DESCRIPTIVE = frozenset({
+    "__dict__", "__class__", "__spec__", "__name__", "__loader__", "__package__", "__path__",
+    "__file__", "__cached__", "__doc__", "__builtins__",
+})
+_PLAN = "__deferred_plan__"
+_OWNER = "__deferred_owner__"
+
+
+class _StandInMeta(type):
+    """Metaclass of stand-in classes: creating an instance loads the real module first."""
+
+    def __call__(cls, *args, **kwargs):
+        owner = getattr(cls, _OWNER, None)
+        if owner is not None:
+            _load_deferred(owner)  # moves `cls` (a subclass of the stand-in) under the real class
+        return type.__call__(cls, *args, **kwargs)
+
+
+def _stand_in(name):
+    """Early attribute: a class object that takes the place of `module.<name>` until the load."""
+
+    def early(module):
+        return _StandInMeta(name, (), {"__module__": module.__name__, _OWNER: module, "__doc__": f"Stand-in for {module.__name__}.{name}."})
+
+    early.stand_in = True
+    return early
+
+
+def _submodule(name):
+    """Early attribute: the real submodule `<package>.<name>`, imported without the package's own code."""
+
+    def early(module):
+        import importlib
+
+        return importlib.import_module(module.__name__ + "." + name)
+
+    early.stand_in = False
+    return early
+
+
+def _is_masked(module):
+    """Early attribute `numpy.ma.is_masked`, which `numpy.unique` asks on every call.
+
+    The real function answers False for every object without a `_mask` attribute. Only for an
+    object that has one is `numpy.ma` loaded and asked.
+    """
+    missing = object()
+
+    def is_masked(x):
+        if getattr(x, "_mask", missing) is missing:
+            return False
+        _load_deferred(module)
+        return module.is_masked(x)
+
+    return is_masked
+
+
+_is_masked.stand_in = False
+
+
+def _rekey_masked_array(stand_in, real):
+    """JAX keeps tables from Python types to handlers; move the entries of the stand-in to the real class."""
+    for module_name, table_name in (
+        ("jax._src.core", "pytype_aval_mappings"),
+        ("jax._src.dtypes", "canonicalize_value_handlers"),
+        ("jax._src.interpreters.mlir", "_constant_handlers"),
+        ("jax._src.interpreters.pxla", "shard_arg_handlers"),
+    ):
+        table = getattr(sys.modules.get(module_name), table_name, None)
+        if isinstance(table, dict) and stand_in in table:
+            table[real] = table.pop(stand_in)
+
+
+# name -> (early attributes, what else to do with a (stand-in, real class) pair after the load)
+DEFERRED_MODULES = {
+    "http.server": ({"SimpleHTTPRequestHandler": _stand_in("SimpleHTTPRequestHandler")}, None),
+    "numpy.ma": ({"MaskedArray": _stand_in("MaskedArray"), "is_masked": _is_masked}, _rekey_masked_array),
+    "opt_einsum": ({"paths": _submodule("paths")}, None),
+}
+
+
+class _DeferredPlan:
+    def __init__(self, loader, early, after):
+        import _thread
+
+        self.loader, self.early, self.after = loader, early, after
+        self.served = {}  # early attributes handed out so far
+        self.stand_ins = {}  # the stand-in classes among them
+        self.lock = _thread.RLock()
+
+
+class _DeferredModule(type(sys)):
+    """A module whose code has not run yet. It runs on the first real use.
+
+    Not a use: reading what describes the module (`_DESCRIPTIVE`), reading a name that is already
+    in the module's namespace (a submodule the import system has put there) and reading one of
+    the early attributes of its plan. Everything else runs the module's code in this very module
+    object, which then is an ordinary module (`_load_deferred`).
+    """
+
+    def __getattribute__(self, name):
+        namespace = object.__getattribute__(self, "__dict__")
+        if name in _DESCRIPTIVE or name in namespace:
+            return object.__getattribute__(self, name)
+        plan = namespace.get(_PLAN)
+        if plan is not None:
+            early = plan.early.get(name)
+            if early is not None:
+                with plan.lock:
+                    if namespace.get(_PLAN) is plan:
+                        if name not in plan.served:
+                            plan.served[name] = early(self)
+                            if early.stand_in:
+                                plan.stand_ins[name] = plan.served[name]
+                        return plan.served[name]
+            _load_deferred(self)
+        return getattr(self, name)
+
+
+def _load_deferred(module):
+    """Run the code of a deferred module now and move every use of its stand-ins to the real classes."""
+    namespace = object.__getattribute__(module, "__dict__")
+    plan = namespace.get(_PLAN)
+    if plan is None:
+        return
+    with plan.lock:
+        if namespace.get(_PLAN) is not plan:
+            return  # loaded meanwhile, or being loaded further up on this thread
+        del namespace[_PLAN]
+        object.__setattr__(module, "__class__", type(sys))
+        try:
+            plan.loader.exec_module(module)
+        except BaseException:
+            # As after a failed ordinary import: the half-built module must not stay around.
+            if sys.modules.get(namespace.get("__name__")) is module:
+                del sys.modules[namespace["__name__"]]
+            raise
+        for name, stand_in in plan.stand_ins.items():
+            real = namespace.get(name)
+            if not isinstance(real, type):
+                continue
+            for subclass in stand_in.__subclasses__():
+                subclass.__bases__ = tuple(real if base is stand_in else base for base in subclass.__bases__)
+            if plan.after is not None:
+                plan.after(stand_in, real)
+        state().setdefault("deferred_loaded", []).append(namespace.get("__name__"))
+
+
+class _DeferredLoader:
+    """Loader wrapper: instead of running the module's code, turn the module into a `_DeferredModule`."""
+
+    def __init__(self, loader, early, after):
+        self._loader, self._early, self._after = loader, early, after
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        try:
+            module.__spec__.loader = self._loader
+            module.__loader__ = self._loader
+        except Exception:
+            pass
+        if type(module) is not type(sys):
+            self._loader.exec_module(module)  # not a plain module object: load it the ordinary way
+            return
+        module.__dict__[_PLAN] = _DeferredPlan(self._loader, self._early, self._after)
+        module.__class__ = _DeferredModule
+        state().setdefault("deferred", []).append(module.__name__)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
 
 
 class _PausedCollector:
@@ -159,9 +503,10 @@ class _Watcher:
     other name `None`, which sends the import machinery on to the normal finders.
     """
 
-    def __init__(self, pause, lazy):
+    def __init__(self, pause, lazy, deferred=None):
         self.pause = pause
         self.lazy = lazy
+        self.deferred = deferred or {}
         self._busy = False
 
     def remove(self):
@@ -171,7 +516,7 @@ class _Watcher:
             pass
 
     def find_spec(self, name, path=None, target=None):
-        if name != "jax" and name not in self.lazy:
+        if name != "jax" and name not in self.lazy and name not in self.deferred:
             return None
         if self._busy:
             return None
@@ -191,6 +536,12 @@ class _Watcher:
                 return None
             if name == "jax":
                 spec.loader = _PausedCollector(spec.loader, self)
+            elif name in self.deferred:
+                from importlib.machinery import SourceFileLoader
+
+                if type(spec.loader) is not SourceFileLoader:
+                    return None
+                spec.loader = _DeferredLoader(spec.loader, *self.deferred[name])
             else:
                 from importlib.machinery import SourceFileLoader
 
@@ -268,14 +619,21 @@ def early(carrier="pth"):
     info = {"carrier": carrier, "early": []}
     setattr(sys, _STATE_ATTRIBUTE, info)
     options = _early_options()
+    if "dataclass" in options:
+        try:
+            info["dataclass_code"] = _install_dataclass_code()
+        except Exception as error:  # never stand in the way of the process
+            info["dataclass_code"] = f"off: {type(error).__name__}: {error}"
     if "jax" in sys.modules:
         # Too late for anything that concerns the import of JAX.
         return info
     pause = "gc" in options
     lazy = LAZY_MODULES if "lazy" in options else frozenset()
-    if pause or lazy:
-        sys.meta_path.insert(0, _Watcher(pause, lazy))
-        info["early"] += [name for name in ("gc", "lazy") if name in options]
+    # A module that is loaded already stays as it is.
+    deferred = {name: plan for name, plan in DEFERRED_MODULES.items() if name not in sys.modules} if "defer" in options else {}
+    if pause or lazy or deferred:
+        sys.meta_path.insert(0, _Watcher(pause, lazy, deferred))
+        info["early"] += [name for name in ("gc", "lazy", "defer") if name in options]
     if "preimport" in options and carrier == "pth" and _is_benchmark_process():
         if _preimport():
             info["early"].append("preimport")
