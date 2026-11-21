@@ -1,13 +1,13 @@
 # Fragen an Feyer
 
-Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` und `nacht` plus sechs Optimierungsrunden vom 21.11.).
+Stand: Sa 21.11.2026, Branch `noel` (Philips Branch plus Max' `lu-once` und `nacht` plus sieben Optimierungsrunden vom 21.11.).
 Zu stellen am Sa 21.11. bei der Challenge-Präsentation (11–12 Uhr) oder direkt beim Mentor.
 
 ## Unser Stand in drei Sätzen (zum Erklären vor der Frage)
 
 - Der Rechenkern läuft nicht mehr in JAX/XLA, sondern in NumPy/SciPy: Sparse-LU mit SuperLU, eingebunden über `jax.pure_callback`. Den Gradienten liefert eine handgeschriebene Rückwärtsregel (`jax.custom_vjp`).
 - Das gilt nur für Setups vom Typ des Benchmarks. Alle anderen laufen weiter über den Original-JAX-Code.
-- Gemessen auf einem Apple M4: Original 12,8 s → 0,43 s auf macOS und 0,51 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung dieses Branches auf x86 fehlt noch.
+- Gemessen auf einem Apple M4: Original 12,8 s → 0,43 s auf macOS und 0,50 s in Docker (Linux, `--cpus 1`, aarch64). Überall `PASS`. Eine Messung dieses Branches auf x86 fehlt noch.
 
 ## Die sechs wichtigsten Fragen
 
@@ -45,7 +45,7 @@ Wenn nur wenig Zeit ist, diese zuerst. Von den ersten fünf hängt ab, ob unsere
 | B1 | Auf welcher Maschine läuft die Wertung: derselbe Xeon Platinum 8468, x86-64, wie viel RAM? Messt ihr oder wir? | Wir haben bisher nur Apple Silicon und Docker auf aarch64. |
 | B2 | Welcher Befehl genau, mit welchen Wiederholungen? Zählt ein einzelner Erstlauf oder der beste bzw. mittlere aus mehreren frischen Prozessen? Zählt die warme Laufzeit für die Rangliste gar nicht, auch nicht bei Gleichstand? | Der «first-run total» entsteht nur einmal pro Prozess. Wir optimieren auf den Erstlauf. Die warme Laufzeit liegt bei 30 ms (macOS) bzw. 35 ms (Docker). |
 | B3 | Wie geht ihr mit Streuung um? Bei uns schwankt der Erstlauf je nach Zustand der Maschine um bis zu 40 ms, in älteren Docker-Messungen zwischen 0,87 s und 1,57 s. | Bei so kleinen Zeiten entscheidet das Rauschen über die Rangliste. |
-| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet der Import unserer Module 13 ms (fast alles Übersetzen der Quelltexte), mit Cache 1,4 ms. |
+| B4 | Ist der Zustand der Maschine definiert: Dateien schon im Page-Cache, `__pycache__` vorhanden oder frischer Checkout? | Die Imports machen bei uns fast 60 % der Gesamtzeit aus, und davon gehören rund 290 ms zu `benchmark.py` selbst (`import jax`, `importlib.metadata`). Ohne `__pycache__` kostet der Import unserer Module 12 bis 13 ms (fast alles Übersetzen der Quelltexte), mit Cache 1,4 bis 1,9 ms. Unsere eigenen Messungen laufen alle ohne Cache. |
 | B5 | Dürfen wir alle Pakete aus `requirements.txt` nutzen (insbesondere SciPy)? Dürfen wir neue Abhängigkeiten hinzufügen, z. B. einen anderen Sparse-Löser, Numba oder eine C-Erweiterung? | SciPy steht in der gepinnten Liste, wird vom Original aber nicht direkt verwendet. |
 | B6 | Dürfen wir Paketversionen, die Python-Version, Umgebungsvariablen oder XLA-Flags ändern? Und dürfte unser Code selbst Einstellungen setzen (`jax.config`, Speicherverwaltung über `mallopt`)? Konkret: `jax.config.update("jax_disable_most_optimizations", True)` in `differometor/`. | Die Baseline nennt ausdrücklich «keine XLA_FLAGS». Wir setzen nichts davon. In Docker sind aber rund 100 ms reine XLA-Kompilation des Readouts aus `benchmark.py`. Gemessen am 21.11.: Der eine Schalter spart dort 42 ms (Sensitivity-Kompilation 64 → 36,5 ms, Gradient-Kompilation 35,3 → 20,6 ms), auf dem Mac 13 ms. Loss und Gradient stimmen danach auf 11 Stellen überein. Joel hat dieselbe Variante vorbereitet (Branches `sx2`, `sx2-env`). Feste Schwellen für die Speicherverwaltung von glibc (über `mallopt`) brächten in Docker weitere rund 3,5 ms. |
 | B7 | Sind der persistente Kompilier-Cache und vorab exportierte Programme (`jax.export`) wirklich ausgeschlossen? | Wir nutzen beides nicht und wollen sicher sein, dass es auch andere nicht dürfen. |
