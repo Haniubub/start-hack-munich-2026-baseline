@@ -78,6 +78,8 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 ist das Kompilieren der
 | 20 | Signalwerte entstehen direkt in dem Feld, in dem die Vorab-Elimination arbeitet (eine Kopie von 4 MB weniger) | `fast.py` | Vorwärts 61,4 → 58,1 ms, warm 55,1 → 51,9 ms (12 Läufe). Bit-identisch |
 | 21 | Signal- und Rauschmatrix entstehen im Build nie als dichte Arrays, ihre Einträge folgen aus der Trägermatrix (Idee aus Noels Runde 6) | `build.py`, `sparse.py` | Build-Schritt allein 18,1 → 13,8 ms (Minimum 15,8 → 12,8, je 16 frische Prozesse abwechselnd). Bit-identisch |
 | 22 | Build-Schritt aus Noels Runde 7 übernommen (`e311d5c`): Seitenband-Erweiterung auf Python-Listen (`_sideband_layout`), Wörterbuch statt `list.index`, weniger kleine NumPy-Aufrufe | `build.py`, `runs/noel/test_build.py` | Build-Schritt allein 14,3 → 10,7 ms (Minimum 13,0 → 9,7, je 20 frische Prozesse abwechselnd). 946 Build-Arrays aus 27 Setups identisch |
+| 23 | Tuning-Modul: kleine XLA-Programme billiger kompilieren (klassischer Kernel-Emitter, ein Codegen-Modul, keine LLVM-Optimierung, gemeinsamer MLIR-Kontext, `jnp.asarray` für Listen ohne XLA-Programm) | `_tuning.py`, `__init__.py`, `runs/flags/test_tuning.py` | Cloud, 8 Läufe: Kompilieren 200,3 → 45,4 ms, Build 59,7 → 17,1 ms, Erstlauf 707,9 → 498,4 ms. Sensitivität 1 ulp, Gradient 1,3e-14 anders, sonst bit-identisch |
+| 24 | Native Faktorisierung mit einer Pivotfolge für alle Frequenzen (`NATIVE_LU`, C-Kernel `_native/pattern_lu.c`, Rückfall auf `_CondensedLU`) | `fast.py`, `_native/` | Cloud, 8 Läufe: Vorwärts 61,2 → 39,9 ms, warm 55,5 → 33,9 ms. Signal und Noise bis 9e-10 relativ anders |
 | – | Übernommen: Noels Runden 2 und 3 (Tests, Notizen) und Max' Aufteilung in nachgeladene Module | `setups.py`, `simulate.py`, `_*.py`, `runs/noel/` | Ohne `.pyc` übersetzt Python beim Import rund ein Sechstel weniger Quelltext (in der langsamen Phase gemessen: 33 → 28 ms) |
 
 ### 1. Basismatrizen sparse
@@ -220,6 +222,18 @@ Geprüft mit Noels `runs/noel/test_build.py`: `_sideband_layout` gegen die Refer
 Gemessen am Build-Schritt allein, je 20 frische Prozesse abwechselnd: Median 14,3 → 10,7 ms, Minimum 13,0 → 9,7 ms. Zusammen mit Änderung 21 sind es 18,1 → 10,7 ms.
 
 Aus Noels Runden 5 und 6 ist sonst nichts übernommen: Die gebündelten Residuen (Runde 5) braucht es hier nicht, weil die kleinen Host-Arrays seit Änderung 13 keine Programm-Argumente mehr sind, und die Matrizen in Koordinatenform (Runde 6) gibt es hier als `BaseMatrix` seit Änderung 1. `fast.py`, `sparse.py`, `simulate.py` und `components.py` bleiben die dieses Branches. Darum laufen `runs/noel/test_pack.py` und `runs/noel/test_sparse.py` hier nicht: Sie prüfen `_host_leaves` und `SparseMatrix` aus Noels `fast.py`. Dieselben Fragen prüfen hier `test_static.py`, `test_compat.py` und `test_build_entries.py`.
+
+### 23. und 24. Nach der Regeländerung vom 21.11. (alles erlaubt, solange Ein- und Ausgaben gleich bleiben)
+
+Beide Massnahmen stammen von Subagenten und sind hier nachgeprüft (komplette Prüfliste, Arrays gegen den Stand davor).
+
+**23, `differometor/_tuning.py`.** Die drei Programme des Benchmarks sind winzig, fast die ganze Kompilierzeit sind Fixkosten pro Programm und pro Kernel. Das Modul ändert die Kompilieroptionen nur für kleine Programme (höchstens `SMALL_PROGRAM_OPERATIONS` Operationen, für zwei Massnahmen ausserdem nur Arrays bis `SMALL_PROGRAM_ELEMENTS` Elemente). Grosse JAX-Programme, also auch der dichte Fallback-Pfad, werden kompiliert wie bisher. Jede Massnahme hat einen eigenen Schalter, die Beschreibung mit Messwerten steht im Kopf der Datei. `DIFFEROMETOR_TUNING=off` lässt JAX unberührt. Schlägt ein Kompilieren mit geänderten Optionen fehl, wird es mit den Optionen von JAX wiederholt. Das Modul patcht JAX-Interna (jax 0.9.0); bei einer anderen Version ohne diese Interna bleibt die jeweilige Massnahme aus (`_tuning.STATUS`).
+
+**24, `NATIVE_LU`.** Alle Frequenzen haben dasselbe Besetzungsmuster. SuperLU wiederholt Analyse, Pivotsuche und Indexarbeit für jeden Frequenzblock. Der C-Kern wählt eine Pivotfolge aus wenigen Frequenzen, faktorisiert alle Frequenzen damit und prüft jeden Pivot an jeder Frequenz gegen eine Schranke. Fällt die Prüfung durch oder lässt sich `libpattern_lu.so` nicht laden, rechnet `_CondensedLU` wie bisher. Die Bibliothek braucht nur glibc ab 2.17, ist ohne FMA und ohne `-march=native` gebaut (`_native/build.sh`), AVX2 wird zur Laufzeit gewählt. Standard: an, `DIFFEROMETOR_NATIVE_LU=0` schaltet ab. Mit beiden Schaltern aus sind die Benchmark-Arrays bit-identisch zum Stand `d043e68`.
+
+Zusammen auf der Cloud-Maschine (8 Läufe, abwechselnd): `d043e68` 679,1 / 576,5 ms, mit 23 und 24 **457,5 / 420,6 ms**.
+
+Noch nicht übernommen, liegen als Branches vor: `sub/imports` (Pause des Garbage Collectors und träge JAX-Module während `import jax`, braucht einen Träger vor `import jax`: `.pth`-Datei aus `pip install -e .` oder eine Datei `statistics.py` neben `benchmark.py`; dazu als eigene, abgeschaltete Stufe der Vorimport vor dem Timer) und `sub/cache` (Compile-Cache trotz Zeile 170 von `benchmark.py`, opt-in).
 
 ## Wo die Zeit auf x86 jetzt steckt
 
