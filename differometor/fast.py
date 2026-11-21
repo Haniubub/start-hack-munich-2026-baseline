@@ -409,11 +409,11 @@ class _EntryBlock:
         arguments = [by_slot[indices[:, j]] if swept[j] else first[indices[:, j], None] for j in range(indices.shape[1])]
         return arguments, (members.size, parameters.shape[0] if swept.any() else 1)
 
-    def values(self, parameters):
+    def values(self, parameters, store=None):
         """parameters: (R, P) -> entries (E, R), no derivatives."""
-        return self.run(parameters, derivatives=False)[0]
+        return self.run(parameters, derivatives=False, store=store)[0]
 
-    def run(self, parameters, derivatives=True):
+    def run(self, parameters, derivatives=True, store=None):
         """
         parameters: (R, P). Returns the entries (E, R) and the tape for the reverse pass.
 
@@ -421,8 +421,15 @@ class _EntryBlock:
         respect to the differentiated inputs, shape (inputs, calls, R) or (inputs, calls, 1) when
         it is the same in every row. A group without differentiated inputs has None, and so has an
         output that depends on none of them.
+
+        With `store`, an array and the row of it that every entry belongs to (no row twice), the
+        entries are written there instead of into an array of their own, and None is returned
+        in their place.
         """
-        entries = np.empty((self.outputs.shape[1], parameters.shape[0]), complex)
+        if store is None:
+            entries, rows = np.empty((self.outputs.shape[1], parameters.shape[0]), complex), None
+        else:
+            entries, rows = store
         tape = []
         for (function_index, members, _, columns), swept, parts in zip(self.groups, self.swept, self.readers):
             arguments, lead = self._inputs(parameters, members, swept)
@@ -436,13 +443,13 @@ class _EntryBlock:
             for o, readers, call, _, _ in parts:
                 item = outputs[o]
                 value, slope = (item.val, item.tan) if isinstance(item, Dual) else (item, 0.0)
-                entries[readers] = np.broadcast_to(value, lead)[call]
+                entries[readers if rows is None else rows[readers]] = np.broadcast_to(value, lead)[call]
                 if np.ndim(slope) == 0:  # a constant: no derivative
                     slopes.append(None)
                 else:
                     slopes.append(np.broadcast_to(slope, (width, lead[0], slope.shape[-1])))
             tape.append(slopes if width else None)
-        return entries, tape
+        return (entries if rows is None else None), tape
 
     def back(self, tape, entries_bar, parameter_count, compact=False):
         """entries_bar: (E, R) -> real parameter cotangent summed over the rows (P,).
@@ -570,17 +577,24 @@ class EntryPlan:
         signal_rows[:, self.signal_changing_indices] = np.real(self.signal_changing_values).T
         return carrier_rows[:1], signal_rows
 
-    def values(self, optimized_parameters):
-        """Carrier, signal and noise entries without derivatives (forward pass)."""
-        carrier_rows, signal_rows = self._rows(optimized_parameters)
-        return self.carrier.values(carrier_rows)[:, 0], self.signal.values(signal_rows), self.noise.values(signal_rows)
+    def values(self, optimized_parameters, signal_store=None):
+        """Carrier, signal and noise entries without derivatives (forward pass).
 
-    def entries(self, optimized_parameters):
+        `signal_store`: where the signal entries go instead of an array of their own (see `_EntryBlock.run`).
+        """
+        carrier_rows, signal_rows = self._rows(optimized_parameters)
+        return self.carrier.values(carrier_rows)[:, 0], self.signal.values(signal_rows, signal_store), self.noise.values(signal_rows)
+
+    def entries(self, optimized_parameters, signal_store=None):
         carrier_rows, signal_rows = self._rows(optimized_parameters)
         carrier, carrier_tape = self.carrier.run(carrier_rows)
-        signal, signal_tape = self.signal.run(signal_rows)
+        signal, signal_tape = self.signal.run(signal_rows, store=signal_store)
         noise, noise_tape = self.noise.run(signal_rows)
         return (carrier[:, 0], signal, noise), (carrier_tape, signal_tape, noise_tape)
+
+    def signal_into(self, optimized_parameters, signal_store):
+        """Only the signal entries, without derivatives, written into `signal_store`."""
+        self.signal.values(self._rows(optimized_parameters)[1], signal_store)
 
     def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count, compact=False, optimized_parameters=None, selection_bar=None):
         """Gradient with respect to the design variables from the cotangents of the entries.
@@ -625,6 +639,22 @@ def _last_writer(rows, columns, width):
     mask = np.zeros(flat.size, bool)
     mask[flat.size - 1 - reverse_first] = True
     return mask
+
+
+class _StoredEntries:
+    """
+    Signal entries that were written straight into the value store of the signal matrices
+    (`SystemPlan.signal_store`) instead of into an array of their own, which would only be copied
+    there. `take()` hands the store over. The factorization works in it afterwards, so whoever
+    asks again gets a new store from `fill`.
+    """
+
+    def __init__(self, store, fill):
+        self._store, self._fill = store, fill
+
+    def take(self):
+        store, self._store = self._store, None
+        return self._fill() if store is None else store
 
 
 class SystemPlan:
@@ -711,6 +741,17 @@ class SystemPlan:
         rhs[self.carrier_rhs_rows] = carrier_entries[self.carrier_rhs_entries]
         return _splu(self.n, values, self.carrier_rows, self.carrier_ptr), rhs
 
+    @property
+    def spare(self):
+        """Rows behind the signal values that let the factorization work in the same array."""
+        return max(0, _CondensedLU.room(self.matrix_rows.size) - self.size)
+
+    def signal_store(self, F, spare=0):
+        """The array for the values of the augmented signal matrices, shape (size, F), with the constant entries in place."""
+        V = np.empty((self.size + spare, F), complex)[: self.size]
+        V[:] = self.signal_base[:, None]
+        return V
+
     def signal_values(self, signal_entries, carrier, spare=0):
         """
         Nonzero values of the augmented signal matrices, shape (size, F), plus placing pre-values.
@@ -718,12 +759,14 @@ class SystemPlan:
         With `spare`, the values are the first rows of a larger array (`V.base`) with that many
         more rows, so that `_CondensedLU` can work in it without copying them.
         """
-        V = np.empty((self.size + spare, signal_entries.shape[1]), complex)[: self.size]
-        V[:] = self.signal_base[:, None]
-        if self.update_live.all():
-            V[self.update_positions] = signal_entries
+        if isinstance(signal_entries, _StoredEntries):  # already in place, see `_run_forward`
+            V = signal_entries.take()
         else:
-            V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
+            V = self.signal_store(signal_entries.shape[1], spare)
+            if self.update_live.all():
+                V[self.update_positions] = signal_entries
+            else:
+                V[self.update_positions[self.update_live]] = signal_entries[self.update_live]
         pre = V[self.placing_positions]
         # Placing entries become -pre * carrier. The sign goes on the short carrier factor and the
         # rows are written a block at a time, so no further arrays of the size of `pre` appear.
@@ -1262,7 +1305,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     carrier = carrier_lu.solve(carrier_rhs)
     # The matrix values are built in the array the factorization works in. The factorization
     # overwrites them, so the right-hand side column is taken out first.
-    spare = max(0, _CondensedLU.room(plan.matrix_rows.size) - plan.size)
+    spare = plan.spare
     V, pre = plan.signal_values(signal_entries, carrier, spare=spare)
     w = plan.detector_weights(carrier)
     N = plan.noise_values(noise_entries)
@@ -1578,10 +1621,25 @@ def _run_forward(optimized_parameters, host_arrays, taped):
     A = dict(zip(HOST_KEYS, host_arrays))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
     plan.selection = entry_plan.selection(optimized_parameters)  # with the phase of a homodyne detector
+    # The signal entries are only needed inside the value store of the signal matrices. When every
+    # one of them has a row of its own there, they are written straight into it.
+    target = stored = None
+    if plan.update_live.all():
+        F, point = entry_plan.signal_changing_values.shape[1], np.array(optimized_parameters, float)
+
+        def fill():
+            store = plan.signal_store(F, plan.spare)
+            entry_plan.signal_into(point, (store, plan.update_positions))
+            return store
+
+        target = (plan.signal_store(F, plan.spare), plan.update_positions)
+        stored = _StoredEntries(target[0], fill)
     if taped:  # a pullback will follow: evaluate the entries with derivatives once, here
-        entries, tape = entry_plan.entries(optimized_parameters)
+        entries, tape = entry_plan.entries(optimized_parameters, target)
     else:
-        entries, tape = entry_plan.values(optimized_parameters), None
+        entries, tape = entry_plan.values(optimized_parameters, target), None
+    if stored is not None:
+        entries = (entries[0], stored, entries[2])
     *results, kept = forward(plan, *entries)
     return tuple(results), (entry_plan, plan, entries, tape, kept)
 
