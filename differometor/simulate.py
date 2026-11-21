@@ -61,9 +61,9 @@ def simulate(
     signal_changing_values: jnp.ndarray,
     # matrices
     parameters: jnp.ndarray,
-    carrier_matrix: jnp.ndarray,
-    signal_matrix: jnp.ndarray,
-    noise_matrix: jnp.ndarray,
+    carrier_matrix: fast.SparseMatrix | jnp.ndarray,
+    signal_matrix: fast.SparseMatrix | jnp.ndarray,
+    noise_matrix: fast.SparseMatrix | jnp.ndarray,
     noise_selection_vectors: jnp.ndarray,
     qhd_parameter_indices: jnp.ndarray,
     qhd_placing_indices: jnp.ndarray,
@@ -96,6 +96,10 @@ def simulate(
     carrier operating point use the sparse host path in `differometor.fast` (a
     `jax.custom_vjp` around `jax.pure_callback`, differentiable with respect to
     `optimized_parameters` in reverse mode). All other setups use `simulate_jax`.
+
+    The three system matrices are `differometor.fast.SparseMatrix` objects (coordinate form), as
+    `run_build_step` returns them. Dense arrays are accepted as well, but then the call takes
+    `simulate_jax`; `SparseMatrix.from_dense` converts a concrete dense matrix.
     """
     arrays = dict(locals())
     if fast.supports(arrays):

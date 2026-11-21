@@ -12,6 +12,7 @@ from jax import lax, vmap, jit
 
 from differometor.build import LINKING_FUNCTIONS
 from differometor.components import FUNCTIONS, UNIT_VACUUM, H_PLANCK, F0
+from differometor.fast import SparseMatrix
 
 
 jax.config.update("jax_enable_x64", True)
@@ -200,9 +201,9 @@ def simulate_jax(
     signal_changing_values: jnp.ndarray,
     # matrices
     parameters: jnp.ndarray,
-    carrier_matrix: jnp.ndarray,
-    signal_matrix: jnp.ndarray,
-    noise_matrix: jnp.ndarray,
+    carrier_matrix: SparseMatrix | jnp.ndarray,
+    signal_matrix: SparseMatrix | jnp.ndarray,
+    noise_matrix: SparseMatrix | jnp.ndarray,
     noise_selection_vectors: jnp.ndarray,
     qhd_parameter_indices: jnp.ndarray,
     qhd_placing_indices: jnp.ndarray,
@@ -308,6 +309,12 @@ def simulate_jax(
     - Conjugation and block manipulation follow the conventions used for upper and lower
       sidebands in frequency-domain interferometer models.
     """
+    # The build step hands the system matrices over in coordinate form; this path works on dense arrays.
+    carrier_matrix, signal_matrix, noise_matrix = (
+        matrix.dense() if isinstance(matrix, SparseMatrix) else matrix
+        for matrix in (carrier_matrix, signal_matrix, noise_matrix)
+    )
+
     # Insert optimized parameter values into the base parameter row.
     parameters = parameters.at[[0], optimized_parameter_indices].set(
         optimized_parameters[optimized_value_indices]

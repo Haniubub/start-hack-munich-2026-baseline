@@ -25,18 +25,20 @@ arrays, ports, *_ = df.run_build_step(setup, [("f", "frequency")], jnp.asarray(r
 def check(name, A):
     packed = fast._pack(A)
     assert [x.dtype for x in packed] == [np.int64, np.float64] and all(x.ndim == 1 for x in packed), name
-    assert tuple(x.shape[0] for x in packed) == fast._packed_sizes(A), (name, [x.shape for x in packed], fast._packed_sizes(A))
+    sizes = fast._packed_sizes([np.asarray(A[key]) for key in fast.HOST_KEYS])
+    assert tuple(x.shape[0] for x in packed) == sizes, (name, [x.shape for x in packed], sizes)
     restored = fast._unpack(*packed)
-    assert list(restored) == list(fast.PACKED_KEYS), name
-    for key in fast.PACKED_KEYS:
+    assert list(restored) == list(fast.HOST_KEYS), name
+    for key in fast.HOST_KEYS:
         a, b = np.asarray(A[key]), restored[key]
         assert a.dtype == b.dtype and a.shape == b.shape and np.array_equal(a, b), (name, key, a.dtype, b.dtype, a.shape, b.shape)
     print(f"{name}: {len(restored)} arrays restored exactly from {packed[0].nbytes + packed[1].nbytes} bytes")
 
 
-benchmark = {key: np.asarray(arrays[key]) for key in fast.HOST_KEYS}
+leaves = fast._host_leaves(arrays)  # plain arrays and both leaves of the three sparse system matrices
+benchmark = dict(zip(fast.HOST_KEYS, map(np.asarray, leaves)))
 check("benchmark setup", benchmark)
-assert fast._packed_sizes(arrays) == fast._packed_sizes(benchmark)  # JAX arrays give the same static sizes
+assert fast._packed_sizes(leaves) == fast._packed_sizes(list(benchmark.values()))  # JAX arrays give the same static sizes
 
 rng = np.random.default_rng(0)
 other = dict(benchmark)

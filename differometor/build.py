@@ -18,6 +18,10 @@ The central idea is:
 Indexing conventions
 --------------------
 
+The three system matrices leave `build` in coordinate form (`differometor.fast.SparseMatrix`:
+row and column indices plus values of the nonzero entries), because they are almost empty.
+`matrix.dense()` gives the dense array described here.
+
 Carrier system:
 - `carrier_matrix` has shape `(system_size, system_size + 1)`.
   The last column is the right-hand side.
@@ -40,6 +44,7 @@ or block-shift errors are difficult to debug in linearized optical simulations.
 import numpy as np
 import jax.numpy as jnp
 from differometor.setups import Setup
+from differometor.fast import SparseMatrix
 from collections import defaultdict
 from differometor.components import (
     F,
@@ -83,19 +88,10 @@ def _device_array(values, dtype=None) -> jnp.ndarray:
     return jnp.asarray(np.asarray(values, dtype=dtype))
 
 
-def _aligned_zeros(shape, dtype=complex, alignment=64) -> np.ndarray:
-    """
-    Zero-filled array whose memory starts at a multiple of `alignment` bytes.
+def _sparse(rows, columns, values, shape) -> SparseMatrix:
+    """A constant system matrix in coordinate form, with its arrays on the device."""
+    return SparseMatrix(_device_array([rows, columns], dtype=int), _device_array(values, dtype=complex), shape)
 
-    On the CPU `jnp.asarray` adopts such an array as it is, while it has to copy an ordinary
-    NumPy array (16-byte alignment). The large system matrices are almost empty, so most of their
-    memory is then never written at all. The array must not be changed after it was handed to JAX.
-    """
-    dtype = np.dtype(dtype)
-    size = int(np.prod(shape)) * dtype.itemsize
-    raw = np.zeros(size + alignment, np.uint8)
-    offset = -raw.__array_interface__["data"][0] % alignment
-    return raw[offset : offset + size].view(dtype).reshape(shape)
 
 # ---------------------------------------------------------------------
 # Global state for parameter linking
@@ -448,7 +444,7 @@ def build(setup: Setup):
     matrices_tuple:
         `(parameters, carrier_matrix, signal_matrix, noise_matrix, noise_selection_vectors,
           qhd_parameter_indices, qhd_placing_indices, linked_indices, linking_function_indices, indices_to_link)`
-        as `jax.numpy` arrays.
+        as `jax.numpy` arrays. The three matrices are `SparseMatrix` objects (coordinate form).
     metadata_tuple:
         `(detector_indices, mirror_indices, beamsplitter_indices, isolator_indices, port_to_index)`
         where the first four entries are integer arrays and `port_to_index` maps string keys of the form
@@ -673,7 +669,7 @@ def build(setup: Setup):
     detectors = {}
 
     # Carrier matrix: identity on the left block, with a separate right-hand-side column.
-    carrier_matrix = _aligned_zeros((system_size, system_size + 1))
+    carrier_matrix = np.zeros((system_size, system_size + 1), dtype=complex)
     carrier_matrix[:, :system_size] = np.eye(system_size, dtype=complex)
 
     # Ensure signal_size is at least 1 to avoid conditional logic later.
@@ -681,12 +677,9 @@ def build(setup: Setup):
         signal_size = 1
 
     # Signal matrix includes two carrier-sized blocks plus appended signal block, plus a right-hand-side column.
+    # Its constant entries follow from the finished carrier matrix (see the end of this function).
+    # The noise matrix has the same shape without the right-hand side and no constant entries.
     full_size = system_size * 2 + signal_size
-    signal_matrix = _aligned_zeros((full_size, full_size + 1))
-    signal_matrix.reshape(-1)[: full_size * (full_size + 1) : full_size + 2] = 1.0  # unit diagonal of the left block
-
-    # Noise matrix has the same shape as the signal matrix without the right-hand side.
-    noise_matrix = _aligned_zeros((full_size, full_size))
     noise_detectors = {}
 
     # Selection vectors map fields to detector readouts for quantum noise calculations.
@@ -1397,9 +1390,17 @@ def build(setup: Setup):
                 carrier_column_indices=system_matrix_column_indices,
             )
 
-    # Insert carrier matrix into both sideband blocks of the signal matrix.
-    signal_matrix[:system_size, :system_size] = carrier_matrix[:, :system_size]
-    signal_matrix[system_size:-signal_size, system_size:-signal_size - 1] = carrier_matrix[:, :system_size]
+    # The system matrices in coordinate form. The signal matrix holds the carrier matrix (without
+    # its right-hand side) in both sideband blocks and a unit diagonal for the signal degrees of
+    # freedom. As a dense array it would take (full_size)^2 * 16 bytes for these few entries.
+    carrier_rows, carrier_columns = np.nonzero(carrier_matrix)
+    carrier_values = carrier_matrix[carrier_rows, carrier_columns]
+    in_block = carrier_columns < system_size
+    block_rows, block_columns, block_values = carrier_rows[in_block], carrier_columns[in_block], carrier_values[in_block]
+    signal_diagonal = np.arange(2 * system_size, full_size)
+    signal_rows = np.concatenate([block_rows, block_rows + system_size, signal_diagonal])
+    signal_columns = np.concatenate([block_columns, block_columns + system_size, signal_diagonal])
+    signal_values = np.concatenate([block_values, block_values, np.ones(signal_diagonal.size, dtype=complex)])
 
     # -----------------------------------------------------------------
     # Mark unused ports and inject vacuum noise at those ports.
@@ -1450,9 +1451,9 @@ def build(setup: Setup):
         (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
         (
             _device_array([parameters], dtype=complex),
-            _device_array(carrier_matrix),
-            _device_array(signal_matrix),
-            _device_array(noise_matrix, dtype=complex),
+            _sparse(carrier_rows, carrier_columns, carrier_values, carrier_matrix.shape),
+            _sparse(signal_rows, signal_columns, signal_values, (full_size, full_size + 1)),
+            _sparse([], [], [], (full_size, full_size)),
             _device_array(noise_selection_vectors, dtype=complex),
             _device_array(qhd_parameter_indices, dtype=int),
             _device_array(qhd_placing_indices, dtype=int),

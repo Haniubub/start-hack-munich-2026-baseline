@@ -34,17 +34,17 @@ Memory decides much of the run time here. JAX copies every array it hands to a c
 every residual that a compiled program passes through, and memory that a callback touches for
 the first time costs a page fault per 4 kB. Therefore:
 
-- The reverse pass gets neither the dense signal matrix nor the dense noise matrix. Only matrix
-  entries that depend on parameters receive a cotangent, so its plan comes from the index arrays;
-  the few values it needs from the signal matrix arrive as small residuals
-  (`SystemPlan.base_residuals`).
+- The constant system matrices arrive in coordinate form (`SparseMatrix`, made by the build
+  step). As dense arrays the signal and the noise matrix of the benchmark setup take 9 MB each,
+  for 1539 and 0 entries.
 - Both passes work on one block of frequencies at a time, which keeps the intermediate arrays
   small, and the component functions write their outputs straight into the matrix entries.
 - Every array that crosses a callback or program boundary also has a fixed cost (lowering,
-  compilation, one copy per call). The 22 small arrays the reverse pass needs therefore travel as
+  compilation, one copy per call). The 28 small arrays the reverse pass needs therefore travel as
   two packed residuals (`_pack`, `_unpack`).
 """
 
+import functools
 import importlib.machinery
 import importlib.util
 import math
@@ -59,6 +59,48 @@ import differometor.components as components
 from differometor.components import UNIT_VACUUM, H_PLANCK, F0
 
 NOISE_SCALE = UNIT_VACUUM * H_PLANCK * F0 * 0.25
+
+
+class SparseMatrix:
+    """
+    A constant system matrix in coordinate form: `indices` (2, k) holds rows and columns of the
+    nonzero entries, `values` (k,) their values, `shape` is the shape of the dense matrix.
+
+    The build step hands the carrier, signal and noise matrix to `simulate` like this, because
+    they are almost empty. The class is a JAX pytree with the leaves `indices` and `values`; the
+    shape is static. `dense()` gives the dense JAX array, `np.asarray(matrix)` the dense NumPy array.
+    """
+
+    __slots__ = ("indices", "values", "shape")
+
+    def __init__(self, indices, values, shape):
+        self.indices, self.values, self.shape = indices, values, tuple(shape)
+
+    @classmethod
+    def from_dense(cls, matrix):
+        """The coordinate form of a concrete dense matrix (entries in row-major order)."""
+        matrix = np.asarray(matrix)
+        rows, columns = np.nonzero(matrix)
+        return cls(jnp.asarray(np.stack([rows, columns])), jnp.asarray(matrix[rows, columns]), matrix.shape)
+
+    def dense(self):
+        return jnp.zeros(self.shape, self.values.dtype).at[self.indices[0], self.indices[1]].set(self.values)
+
+    def __array__(self, dtype=None, copy=None):
+        indices, values = np.asarray(self.indices), np.asarray(self.values)
+        matrix = np.zeros(self.shape, values.dtype if dtype is None else dtype)
+        matrix[indices[0], indices[1]] = values
+        return matrix
+
+    def __repr__(self):
+        return f"SparseMatrix(shape={self.shape}, entries={self.values.shape[0]})"
+
+
+jax.tree_util.register_pytree_node(
+    SparseMatrix,
+    lambda matrix: ((matrix.indices, matrix.values), matrix.shape),
+    lambda shape, leaves: SparseMatrix(*leaves, shape),
+)
 
 
 # ---------------------------------------------------------------------
@@ -142,10 +184,6 @@ BALANCE_SWEEPS = 6
 
 # Frequencies whose signal systems share one SuperLU call (see `_BlockLU`).
 BLOCK_FREQUENCIES = 16
-
-# Room for the constant entries of the signal matrix that the forward pass hands to the reverse
-# pass, per unknown (see `SystemPlan.base_residuals`). The benchmark setup has about two.
-BASE_ENTRIES_PER_UNKNOWN = 16
 
 
 class _BlockLU:
@@ -561,15 +599,6 @@ class EntryPlan:
 # ---------------------------------------------------------------------
 
 
-def _flat_nonzero(matrix):
-    """Flat indices of the nonzero entries of a complex matrix (faster than `np.flatnonzero`)."""
-    parts = np.ascontiguousarray(matrix, dtype=np.complex128).view(np.float64).reshape(-1)
-    hits = np.flatnonzero(parts != 0) >> 1  # real and imaginary part of one entry are neighbours
-    if hits.size > 1:
-        hits = hits[np.concatenate(([True], hits[1:] != hits[:-1]))]
-    return hits
-
-
 def _last_writer(rows, columns, width):
     """Mask of scatter entries that survive `.at[rows, columns].set(...)` (last write wins)."""
     flat = rows * width + columns
@@ -582,31 +611,33 @@ def _last_writer(rows, columns, width):
 class SystemPlan:
     """Static sparsity data derived from the index arrays (cheap, rebuilt in every callback).
 
-    The forward pass needs the complete sparsity pattern, so it scans the dense signal and noise
-    matrix for their nonzeros (`signal_base=True`, `noise_base=True`). The reverse pass only needs
-    the entries that depend on parameters: the ones written by component functions or multiplied
-    by the carrier. `signal_base=False` restricts the signal pattern to those entries and
-    `noise_base=False` leaves out the constant noise entries. Then no dense signal or noise matrix
-    is read. `signal_base=(keys, values)` gives the constant signal entries directly (as returned
-    by `base_residuals`), for a reverse pass that has to factorize the signal systems again.
+    `A` holds the host arrays (HOST_KEYS), `n` is the size of the carrier system. The forward
+    pass needs the complete sparsity pattern (`signal_base=True`, `noise_base=True`). The reverse
+    pass only needs the entries that depend on parameters: the ones written by component
+    functions or multiplied by the carrier. `signal_base=False` restricts the signal pattern to
+    those entries and `noise_base=False` leaves out the constant noise entries.
     """
 
-    def __init__(self, A, signal_base=True, noise_base=True):
+    def __init__(self, A, n, signal_base=True, noise_base=True):
         get = lambda key: np.asarray(A[key])
-        self.carrier_base = get("carrier_matrix")
-        self.n = n = self.carrier_base.shape[0]
+        self.n = n
         self.selection = get("noise_selection_vectors")[0, 0]
         self.m = m = self.selection.size
 
-        # Carrier system: pattern of the n x n matrix, right-hand side in column n.
-        self.cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
-        self.carrier_live = _last_writer(self.cmi[0], self.cmi[1], n + 1)
-        mask = self.carrier_base[:, :-1] != 0
-        in_matrix = self.cmi[1] < n
-        mask[self.cmi[0][in_matrix], self.cmi[1][in_matrix]] = True
-        self.carrier_cols, self.carrier_rows = np.nonzero(mask.T)
-        self.carrier_rows = self.carrier_rows.astype(np.intc)
-        self.carrier_ptr = np.concatenate([[0], np.cumsum(mask.sum(0))]).astype(np.intc)
+        # Carrier system: the n x n matrix in CSC order, followed by the right-hand side (column
+        # n). Entries are identified by the key `column * n + row`, which sorts them that way.
+        self.cmi = cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
+        self.carrier_live = _last_writer(cmi[0], cmi[1], n + 1)
+        base_rows, base_cols = get("carrier_base_indices")
+        base_keys, written_keys = base_cols * n + base_rows, cmi[1] * n + cmi[0]
+        keys = np.unique(np.concatenate([base_keys, written_keys]))
+        self.carrier_count = count = int(np.searchsorted(keys, n * n))  # entries of the matrix itself
+        self.carrier_rows = (keys[:count] % n).astype(np.intc)
+        self.carrier_ptr = np.searchsorted(keys[:count], np.arange(n + 1) * n).astype(np.intc)
+        self.carrier_rhs_rows = keys[count:] - n * n
+        self.carrier_base = np.zeros(keys.size, complex)
+        self.carrier_base[np.searchsorted(keys, base_keys)] = get("carrier_base_values")
+        self.carrier_positions = np.searchsorted(keys, written_keys)
 
         # Signal system: pattern of the augmented m x (m + 1) matrix in CSC order. Entries are
         # identified by the key `column * m + row`, which sorts them column by column.
@@ -615,19 +646,19 @@ class SystemPlan:
         self.signal_carrier_indices = get("signal_carrier_indices").ravel()
         key = lambda rows, cols: cols * m + rows
         written = [key(smi[0], smi[1]), key(placing[0], placing[1])]
-        if signal_base is True:
-            signal_matrix = get("signal_matrix")
-            base_rows, base_cols = np.divmod(_flat_nonzero(signal_matrix), m + 1)
-            signal_base = key(base_rows, base_cols), signal_matrix[base_rows, base_cols]
+        base_keys = key(*get("signal_base_indices"))
         if signal_base:
-            written.append(signal_base[0])
+            written.append(base_keys)
         keys = np.unique(np.concatenate(written))
         cols, rows = np.divmod(keys, m)
         self.rows, self.cols, self.size = rows, cols, rows.size
-        self.base_entries = signal_base  # (keys, values) of the constant entries, or False
+        # Constant values on the pattern. Without `signal_base` the pattern holds only some of the
+        # constant entries, among them the ones in placing slots, which the reverse pass needs.
         self.signal_base = np.zeros(keys.size, complex)
-        if signal_base:
-            self.signal_base[np.searchsorted(keys, signal_base[0])] = signal_base[1]
+        if keys.size:
+            places = np.minimum(np.searchsorted(keys, base_keys), keys.size - 1)
+            present = keys[places] == base_keys
+            self.signal_base[places[present]] = get("signal_base_values")[present]
         self.update_positions = np.searchsorted(keys, key(smi[0], smi[1]))
         self.update_live = _last_writer(smi[0], smi[1], m + 1)
         self.placing_positions = np.searchsorted(keys, key(placing[0], placing[1]))
@@ -647,12 +678,11 @@ class SystemPlan:
         # Noise matrix: base entries plus entries written by noise component functions.
         nmi = get("noise_system_matrix_indices") % m
         self.noise_live = _last_writer(nmi[0], nmi[1], m)
-        if noise_base:
-            noise_matrix = get("noise_matrix")
-            base = _flat_nonzero(noise_matrix)
-            base = base[~np.isin(base, nmi[0] * m + nmi[1])]
-            base_rows, base_cols = np.divmod(base, m)
-            self.noise_base = noise_matrix[base_rows, base_cols]
+        if noise_base:  # constant entries that no noise component function overwrites
+            base_rows, base_cols = get("noise_base_indices")
+            kept = ~np.isin(base_rows * m + base_cols, nmi[0] * m + nmi[1])
+            base_rows, base_cols = base_rows[kept], base_cols[kept]
+            self.noise_base = get("noise_base_values")[kept]
         else:
             base_rows = base_cols = np.empty(0, np.intp)
             self.noise_base = np.empty(0, complex)
@@ -668,10 +698,13 @@ class SystemPlan:
         self.order = None
 
     def carrier_matrix(self, carrier_entries):
-        n = self.n
-        M = self.carrier_base.astype(complex)
-        M[self.cmi[0][self.carrier_live], self.cmi[1][self.carrier_live]] = carrier_entries[self.carrier_live]
-        return _splu(n, M[self.carrier_rows, self.carrier_cols], self.carrier_rows, self.carrier_ptr), M[:, -1]
+        """The factorized carrier matrix and the right-hand side of the carrier system."""
+        count, live = self.carrier_count, self.carrier_live
+        values = self.carrier_base.copy()
+        values[self.carrier_positions[live]] = carrier_entries[live]
+        rhs = np.zeros(self.n, complex)
+        rhs[self.carrier_rhs_rows] = values[count:]
+        return _splu(self.n, values[:count], self.carrier_rows, self.carrier_ptr), rhs
 
     def signal_values(self, signal_entries, carrier):
         """Nonzero values of the augmented signal matrices, shape (F, size)."""
@@ -683,29 +716,6 @@ class SystemPlan:
         V[:, placed] = -V[:, placed] * carrier[self.signal_carrier_indices[self.placing_live]]
         V[:, self.conjugated] = np.conj(V[:, self.conjugated])
         return V
-
-    def base_residuals(self, capacity):
-        """What the reverse pass needs from the dense signal matrix, as arrays of static shape.
-
-        JAX copies every array on its way into a callback and every residual that a compiled
-        forward program passes through. The reverse pass therefore does not get the dense signal
-        matrix (9 MB for the benchmark setup) but these three arrays:
-
-        - `placing_base` (placing count,): the constant value in every placing slot. The usual
-          reverse pass needs nothing else from the matrix.
-        - `base_keys`, `base_values` (capacity,): all constant entries (key `column * m + row`,
-          padded with -1), for a reverse pass that has to factorize the signal systems again
-          (`SystemPlan(..., signal_base=(keys, values))`). If the matrix has more than `capacity`
-          constant entries, every key is -2 and that reverse pass reports it.
-        """
-        keys, values = self.base_entries
-        fits = keys.size <= capacity
-        base_keys = np.full(capacity, -1 if fits else -2, np.int64)
-        base_values = np.zeros(capacity, complex)
-        if fits:
-            base_keys[: keys.size] = keys
-            base_values[: keys.size] = values
-        return self.signal_base[self.placing_positions], base_keys, base_values
 
     def placing_writers(self):
         """For the placing slots a signal entry writes to: the slots and the entries (last writer)."""
@@ -892,7 +902,6 @@ def backward(
     Y,
     MU,
     Z,
-    placing_base,
     carrier_bar,
     signal_bar,
     noise_bar,
@@ -901,7 +910,7 @@ def backward(
     """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
 
     `plan` only has to contain the parameter-dependent entries (`SystemPlan(..., signal_base=False,
-    noise_base=False)`): constant matrix entries receive no cotangent.
+    noise_base=False)`): constant matrix entries receive no cotangent. `X` is the signal (F, m).
     """
     n, m = plan.n, plan.m
     carrier_lu, _ = plan.carrier_matrix(carrier_entries)
@@ -919,7 +928,7 @@ def backward(
     updated = plan.update_positions[update_live]
     noise_live = np.nonzero(plan.noise_live)[0]
     written, writers = plan.placing_writers()
-    placing_base = placing_base.astype(complex)
+    placing_base = plan.signal_base[plan.placing_positions]
     signal_entries_bar = np.zeros_like(signal_entries)
     noise_entries_bar = np.zeros((F, plan.noise_live.size), complex)
     placed_sum = np.zeros(placed.size, complex)
@@ -970,8 +979,9 @@ def backward(
 # JAX integration
 # ---------------------------------------------------------------------
 
-# Arrays the host callbacks need (the remaining `simulate` arguments only select the path).
-HOST_KEYS = (
+# `simulate` arguments the host callbacks need (the remaining ones only select the path): plain
+# arrays and the three constant system matrices, which have to be `SparseMatrix` objects.
+ARRAY_KEYS = (
     "optimized_parameter_indices",
     "optimized_value_indices",
     "carrier_changing_parameter_indices",
@@ -979,9 +989,6 @@ HOST_KEYS = (
     "signal_changing_parameter_indices",
     "signal_changing_values",
     "parameters",
-    "carrier_matrix",
-    "signal_matrix",
-    "noise_matrix",
     "noise_selection_vectors",
     "carrier_function_input_indices",
     "carrier_function_indices",
@@ -998,21 +1005,32 @@ HOST_KEYS = (
     "noise_output_indices",
     "noise_system_matrix_indices",
 )
+MATRIX_KEYS = ("carrier_matrix", "signal_matrix", "noise_matrix")
+# Names of the arrays a host callback works with: the plain arrays, then both leaves of every
+# matrix. All of them are small. The forward callback gets them as operands and packs them into
+# two residuals for the reverse callback (`_pack`), because every array that crosses a callback
+# or program boundary costs time, however small it is.
+HOST_KEYS = ARRAY_KEYS + (
+    "carrier_base_indices",
+    "carrier_base_values",
+    "signal_base_indices",
+    "signal_base_values",
+    "noise_base_indices",
+    "noise_base_values",
+)
 
-# The reverse pass reads neither the dense signal matrix nor the dense noise matrix (see
-# `SystemPlan`). Every array handed to a callback is copied, so both are left out of the residuals.
-# Of the remaining arrays only the carrier matrix is large. It goes to the reverse callback as it
-# is. All others reach it as two residuals that the forward callback packs (`_pack`), because every
-# array that crosses a callback or program boundary costs time, however small it is.
-BACKWARD_KEYS = ("carrier_matrix",)
-PACKED_KEYS = tuple(key for key in HOST_KEYS if key not in ("carrier_matrix", "signal_matrix", "noise_matrix"))
+
+def _host_leaves(host):
+    """The arrays behind HOST_KEYS, in that order, taken from the `simulate` arguments."""
+    matrices = [leaf for key in MATRIX_KEYS for leaf in (host[key].indices, host[key].values)]
+    return [host[key] for key in ARRAY_KEYS] + matrices
 
 
-def _packed_sizes(host):
+def _packed_sizes(leaves):
     """Lengths of the two arrays `_pack` returns, from the static shapes and dtypes of the host arrays."""
     integers, reals = 1, 0
-    for key in PACKED_KEYS:
-        shape, kind = host[key].shape, np.dtype(host[key].dtype).kind
+    for leaf in leaves:
+        shape, kind = leaf.shape, np.dtype(leaf.dtype).kind
         integers += 2 + len(shape)
         if kind in "iub":
             integers += math.prod(shape)
@@ -1023,14 +1041,14 @@ def _packed_sizes(host):
 
 def _pack(A):
     """
-    The arrays `A[key]` for PACKED_KEYS as two flat arrays; `_unpack` restores them exactly.
+    The arrays `A[key]` for HOST_KEYS as two flat arrays; `_unpack` restores them exactly.
 
     Integer and boolean arrays go into an int64 array, behind a header: its length, then dtype,
     number of dimensions and shape of every array. Real and complex arrays go into a float64
     array, where a complex number takes two places.
     """
     header, integers, reals = [], [], []
-    for key in PACKED_KEYS:
+    for key in HOST_KEYS:
         array = np.asarray(A[key])
         header += [ord(array.dtype.char), array.ndim, *array.shape]
         kind = array.dtype.kind
@@ -1050,7 +1068,7 @@ def _unpack(packed_integers, packed_reals):
     A = {}
     integer_at, real_at, at = int(packed_integers[0]), 0, 1
     header = packed_integers[:integer_at].tolist()
-    for key in PACKED_KEYS:
+    for key in HOST_KEYS:
         dtype, ndim = np.dtype(chr(header[at])), header[at + 1]
         shape = tuple(header[at + 2 : at + 2 + ndim])
         at += 2 + ndim
@@ -1069,10 +1087,11 @@ def _unpack(packed_integers, packed_reals):
 
 
 def supports(arrays):
-    """Static (shape/dtype only) check whether the fast path covers these `simulate` arguments."""
+    """Static (type/shape/dtype only) check whether the fast path covers these `simulate` arguments."""
     optimized = arrays["optimized_parameters"]
     return (
-        arrays["linked_indices"].shape[0] == 0
+        all(isinstance(arrays[key], SparseMatrix) for key in MATRIX_KEYS)
+        and arrays["linked_indices"].shape[0] == 0
         and arrays["qhd_parameter_indices"].shape[0] == 0
         and arrays["noise_selection_vectors"].shape[0] == 1
         and arrays["carrier_changing_values"].ndim == 2
@@ -1091,42 +1110,30 @@ def _output_shapes(arrays):
     return n, m, F, noise_shape
 
 
-def _host_forward(optimized_parameters, *host_arrays):
+def _host_forward(n, optimized_parameters, *host_arrays):
     A = dict(zip(HOST_KEYS, host_arrays))
     entries = EntryPlan(A).values(optimized_parameters)  # derivatives are only taped in the backward pass
-    plan = SystemPlan(A)
-    carrier, signal, noise, Y, MU, Z = forward(plan, *entries)
-    base = plan.base_residuals(BASE_ENTRIES_PER_UNKNOWN * plan.m)
-    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z, *base, *_pack(A)
+    carrier, signal, noise, Y, MU, Z = forward(SystemPlan(A, n), *entries)
+    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z, *_pack(A)
 
 
-def _host_backward(optimized_parameters, *rest):
-    k = len(BACKWARD_KEYS)
-    carrier, signal, noise, Y, MU, Z, placing_base, base_keys, base_values, packed_integers, packed_reals = rest[k:-3]
-    carrier_bar, signal_bar, noise_bar = rest[-3:]
+def _host_backward(
+    optimized_parameters, carrier, signal, noise, Y, MU, Z, packed_integers, packed_reals, carrier_bar, signal_bar, noise_bar
+):
     A = _unpack(np.asarray(packed_integers), np.asarray(packed_reals))
-    A.update(zip(BACKWARD_KEYS, rest[:k]))
-    F = Y.shape[0]
+    F, n = Y.shape[0], carrier.shape[0]
     entry_plan = EntryPlan(A)
     (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
     carrier = np.asarray(carrier)[:, 0]
 
     def general_adjoint(signal_bar):
         # A cotangent outside the detector rows: factorize the complete signal systems once more.
-        keys = np.asarray(base_keys)
-        if keys.size and keys[0] == -2:
-            raise NotImplementedError(
-                "The signal matrix has more constant entries than the fast path keeps for this reverse pass "
-                f"({BASE_ENTRIES_PER_UNKNOWN} per unknown). Raise differometor.fast.BASE_ENTRIES_PER_UNKNOWN "
-                "or use differometor.simulate.simulate_jax."
-            )
-        count = np.count_nonzero(keys >= 0)
-        plan = SystemPlan(A, signal_base=(keys[:count], np.asarray(base_values)[:count]), noise_base=False)
+        plan = SystemPlan(A, n, noise_base=False)
         factors = plan.signal_factors(plan.signal_values(signal_entries, carrier))
         return plan.solve_transposed(factors, signal_bar)
 
     entries_bar = backward(
-        SystemPlan(A, signal_base=False, noise_base=False),
+        SystemPlan(A, n, signal_base=False, noise_base=False),
         carrier_entries,
         signal_entries,
         carrier,
@@ -1135,7 +1142,6 @@ def _host_backward(optimized_parameters, *rest):
         np.asarray(Y),
         np.asarray(MU),
         np.asarray(Z),
-        np.asarray(placing_base),
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar).T,
         np.asarray(noise_bar, float).reshape(F),
@@ -1146,11 +1152,10 @@ def _host_backward(optimized_parameters, *rest):
 
 
 def _forward_callback(optimized_parameters, host):
-    """The simulation outputs and the residuals of the reverse pass (Y, MU, Z, `base_residuals`, `_pack`)."""
+    """The simulation outputs and the residuals of the reverse pass (Y, MU, Z and the packed host arrays)."""
     n, m, F, noise_shape = _output_shapes(host)
-    placing_count = jax.tree_util.tree_leaves(host["signal_carrier_placing_indices"])[0].shape[-1]
-    base_capacity = BASE_ENTRIES_PER_UNKNOWN * m
-    packed_integers, packed_reals = _packed_sizes(host)
+    leaves = _host_leaves(host)
+    packed_integers, packed_reals = _packed_sizes(leaves)
     result_shapes = (
         jax.ShapeDtypeStruct((n, 1), jnp.complex128),
         jax.ShapeDtypeStruct((m, F), jnp.complex128),
@@ -1158,14 +1163,11 @@ def _forward_callback(optimized_parameters, host):
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
-        jax.ShapeDtypeStruct((placing_count,), jnp.complex128),
-        jax.ShapeDtypeStruct((base_capacity,), jnp.int64),
-        jax.ShapeDtypeStruct((base_capacity,), jnp.complex128),
         jax.ShapeDtypeStruct((packed_integers,), jnp.int64),
         jax.ShapeDtypeStruct((packed_reals,), jnp.float64),
     )
     carrier, signal, noise, *residuals = jax.pure_callback(
-        _host_forward, result_shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), vmap_method="sequential"
+        functools.partial(_host_forward, n), result_shapes, optimized_parameters, *leaves, vmap_method="sequential"
     )
     return (carrier, signal, noise.reshape(noise_shape)), tuple(residuals)
 
@@ -1199,23 +1201,16 @@ def _fast_fwd(optimized_parameters, host, others):
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
     outputs, residuals = _forward_callback(p, host)
-    return outputs, (p, {key: host[key] for key in BACKWARD_KEYS}, outputs, *residuals)
+    return outputs, (p, outputs, *residuals)
 
 
 def _fast_bwd(residuals, cotangents):
     cotangents = tuple(_zeros_if_symbolic(c) for c in cotangents)
     if len(residuals) == 1:
         return residuals[0](cotangents)
-    p, host, outputs, *helpers = residuals
+    p, outputs, *helpers = residuals
     gradient = jax.pure_callback(
-        _host_backward,
-        jax.ShapeDtypeStruct(p.shape, p.dtype),
-        p,
-        *(host[k] for k in BACKWARD_KEYS),
-        *outputs,
-        *helpers,
-        *cotangents,
-        vmap_method="sequential",
+        _host_backward, jax.ShapeDtypeStruct(p.shape, p.dtype), p, *outputs, *helpers, *cotangents, vmap_method="sequential"
     )
     return gradient, None, None
 
@@ -1225,6 +1220,6 @@ _fast.defvjp(_fast_fwd, _fast_bwd, symbolic_zeros=True)
 
 def simulate_fast(arrays):
     """Fast `simulate` for argument dicts accepted by `supports`."""
-    host = {key: arrays[key] for key in HOST_KEYS}
-    others = {key: value for key, value in arrays.items() if key not in HOST_KEYS and key != "optimized_parameters"}
+    host = {key: arrays[key] for key in ARRAY_KEYS + MATRIX_KEYS}
+    others = {key: value for key, value in arrays.items() if key not in host and key != "optimized_parameters"}
     return _fast(arrays["optimized_parameters"], host, others)

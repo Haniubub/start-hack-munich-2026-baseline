@@ -7,7 +7,8 @@ and compares the full gradient with `simulate_jax`. It also repeats the benchmar
 
 Two more checks on the fast path itself:
 - The frequency block size must not matter (blocks of 1 and 2 against the default).
-- When the constant entries of the signal matrix do not fit into the residuals of the reverse
+- Only for states before the sparse system matrices (`fast.BASE_ENTRIES_PER_UNKNOWN` exists):
+  when the constant entries of the signal matrix do not fit into the residuals of the reverse
   pass, the general adjoint has to fail with a clear message, and the usual readout still works.
 
 Usage: python runs/noel/test_adjoint.py <repo>
