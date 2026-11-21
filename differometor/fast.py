@@ -127,6 +127,47 @@ DETECTOR_WIDTH = 2
 DIAGONAL_PIVOT_THRESHOLD = 0.1
 BALANCE_SWEEPS = 6
 
+# Frequencies whose signal systems share one SuperLU call (see `_BlockLU`).
+BLOCK_FREQUENCIES = 16
+
+# Room for the constant entries of the signal matrix that the forward pass hands to the reverse
+# pass, per unknown (see `SystemPlan.base_residuals`). The benchmark setup has about two.
+BASE_ENTRIES_PER_UNKNOWN = 16
+
+
+class _BlockLU:
+    """LU factorizations of several square matrices that share one sparsity pattern.
+
+    SuperLU has a fixed cost per call: work arrays, the elimination tree and a generous memory
+    reserve for the factors. The matrices of BLOCK_FREQUENCIES frequencies are therefore stacked
+    into one block-diagonal system, which takes one factorization call and one call per solve.
+    No entry connects two blocks, so every pivot and every result is exactly the one of a
+    separate factorization.
+
+    `values` has one row per matrix, in the CSC order given by `row_indices`/`column_pointers`.
+    """
+
+    def __init__(self, size, values, row_indices, column_pointers, **options):
+        entries = values.shape[1]
+        self.size, self.blocks = size, []
+        for start in range(0, values.shape[0], BLOCK_FREQUENCIES):
+            chunk = values[start : start + BLOCK_FREQUENCIES]
+            count = chunk.shape[0]
+            offsets = np.arange(count, dtype=np.intc)[:, None]
+            rows = (row_indices + offsets * size).ravel()
+            pointers = np.empty(count * size + 1, np.intc)
+            pointers[:-1] = (column_pointers[:-1] + offsets * entries).ravel()
+            pointers[-1] = count * entries
+            self.blocks.append((start, count, _splu(count * size, chunk.reshape(-1), rows, pointers, **options)))
+
+    def solve(self, b, trans="N"):
+        """b: (matrices, size, k) right-hand sides -> solutions of the same shape."""
+        x = np.empty(b.shape, complex)
+        for start, count, lu in self.blocks:
+            block = b[start : start + count].reshape(count * self.size, -1)
+            x[start : start + count] = lu.solve(block, trans=trans).reshape(count, self.size, -1)
+        return x
+
 
 def _balance(magnitudes, rows, cols, size, sweeps=BALANCE_SWEEPS):
     """
@@ -347,16 +388,6 @@ class _EntryBlock:
                 if members.size:
                     columns = np.nonzero(needed[members].any(axis=0))[0]
                     self.groups.append((int(k), members, varying, columns))
-        # Scatter from entries to (call, output) slots; several entries may share a slot.
-        self.scatter = _grouping(self.outputs[0] * 4 + self.outputs[1])
-        # Per group: which scatter slots belong to its calls and where they go in a (members, 4) block.
-        slots = self.scatter[2]
-        self.group_slots = []
-        for _, members, _, _ in self.groups:
-            position = np.full(self.inputs.shape[0], -1)
-            position[members] = np.arange(members.size)
-            picked = np.nonzero(position[slots // 4] >= 0)[0]
-            self.group_slots.append((picked, position[slots[picked] // 4] * 4 + slots[picked] % 4))
 
     def _gather(self, values):
         return values[:, self.outputs[0], self.outputs[1]]
@@ -387,28 +418,32 @@ class _EntryBlock:
 
     def back(self, tape, entries_bar, parameter_count):
         """entries_bar: (R, E) -> real parameter cotangent summed over the rows (P,)."""
-        rows = entries_bar.shape[0]
-        order, starts, _ = self.scatter
+        rows, calls = entries_bar.shape[0], self.inputs.shape[0]
+        # Scatter from entries to (call, output) slots; several entries may share a slot.
+        order, starts, slots = _grouping(self.outputs[0] * 4 + self.outputs[1])
         summed = _group_sum(entries_bar, order, starts) if order.size else None
+        slot_calls, slot_outputs = slots // 4, slots % 4
+        position = np.empty(calls, np.intp)
         parameters_bar = np.zeros(parameter_count)
-        for (function_index, members, varying, columns), jacobian, (picked, local) in zip(
-            self.groups, tape, self.group_slots
-        ):
+        for (function_index, members, varying, columns), jacobian in zip(self.groups, tape):
             if jacobian is None:
                 continue
-            # Output cotangents of this group's calls only, (rows, members, 4) or (members, 4).
+            # Output cotangents of this group's calls only: the scatter slots that belong to them
+            # (`picked`) and their place in a (members, 4) block (`local`).
+            position.fill(-1)
+            position[members] = np.arange(members.size)
+            picked = np.nonzero(position[slot_calls] >= 0)[0]
+            local = position[slot_calls[picked]] * 4 + slot_outputs[picked]
             if varying:
                 outputs_bar = np.zeros((rows, members.size * 4), complex)
                 if picked.size:
                     outputs_bar[:, local] = summed[:, picked]
-                outputs_bar = outputs_bar.reshape(rows, members.size, 4)
-                inputs_bar = np.einsum("rco,rcoj->cj", outputs_bar, jacobian).real
+                inputs_bar = np.einsum("rco,rcoj->cj", outputs_bar.reshape(rows, members.size, 4), jacobian).real
             else:  # identical Jacobian in every row
                 outputs_bar = np.zeros(members.size * 4, complex)
                 if picked.size:
                     outputs_bar[local] = summed[:, picked].sum(0)
-                outputs_bar = outputs_bar.reshape(members.size, 4)
-                inputs_bar = np.einsum("co,coj->cj", outputs_bar, jacobian[0]).real
+                inputs_bar = np.einsum("co,coj->cj", outputs_bar.reshape(members.size, 4), jacobian[0]).real
             parameters_bar += np.bincount(self.inputs[members][:, columns].ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
@@ -481,8 +516,11 @@ class EntryPlan:
 
 def _flat_nonzero(matrix):
     """Flat indices of the nonzero entries of a complex matrix (faster than `np.flatnonzero`)."""
-    parts = np.ascontiguousarray(matrix).view(np.float64).reshape(-1, 2)
-    return np.flatnonzero((parts[:, 0] != 0) | (parts[:, 1] != 0))
+    parts = np.ascontiguousarray(matrix, dtype=np.complex128).view(np.float64).reshape(-1)
+    hits = np.flatnonzero(parts != 0) >> 1  # real and imaginary part of one entry are neighbours
+    if hits.size > 1:
+        hits = hits[np.concatenate(([True], hits[1:] != hits[:-1]))]
+    return hits
 
 
 def _last_writer(rows, columns, width):
@@ -498,18 +536,20 @@ class SystemPlan:
     """Static sparsity data derived from the index arrays (cheap, rebuilt in every callback).
 
     The forward pass needs the complete sparsity pattern, so it scans the dense signal and noise
-    matrix for their nonzeros. The reverse pass only needs the entries that depend on parameters:
-    the ones written by component functions or multiplied by the carrier. `signal_base=False`
-    restricts the signal pattern to those entries and `noise_base=False` leaves out the constant
-    noise entries. Then no dense matrix is scanned and the noise matrix is not read at all.
+    matrix for their nonzeros (`signal_base=True`, `noise_base=True`). The reverse pass only needs
+    the entries that depend on parameters: the ones written by component functions or multiplied
+    by the carrier. `signal_base=False` restricts the signal pattern to those entries and
+    `noise_base=False` leaves out the constant noise entries. Then no dense signal or noise matrix
+    is read. `signal_base=(keys, values)` gives the constant signal entries directly (as returned
+    by `base_residuals`), for a reverse pass that has to factorize the signal systems again.
     """
 
     def __init__(self, A, signal_base=True, noise_base=True):
         get = lambda key: np.asarray(A[key])
         self.carrier_base = get("carrier_matrix")
         self.n = n = self.carrier_base.shape[0]
-        signal_matrix = get("signal_matrix")
-        self.m = m = signal_matrix.shape[0]
+        self.selection = get("noise_selection_vectors")[0, 0]
+        self.m = m = self.selection.size
 
         # Carrier system: pattern of the n x n matrix, right-hand side in column n.
         self.cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
@@ -528,21 +568,23 @@ class SystemPlan:
         self.signal_carrier_indices = get("signal_carrier_indices").ravel()
         key = lambda rows, cols: cols * m + rows
         written = [key(smi[0], smi[1]), key(placing[0], placing[1])]
-        if signal_base:
+        if signal_base is True:
+            signal_matrix = get("signal_matrix")
             base_rows, base_cols = np.divmod(_flat_nonzero(signal_matrix), m + 1)
-            written.append(key(base_rows, base_cols))
+            signal_base = key(base_rows, base_cols), signal_matrix[base_rows, base_cols]
+        if signal_base:
+            written.append(signal_base[0])
         keys = np.unique(np.concatenate(written))
         cols, rows = np.divmod(keys, m)
         self.rows, self.cols, self.size = rows, cols, rows.size
-        self.signal_base = signal_matrix[rows, cols]
+        self.base_entries = signal_base  # (keys, values) of the constant entries, or False
+        self.signal_base = np.zeros(keys.size, complex)
+        if signal_base:
+            self.signal_base[np.searchsorted(keys, signal_base[0])] = signal_base[1]
         self.update_positions = np.searchsorted(keys, key(smi[0], smi[1]))
         self.update_live = _last_writer(smi[0], smi[1], m + 1)
         self.placing_positions = np.searchsorted(keys, key(placing[0], placing[1]))
         self.placing_live = _last_writer(placing[0], placing[1], m + 1)
-        # Signal entry (or -1 for the base value) that sets each placing slot before the placement.
-        writer = np.full(rows.size, -1)
-        writer[self.update_positions[self.update_live]] = np.nonzero(self.update_live)[0]
-        self.placing_writer = writer[self.placing_positions]
         # Entries that are complex-conjugated for the lower sideband (see `simulate`).
         self.conjugated = (
             ((rows >= n) & (rows < 2 * n) & (cols >= n) & (cols < 2 * n))
@@ -572,7 +614,6 @@ class SystemPlan:
         if noise_base:  # scatter plans for N y and N^H y (forward pass only)
             self.noise_by_row = _grouping(self.noise_rows)
             self.noise_by_col = _grouping(self.noise_cols)
-        self.selection = get("noise_selection_vectors")[0, 0]
         # Rows the quantum noise detector reads. When they fit into DETECTOR_WIDTH, the forward pass
         # solves S^T z = e_d for each of them; Y and the signal adjoint are then combinations of z.
         self.detector = np.nonzero(self.selection)[0]
@@ -596,12 +637,38 @@ class SystemPlan:
         V[:, self.conjugated] = np.conj(V[:, self.conjugated])
         return V
 
-    def signal_pre(self, signal_entries):
+    def base_residuals(self, capacity):
+        """What the reverse pass needs from the dense signal matrix, as arrays of static shape.
+
+        JAX copies every array on its way into a callback and every residual that a compiled
+        forward program passes through. The reverse pass therefore does not get the dense signal
+        matrix (9 MB for the benchmark setup) but these three arrays:
+
+        - `placing_base` (placing count,): the constant value in every placing slot. The usual
+          reverse pass needs nothing else from the matrix.
+        - `base_keys`, `base_values` (capacity,): all constant entries (key `column * m + row`,
+          padded with -1), for a reverse pass that has to factorize the signal systems again
+          (`SystemPlan(..., signal_base=(keys, values))`). If the matrix has more than `capacity`
+          constant entries, every key is -2 and that reverse pass reports it.
+        """
+        keys, values = self.base_entries
+        fits = keys.size <= capacity
+        base_keys = np.full(capacity, -1 if fits else -2, np.int64)
+        base_values = np.zeros(capacity, complex)
+        if fits:
+            base_keys[: keys.size] = keys
+            base_values[: keys.size] = values
+        return self.signal_base[self.placing_positions], base_keys, base_values
+
+    def signal_pre(self, signal_entries, placing_base):
         """Values of the placing slots before the placement, shape (F, placing count)."""
         F = signal_entries.shape[0]
         pre = np.empty((F, self.placing_positions.size), complex)
-        pre[:] = self.signal_base[self.placing_positions]
-        writer = self.placing_writer
+        pre[:] = placing_base
+        # Signal entry (or -1 for the base value) that sets each placing slot before the placement.
+        writer = np.full(self.size, -1)
+        writer[self.update_positions[self.update_live]] = np.nonzero(self.update_live)[0]
+        writer = writer[self.placing_positions]
         written = writer >= 0
         pre[:, written] = signal_entries[:, writer[written]]
         return pre
@@ -645,15 +712,28 @@ class SystemPlan:
         self.scale = np.exp2(log_scale)  # d, per unknown
 
     def signal_factors(self, V):
-        """One SuperLU factorization of B_f = D^-1 S_f[order][:, order] D per frequency (rows of `V`)."""
+        """SuperLU factorizations of B_f = D^-1 S_f[order][:, order] D for all frequencies (rows of `V`)."""
         if self.order is None:
             self._analyze(V[0])
-        values = V[:, self.ordered_values] * self.ordered_scale
-        rows, pointers, m = self.ordered_rows, self.ordered_ptr, self.m
-        return [_splu(m, row, rows, pointers, "NATURAL", True, DIAGONAL_PIVOT_THRESHOLD) for row in values]
+        values = V[:, self.ordered_values]
+        values *= self.ordered_scale
+        return _BlockLU(
+            self.m,
+            values,
+            self.ordered_rows,
+            self.ordered_ptr,
+            column_order="NATURAL",
+            small_supernodes=True,
+            diagonal_threshold=DIAGONAL_PIVOT_THRESHOLD,
+        )
 
-    def signal_lu(self, values_row):
-        return _OrderedLU(self.signal_factors(values_row[None])[0], self.order, self.scale)
+    def solve_transposed(self, factors, c):
+        """lam_f with S_f^T lam_f = c_f for every frequency: B^T (D lam) = D c in elimination order."""
+        order = self.order
+        scale = self.scale[order]
+        lam = np.empty(c.shape, complex)
+        lam[:, order] = factors.solve((c[:, order] * scale)[:, :, None], trans="T")[:, :, 0] / scale
+        return lam
 
     def noise_values(self, noise_entries):
         F = noise_entries.shape[0]
@@ -666,23 +746,6 @@ class SystemPlan:
         w[:n] = s[:n] * carrier
         w[n : 2 * n] = np.conj(s[n : 2 * n] * carrier)
         return w
-
-
-class _OrderedLU:
-    """LU of B = D^-1 A[order][:, order] D with a real diagonal D; solves with A, A^T and A^H."""
-
-    def __init__(self, lu, order, scale):
-        self.lu, self.order, self.scale = lu, order, scale[order]
-
-    def solve(self, b, trans="N"):
-        scale = self.scale.reshape((-1,) + (1,) * (b.ndim - 1))
-        if trans == "N":  # B (D^-1 x) = D^-1 b
-            y = self.lu.solve(b[self.order] / scale) * scale
-        else:  # B^T (D x) = D b, and the same with B^H
-            y = self.lu.solve(b[self.order] * scale, trans=trans) / scale
-        x = np.empty_like(y)
-        x[self.order] = y
-        return x
 
 
 def _scatter_sum(values, grouping, size):
@@ -720,19 +783,19 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     order, position = plan.order, plan.position
     scale = plan.scale[order]
     d, k = plan.detector, plan.detector.size
-    Z_o = np.zeros((F, m, DETECTOR_WIDTH), complex)
     if plan.use_basis:
-        basis = np.zeros((m, k), complex)
-        basis[position[d], np.arange(k)] = plan.scale[d]
-        for f, lu in enumerate(factors):
-            Z_o[f, :, :k] = lu.solve(basis, trans="T")
-        Z_o[:, :, :k] /= scale[:, None]
-        Y_o = np.conj(Z_o[:, :, :k] @ np.conj(w[d]))
+        basis = np.zeros((F, m, k), complex)
+        basis[:, position[d], np.arange(k)] = plan.scale[d]
+        Z_o = factors.solve(basis, trans="T")
+        Z_o /= scale[:, None]
+        Y_o = np.conj(Z_o @ np.conj(w[d]))
+        if k < DETECTOR_WIDTH:
+            Z_o = np.concatenate([Z_o, np.zeros((F, m, DETECTOR_WIDTH - k), complex)], axis=2)
     else:
-        w_o = w[order] * scale
-        Y_o = np.empty((F, m), complex)
-        for f, lu in enumerate(factors):
-            Y_o[f] = lu.solve(w_o, trans="H")
+        Z_o = np.zeros((F, m, DETECTOR_WIDTH), complex)
+        w_o = np.empty((F, m, 1), complex)
+        w_o[:, :, 0] = w[order] * scale
+        Y_o = factors.solve(w_o, trans="H")[:, :, 0]
         Y_o /= scale
     by_row, by_col = plan.noise_by_row, plan.noise_by_col
     q_o = _scatter_sum(N * Y_o[:, position[plan.noise_cols]], (*by_row[:2], position[by_row[2]]), m)  # N y
@@ -741,9 +804,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     right_hand_sides = np.zeros((F, m, 2), complex)
     right_hand_sides[:, position[plan.rhs_rows], 0] = V[:, ~plan.in_matrix] / plan.scale[plan.rhs_rows]
     right_hand_sides[:, :, 1] = (q_o + qh_o) * (0.5 / scale)
-    solutions = np.empty((F, m, 2), complex)
-    for f, lu in enumerate(factors):
-        solutions[f] = lu.solve(right_hand_sides[f])
+    solutions = factors.solve(right_hand_sides)
     solutions *= scale[:, None]
     X = np.empty((F, m), complex)
     MU = np.empty((F, m), complex)
@@ -771,7 +832,20 @@ def _signal_adjoint(plan, Z, signal_bar, general_adjoint):
 
 
 def backward(
-    plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, general_adjoint
+    plan,
+    carrier_entries,
+    signal_entries,
+    carrier,
+    X,
+    noise,
+    Y,
+    MU,
+    Z,
+    placing_base,
+    carrier_bar,
+    signal_bar,
+    noise_bar,
+    general_adjoint,
 ):
     """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
 
@@ -780,7 +854,7 @@ def backward(
     """
     n, m = plan.n, plan.m
     carrier_lu, _ = plan.carrier_matrix(carrier_entries)
-    pre = plan.signal_pre(signal_entries)
+    pre = plan.signal_pre(signal_entries, placing_base)
     F = signal_entries.shape[0]
     carrier_bar = carrier_bar.astype(complex)
     V_bar = np.empty((F, plan.size), complex)
@@ -857,9 +931,9 @@ HOST_KEYS = (
     "noise_system_matrix_indices",
 )
 
-# The reverse pass does not read the dense noise matrix (see `SystemPlan`). Every array handed to a
-# callback is copied, so the 9 MB matrix is left out of the residuals.
-BACKWARD_KEYS = tuple(key for key in HOST_KEYS if key != "noise_matrix")
+# The reverse pass reads neither the dense signal matrix nor the dense noise matrix (see
+# `SystemPlan`). Every array handed to a callback is copied, so both are left out of the residuals.
+BACKWARD_KEYS = tuple(key for key in HOST_KEYS if key not in ("signal_matrix", "noise_matrix"))
 
 
 def supports(arrays):
@@ -888,14 +962,16 @@ def _output_shapes(arrays):
 def _host_forward(optimized_parameters, *host_arrays):
     A = dict(zip(HOST_KEYS, host_arrays))
     entries = EntryPlan(A).values(optimized_parameters)  # derivatives are only taped in the backward pass
-    carrier, X, noise, Y, MU, Z = forward(SystemPlan(A), *entries)
-    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z
+    plan = SystemPlan(A)
+    carrier, X, noise, Y, MU, Z = forward(plan, *entries)
+    base = plan.base_residuals(BASE_ENTRIES_PER_UNKNOWN * plan.m)
+    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z, *base
 
 
 def _host_backward(optimized_parameters, *rest):
     k = len(BACKWARD_KEYS)
     A = dict(zip(BACKWARD_KEYS, rest[:k]))
-    carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
+    carrier, signal, noise, Y, MU, Z, placing_base, base_keys, base_values, carrier_bar, signal_bar, noise_bar = rest[k:]
     F = Y.shape[0]
     entry_plan = EntryPlan(A)
     (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
@@ -903,12 +979,17 @@ def _host_backward(optimized_parameters, *rest):
 
     def general_adjoint(signal_bar):
         # A cotangent outside the detector rows: factorize the complete signal systems once more.
-        plan = SystemPlan(A, noise_base=False)
-        V = plan.signal_values(signal_entries, carrier)
-        lam = np.empty(signal_bar.shape, complex)
-        for f in range(F):
-            lam[f] = plan.signal_lu(V[f]).solve(signal_bar[f].astype(complex), trans="T")
-        return lam
+        keys = np.asarray(base_keys)
+        if keys.size and keys[0] == -2:
+            raise NotImplementedError(
+                "The signal matrix has more constant entries than the fast path keeps for this reverse pass "
+                f"({BASE_ENTRIES_PER_UNKNOWN} per unknown). Raise differometor.fast.BASE_ENTRIES_PER_UNKNOWN "
+                "or use differometor.simulate.simulate_jax."
+            )
+        count = np.count_nonzero(keys >= 0)
+        plan = SystemPlan(A, signal_base=(keys[:count], np.asarray(base_values)[:count]), noise_base=False)
+        factors = plan.signal_factors(plan.signal_values(signal_entries, carrier))
+        return plan.solve_transposed(factors, signal_bar)
 
     entries_bar = backward(
         SystemPlan(A, signal_base=False, noise_base=False),
@@ -920,6 +1001,7 @@ def _host_backward(optimized_parameters, *rest):
         np.asarray(Y),
         np.asarray(MU),
         np.asarray(Z),
+        np.asarray(placing_base),
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar).T,
         np.asarray(noise_bar, float).reshape(F),
@@ -930,7 +1012,10 @@ def _host_backward(optimized_parameters, *rest):
 
 
 def _forward_callback(optimized_parameters, host):
+    """The simulation outputs and the residuals of the reverse pass (Y, MU, Z and `base_residuals`)."""
     n, m, F, noise_shape = _output_shapes(host)
+    placing_count = jax.tree_util.tree_leaves(host["signal_carrier_placing_indices"])[0].shape[-1]
+    base_capacity = BASE_ENTRIES_PER_UNKNOWN * m
     result_shapes = (
         jax.ShapeDtypeStruct((n, 1), jnp.complex128),
         jax.ShapeDtypeStruct((m, F), jnp.complex128),
@@ -938,11 +1023,14 @@ def _forward_callback(optimized_parameters, host):
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
+        jax.ShapeDtypeStruct((placing_count,), jnp.complex128),
+        jax.ShapeDtypeStruct((base_capacity,), jnp.int64),
+        jax.ShapeDtypeStruct((base_capacity,), jnp.complex128),
     )
-    carrier, signal, noise, Y, MU, Z = jax.pure_callback(
+    carrier, signal, noise, *residuals = jax.pure_callback(
         _host_forward, result_shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), vmap_method="sequential"
     )
-    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU, Z)
+    return (carrier, signal, noise.reshape(noise_shape)), tuple(residuals)
 
 
 def _is_primal(x):
@@ -973,26 +1061,22 @@ def _fast_fwd(optimized_parameters, host, others):
         full = lambda p, host, others: simulate_jax(optimized_parameters=p, **host, **others)
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
-    outputs, (Y, MU, Z) = _forward_callback(p, host)
-    return outputs, (p, {key: host[key] for key in BACKWARD_KEYS}, outputs, Y, MU, Z)
+    outputs, residuals = _forward_callback(p, host)
+    return outputs, (p, {key: host[key] for key in BACKWARD_KEYS}, outputs, *residuals)
 
 
 def _fast_bwd(residuals, cotangents):
     cotangents = tuple(_zeros_if_symbolic(c) for c in cotangents)
     if len(residuals) == 1:
         return residuals[0](cotangents)
-    p, host, (carrier, signal, noise), Y, MU, Z = residuals
+    p, host, outputs, *helpers = residuals
     gradient = jax.pure_callback(
         _host_backward,
         jax.ShapeDtypeStruct(p.shape, p.dtype),
         p,
         *(host[k] for k in BACKWARD_KEYS),
-        carrier,
-        signal,
-        noise,
-        Y,
-        MU,
-        Z,
+        *outputs,
+        *helpers,
         *cotangents,
         vmap_method="sequential",
     )
