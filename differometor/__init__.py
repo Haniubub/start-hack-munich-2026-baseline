@@ -33,3 +33,9 @@ def __getattr__(name):
 
 def __dir__():
     return sorted(set(globals()) | {"visualize_setup"})
+
+
+# Collector policy for the run (and bookkeeping of the start-up measures), see _startup.py.
+from differometor import _startup as _startup
+
+_startup.late()
