@@ -29,6 +29,12 @@ as arrays that flow through JAX, so the backward callback can rebuild everything
 It only does so when it has to: a forward pass that is followed by a pullback keeps its
 work on the host in a small cache (`FORWARD_CACHE`), and the pullback finds it through a key
 that travels with the residuals.
+
+The index arrays and base matrices from the build step are host constants
+(`differometor.sparse.Constant`). They have no leaves as pytrees, so they are neither operands
+of the callbacks nor residuals: the callbacks receive the constants themselves, and only the
+design variables, the base parameters and the sweep values travel through JAX. Entries that
+were replaced by JAX arrays travel through JAX as before.
 """
 
 import importlib.machinery

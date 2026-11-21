@@ -40,7 +40,7 @@ or block-shift errors are difficult to debug in linearized optical simulations.
 import numpy as np
 import jax.numpy as jnp
 from differometor.setups import Setup
-from differometor.sparse import BaseMatrix
+from differometor.sparse import BaseMatrix, structure_array
 from collections import defaultdict
 from differometor.components import (
     F,
@@ -82,6 +82,12 @@ _NUMPY_COMPONENTS = rebind_functions(np)
 def _device_array(values, dtype=None) -> jnp.ndarray:
     """Convert on the host, then transfer (`jnp.array(..., dtype=...)` compiles a conversion)."""
     return jnp.asarray(np.asarray(values, dtype=dtype))
+
+
+# Index arrays and other outputs that are fixed for a setup become host constants
+# (`differometor.sparse.Constant`); parameter values, sweep values and the metadata returned next
+# to the simulation arrays stay JAX arrays (`_device_array`).
+_structure_array = structure_array
 
 # ---------------------------------------------------------------------
 # Global state for parameter linking
@@ -1439,12 +1445,12 @@ def build(setup: Setup):
             BaseMatrix.from_dense(carrier_matrix),
             BaseMatrix.from_dense(signal_matrix),
             BaseMatrix.from_dense(noise_matrix),
-            _device_array(noise_selection_vectors, dtype=complex),
-            _device_array(qhd_parameter_indices, dtype=int),
-            _device_array(qhd_placing_indices, dtype=int),
-            _device_array(linked_indices, dtype=int),
-            _device_array(linking_function_indices, dtype=int),
-            _device_array(indices_to_link, dtype=int),
+            _structure_array(noise_selection_vectors, dtype=complex),
+            _structure_array(qhd_parameter_indices, dtype=int),
+            _structure_array(qhd_placing_indices, dtype=int),
+            _structure_array(linked_indices, dtype=int),
+            _structure_array(linking_function_indices, dtype=int),
+            _structure_array(indices_to_link, dtype=int),
         ),
         (
             _device_array(detector_indices, dtype=int),
@@ -1648,10 +1654,10 @@ def pairs_to_arrays(
         if len(arrays["function_input_indices"]) == 0:
             # Dummy update that leaves matrices unchanged.
             return (
-                _device_array([[0, 0, 0]]),
-                _device_array([FUNCTIONS.index(dummy_function)]),
-                _device_array([[0], [0]]),
-                _device_array([[0], [0]]),
+                _structure_array([[0, 0, 0]]),
+                _structure_array([FUNCTIONS.index(dummy_function)]),
+                _structure_array([[0], [0]]),
+                _structure_array([[0], [0]]),
             )
 
         function_input_indices = np.vstack(arrays["function_input_indices"])
@@ -1670,27 +1676,27 @@ def pairs_to_arrays(
                 )
 
             return (
-                _device_array(function_input_indices, dtype=int),
-                _device_array(arrays["function_indices"], dtype=int),
-                _device_array(output_indices, dtype=int),
-                _device_array(system_matrix_indices, dtype=int),
-                _device_array(carrier_solution_indices, dtype=int),
-                _device_array(carrier_solution_placing_indices, dtype=int),
+                _structure_array(function_input_indices, dtype=int),
+                _structure_array(arrays["function_indices"], dtype=int),
+                _structure_array(output_indices, dtype=int),
+                _structure_array(system_matrix_indices, dtype=int),
+                _structure_array(carrier_solution_indices, dtype=int),
+                _structure_array(carrier_solution_placing_indices, dtype=int),
             )
 
         return (
-            _device_array(function_input_indices, dtype=int),
-            _device_array(arrays["function_indices"], dtype=int),
-            _device_array(output_indices, dtype=int),
-            _device_array(system_matrix_indices, dtype=int),
+            _structure_array(function_input_indices, dtype=int),
+            _structure_array(arrays["function_indices"], dtype=int),
+            _structure_array(output_indices, dtype=int),
+            _structure_array(system_matrix_indices, dtype=int),
         )
 
     return (
         (
-            _device_array(optimized_parameter_indices, dtype=int),
-            _device_array(optimization_value_indices, dtype=int),
-            _device_array(carrier_changing_parameter_indices, dtype=int),
-            _device_array(signal_changing_parameter_indices, dtype=int),
+            _structure_array(optimized_parameter_indices, dtype=int),
+            _structure_array(optimization_value_indices, dtype=int),
+            _structure_array(carrier_changing_parameter_indices, dtype=int),
+            _structure_array(signal_changing_parameter_indices, dtype=int),
         ),
         combine_arrays(carrier_arrays),
         combine_arrays(signal_arrays, signal=True),
@@ -1784,18 +1790,16 @@ def prepare_arrays(
         signal_changing_parameter_indices = np.array([0])
         signal_changing_values = np.array([parameters[0][signal_changing_parameter_indices]])
 
-    as_jax = lambda array: None if array is None else _device_array(array)
-    return tuple(
-        as_jax(array)
-        for array in (
-            optimized_parameters,
-            optimized_parameter_indices,
-            optimized_value_indices,
-            carrier_changing_parameter_indices,
-            carrier_changing_values,
-            signal_changing_parameter_indices,
-            signal_changing_values,
-        )
+    # Values stay runtime JAX arrays, index arrays are structure.
+    values = lambda array: None if array is None else _device_array(array)
+    return (
+        values(optimized_parameters),
+        _structure_array(optimized_parameter_indices),
+        _structure_array(optimized_value_indices),
+        _structure_array(carrier_changing_parameter_indices),
+        values(carrier_changing_values),
+        _structure_array(signal_changing_parameter_indices),
+        values(signal_changing_values),
     )
 
 

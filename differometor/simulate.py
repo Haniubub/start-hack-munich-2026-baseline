@@ -12,11 +12,14 @@ The main public entry points are:
 - `run_with_parameter_sets`: run the same setup over many optimized-parameter sets
 
 Conventions used throughout:
-- Arrays are JAX arrays (`jax.numpy`).
+- Arrays are JAX arrays (`jax.numpy`). The build step returns the arrays that describe the
+  structure of a setup (index arrays, constant matrix entries) as host constants, see
+  `differometor.sparse`; `simulate_jax` turns them into JAX arrays on entry.
 - Shapes are documented explicitly for every function.
 - All indices are integer arrays that index into parameter vectors and matrix entries.
 """
 
+import functools
 import jax
 from time import time
 import jax.numpy as jnp
@@ -26,7 +29,7 @@ from differometor.setups import Setup
 from differometor.build import build, pairs_to_arrays, prepare_arrays, LINKING_FUNCTIONS
 from differometor.components import FUNCTIONS, UNIT_VACUUM, H_PLANCK, F0
 from differometor import fast
-from differometor.sparse import dense_matrix
+from differometor.sparse import dense_matrix, device_array
 
 
 jax.config.update("jax_enable_x64", True)
@@ -204,6 +207,17 @@ def expand_parameters(array: jnp.ndarray, indices: jnp.ndarray, values: jnp.ndar
     return tiled_array.at[row_indices, column_indices].set(flat_values)
 
 
+def _constants_on_device(function):
+    """`function` with the host constants among its arguments (`differometor.sparse.Constant`) as JAX arrays."""
+
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        return function(*map(device_array, args), **{name: device_array(value) for name, value in kwargs.items()})
+
+    return wrapped
+
+
+@_constants_on_device
 def simulate_jax(
     # prepared arrays
     optimized_parameters: jnp.ndarray,
@@ -560,7 +574,10 @@ def run_build_step(
     -------
     If `timeit` is False
         simulation_arrays : dict[str, jnp.ndarray]
-            Mapping from `simulate` argument name to the array value.
+            Mapping from `simulate` argument name to the array value. Parameter and sweep
+            values are JAX arrays. Index arrays and the base matrices are host constants
+            (`differometor.sparse.Constant`, `BaseMatrix`): a jitted function that takes this
+            dictionary as an argument is specialized on them, as if they were closed over.
         metadata : tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
             (detector_indices, mirror_indices, beamsplitter_indices, isolator_indices)
 
