@@ -1199,7 +1199,12 @@ def _fast_fwd(optimized_parameters, host, others):
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
     outputs, helpers, noise_shape = _result_shapes(host)
-    if FORWARD_CACHE:
+    # Under `vmap` all forward passes of a batch run before the first pullback, so the small
+    # cache would only serve the last ones. Batched calls therefore take the stateless route.
+    # (The tracer class has no public name any more; if this check stops matching, results stay
+    # correct and a batch only gets slower.)
+    batched = any(type(leaf).__name__ == "BatchTracer" for leaf in jax.tree_util.tree_leaves((p, host)))
+    if FORWARD_CACHE and not batched:
         key = jax.ShapeDtypeStruct((), jnp.float64)
         carrier, signal, noise, token = _call_host(_host_forward_cached, outputs + (key,), p, host)
         return (carrier, signal, noise.reshape(noise_shape)), (p, host, token)

@@ -70,4 +70,11 @@ for i, expected in enumerate(stateless):
     assert np.array_equal(late[2 * i], expected) and np.array_equal(late[2 * i + 1], expected), f"late pullback differs at point {i}"
 jitted = jax.jit(lambda p: jax.vjp(simulate, p)[1](cotangents)[0])
 assert np.array_equal(np.asarray(jitted(points[1])), stateless[1])
-print("forward cache: gradients identical with cache hits, evicted entries, repeated pullbacks and under jit")
+
+# A batch of parameter sets under vmap takes the stateless route and leaves the cache alone.
+fast._forward_cache.clear()
+batch = np.asarray(jax.vmap(lambda p: jax.vjp(simulate, p)[1](cotangents)[0])(jnp.stack(points)))
+assert not fast._forward_cache
+for i, expected in enumerate(stateless):
+    assert np.array_equal(batch[i], expected), f"vmap differs at point {i}"
+print("forward cache: gradients identical with cache hits, evicted entries, repeated pullbacks, under jit and under vmap")
