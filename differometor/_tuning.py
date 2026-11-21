@@ -64,11 +64,12 @@ ONE_CODEGEN_MODULE = True
 UNOPTIMIZED_SMALL_PROGRAMS = True
 
 # XLA rewrites a sum over more than 32 elements into sums over blocks of 32 (a reduce-window kernel
-# in an LLVM module of its own). With this switch small programs keep the plain sum. Off by
-# default: it changes the order of summation, so a mean or sum can differ in the last digits
-# (benchmark: only the scalar loss, 1e-15 relative; the saved arrays stay identical). Benchmark:
-# compile 103 -> 85 ms without UNOPTIMIZED_SMALL_PROGRAMS, 46 -> 43 ms with it.
-PLAIN_SMALL_REDUCTIONS = False
+# in an LLVM module of its own). With this switch small programs keep the plain sum. It changes
+# the order of summation, so a mean or sum can differ in the last digits (benchmark: only the
+# scalar loss, 1e-15 relative; the saved arrays stay identical). Benchmark:
+# compile 103 -> 85 ms without UNOPTIMIZED_SMALL_PROGRAMS, 46 -> 43 ms with it. On since the
+# branch philip-fastest (Xeon 8468, job prof-1726, 20 alternating runs: compile 38.4 -> 35.5 ms).
+PLAIN_SMALL_REDUCTIONS = True
 
 # JAX creates a new MLIR context for every program it lowers (2-3 ms each). With this switch the
 # lowerings of a thread share one context. Outputs identical (the context only owns types and
