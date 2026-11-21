@@ -5,6 +5,11 @@ test uses a loss that reads every carrier, signal and noise value with random we
 general adjoint solve of the fast path (a second factorization in the reverse pass) is exercised,
 and compares the full gradient with `simulate_jax`. It also repeats the benchmark-style readout.
 
+Two more checks on the fast path itself:
+- The frequency block size must not matter (blocks of 1 and 2 against the default).
+- When the constant entries of the signal matrix do not fit into the residuals of the reverse
+  pass, the general adjoint has to fail with a clear message, and the usual readout still works.
+
 Usage: python runs/noel/test_adjoint.py <repo>
 """
 import json
@@ -19,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import differometor as df
+from differometor import fast
 from differometor.setups import constrain_inter_grid_cell_spaces
 from differometor.simulate import simulate_jax
 
@@ -73,3 +79,38 @@ for label, make in (("all outputs, random weights (general adjoint)", general_lo
     print(f"{label:48s} loss {float(value):+.9e} vs {float(value_jax):+.9e}   gradient vs JAX {deviation:.2e}")
 print("WORST", worst)
 assert worst < 1e-5
+
+# Block size: the compiled functions read it in the host callbacks, so they can be reused.
+blocks = 0.0
+if hasattr(fast, "BLOCK_FREQUENCIES"):
+    default = fast.BLOCK_FREQUENCIES
+    for make in (general_loss, readout_loss):
+        function = make(df.simulate)
+        value, gradient = function(parameters)
+        for size in (1, 2):
+            fast.BLOCK_FREQUENCIES = size
+            value_blocked, gradient_blocked = function(parameters)
+            blocks = max(blocks, rel(gradient_blocked, gradient), abs(float(value_blocked - value)) / abs(float(value)))
+        fast.BLOCK_FREQUENCIES = default
+    print(f"block sizes 1 and 2 against {default}: largest deviation {blocks:.2e}")
+    assert blocks < 1e-11
+
+# Residual capacity: with room for one constant entry per unknown the signal matrix does not fit.
+if hasattr(fast, "BASE_ENTRIES_PER_UNKNOWN"):
+    default = fast.BASE_ENTRIES_PER_UNKNOWN
+    fast.BASE_ENTRIES_PER_UNKNOWN = 1
+    try:
+        value, gradient = readout_loss(df.simulate)(parameters)
+        reference_value, reference_gradient = readout_loss(simulate_jax)(parameters)
+        deviation = rel(gradient, reference_gradient)
+        print(f"small residual capacity, benchmark-style readout: gradient vs JAX {deviation:.2e}")
+        assert deviation < 1e-5
+        try:
+            general_loss(df.simulate)(parameters)
+        except Exception as error:
+            assert "BASE_ENTRIES_PER_UNKNOWN" in str(error), error
+            print("small residual capacity, general adjoint: fails with a clear message, as intended")
+        else:
+            raise AssertionError("the general adjoint should have reported the missing constant entries")
+    finally:
+        fast.BASE_ENTRIES_PER_UNKNOWN = default

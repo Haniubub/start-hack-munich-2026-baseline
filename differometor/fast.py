@@ -16,8 +16,10 @@ How it works
   CSC matrices and factorized with SuperLU, the solver behind `scipy.sparse.linalg.splu`.
   The compiled SuperLU module is loaded directly (`_load_superlu`), because importing
   `scipy.sparse.linalg` costs more time than the whole simulation.
-- All frequencies share one sparsity pattern. The elimination order is computed once (see
-  `SystemPlan._analyze`) and reused; per frequency there is one factorization and two solve calls.
+- All frequencies share one sparsity pattern. The scaling and the elimination order are found
+  once (see `SystemPlan._analyze`) and reused. The frequencies are processed in blocks of
+  BLOCK_FREQUENCIES: a block is one block-diagonal system for SuperLU (`_BlockLU`), with one
+  factorization call and two solve calls.
 - The quantum noise of the (single) detector is `Re(y^H N y)` with `y = S^-H w`; the
   same solve is reused as the adjoint helper for the gradient.
 - Reverse mode is written by hand. Cotangents follow JAX's convention for complex
@@ -28,9 +30,16 @@ The JAX integration (`simulate_fast`) is a `jax.custom_vjp` around two
 every residual the backward pass needs as arrays that flow through JAX, and the backward
 callback rebuilds the sparsity plan from them.
 
-JAX copies every array it hands to a callback. The reverse pass therefore gets no dense noise
-matrix and builds its plan from the index arrays alone: only matrix entries that depend on
-parameters receive a cotangent, so the constant entries are not needed there.
+Memory decides much of the run time here. JAX copies every array it hands to a callback and
+every residual that a compiled program passes through, and memory that a callback touches for
+the first time costs a page fault per 4 kB. Therefore:
+
+- The reverse pass gets neither the dense signal matrix nor the dense noise matrix. Only matrix
+  entries that depend on parameters receive a cotangent, so its plan comes from the index arrays;
+  the few values it needs from the signal matrix arrive as small residuals
+  (`SystemPlan.base_residuals`).
+- Both passes work on one block of frequencies at a time, which keeps the intermediate arrays
+  small, and the component functions write their outputs straight into the matrix entries.
 """
 
 import importlib.machinery
@@ -315,37 +324,22 @@ def _rebind_component_functions():
 FUNCTIONS_NUMPY = _rebind_component_functions()
 
 
-def _evaluate(function_index, inputs, columns):
+def _function_outputs(function_index, arguments, columns=()):
     """
-    inputs: (..., rows, k) -> values (..., rows, 4) and Jacobians (..., rows, 4, len(columns)).
+    The four outputs of one component function. `arguments` has one array per function input,
+    of shape (rows, calls) or (1, calls).
 
-    Only the input columns listed in `columns` carry a derivative; the others are plain values.
+    Each output is what the function returns: a scalar, an array that broadcasts to (rows, calls),
+    or a `Dual` of those. Only the inputs listed in `columns` carry a derivative; the others are
+    plain values.
     """
-    lead, width = inputs.shape[:-1], len(columns)
-    seed = np.eye(width)
-    arguments = [inputs[..., j] for j in range(inputs.shape[-1])]
-    for position, j in enumerate(columns):
-        arguments[j] = Dual(arguments[j], seed[position].reshape((width,) + (1,) * len(lead)))
-    outputs = FUNCTIONS_NUMPY[function_index](arguments)
-    values = np.empty(lead + (4,), complex)
-    jacobian = np.zeros(lead + (4, width), complex)
-    for o, item in enumerate(outputs):
-        if isinstance(item, Dual):
-            values[..., o] = item.val
-            if not np.isscalar(item.tan):
-                jacobian[..., o, :] = np.moveaxis(np.broadcast_to(item.tan, (width,) + lead), 0, -1)
-        else:
-            values[..., o] = item
-    return values, jacobian
-
-
-def _evaluate_values(function_index, inputs):
-    """Values only (no derivatives): inputs (..., rows, k) -> (..., rows, 4)."""
-    outputs = FUNCTIONS_NUMPY[function_index]([inputs[..., j] for j in range(inputs.shape[-1])])
-    values = np.empty(inputs.shape[:-1] + (4,), complex)
-    for o, item in enumerate(outputs):
-        values[..., o] = item
-    return values
+    width = len(columns)
+    if width:
+        arguments = list(arguments)
+        seed = np.eye(width)
+        for position, j in enumerate(columns):
+            arguments[j] = Dual(arguments[j], seed[position].reshape(width, 1, 1))
+    return FUNCTIONS_NUMPY[function_index](arguments)
 
 
 def _group_sum(values, order, starts):
@@ -365,6 +359,9 @@ class _EntryBlock:
 
     `changing` lists the parameter columns that differ between the rows (the frequency sweep).
     Calls that read none of them give the same entries in every row and are evaluated once.
+    The other calls get only the inputs that change as (rows, calls) arrays and the rest as
+    (1, calls), so every part of a formula that does not depend on the frequency is also
+    evaluated once (NumPy broadcasting does the rest).
 
     `differentiable` marks the parameter slots that receive a design variable. The reverse pass
     only needs derivatives with respect to those, so every other function input is evaluated as a
@@ -376,45 +373,82 @@ class _EntryBlock:
         self.inputs = np.asarray(function_input_indices)
         function_indices = np.asarray(function_indices)
         self.outputs = np.asarray(output_indices)
-        self.varying = np.isin(self.inputs, np.asarray(changing, int)).any(axis=1)
+        changes = np.isin(self.inputs, np.asarray(changing, int))
+        self.varying = changes.any(axis=1)
         if differentiable is None:
             needed = np.ones(self.inputs.shape, bool)
         else:
             needed = differentiable[self.inputs]
         self.groups = []  # (function index, members, varying, differentiated input columns)
+        self.changes = []  # per group: which function inputs differ between the rows
         for k in np.unique(function_indices):
             for varying in (True, False):
                 members = np.nonzero((function_indices == k) & (self.varying == varying))[0]
                 if members.size:
                     columns = np.nonzero(needed[members].any(axis=0))[0]
                     self.groups.append((int(k), members, varying, columns))
+                    self.changes.append(changes[members].any(axis=0))
 
-    def _gather(self, values):
-        return values[:, self.outputs[0], self.outputs[1]]
+        # For every group and each of its four outputs: the entries that output fills (`slots`) and
+        # the calls of the group they come from (`picks`). The function outputs are written straight
+        # into the entries, without an intermediate (rows, calls, 4) array.
+        calls = self.inputs.shape[0]
+        call_group, call_place = np.empty(calls, np.intp), np.empty(calls, np.intp)
+        for index, (_, members, _, _) in enumerate(self.groups):
+            call_group[members] = index
+            call_place[members] = np.arange(members.size)
+        key = call_group[self.outputs[0]] * 4 + self.outputs[1]
+        order = np.argsort(key, kind="stable")
+        bounds = np.searchsorted(key[order], np.arange(len(self.groups) * 4 + 1))
+        places = call_place[self.outputs[0][order]]
+        self.writes = [
+            [(order[bounds[i] : bounds[i + 1]], places[bounds[i] : bounds[i + 1]]) for i in range(4 * index, 4 * index + 4)]
+            for index in range(len(self.groups))
+        ]
+
+    def _arguments(self, parameters, index):
+        """One array per function input of a group, (R, calls) or (1, calls), and the shape they broadcast to."""
+        _, members, varying, _ = self.groups[index]
+        indices = self.inputs[members]
+        first = parameters[:1]
+        arguments = [(parameters if changes else first)[:, indices[:, j]] for j, changes in enumerate(self.changes[index])]
+        return arguments, (parameters.shape[0] if varying else 1, members.size)
+
+    @staticmethod
+    def _write(entries, write, value, lead):
+        """Put one function output (anything that broadcasts to `lead` = (rows or 1, calls)) into its entries."""
+        slots, picks = write
+        if slots.size:
+            entries[:, slots] = np.broadcast_to(value, lead)[:, picks]
 
     def values(self, parameters):
         """parameters: (R, P) -> entries (R, E), no derivatives."""
-        rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((rows, calls, 4), complex)
-        for function_index, members, varying, _ in self.groups:
-            source = parameters if varying else parameters[:1]
-            values[:, members] = _evaluate_values(function_index, source[:, self.inputs[members]])
-        return self._gather(values)
+        entries = np.empty((parameters.shape[0], self.outputs.shape[1]), complex)
+        for index, ((function_index, _, _, _), writes) in enumerate(zip(self.groups, self.writes)):
+            arguments, lead = self._arguments(parameters, index)
+            for item, write in zip(_function_outputs(function_index, arguments), writes):
+                self._write(entries, write, item, lead)
+        return entries
 
     def run(self, parameters):
-        """parameters: (R, P). Returns entries (R, E) and the Jacobian tape for the reverse pass."""
-        rows, calls = parameters.shape[0], self.inputs.shape[0]
-        values = np.empty((rows, calls, 4), complex)
+        """
+        parameters: (R, P). Returns entries (R, E) and the Jacobian tape for the reverse pass:
+        per group an array (R or 1, calls, 4, differentiated inputs), or None without derivatives.
+        """
+        entries = np.empty((parameters.shape[0], self.outputs.shape[1]), complex)
         tape = []
-        for function_index, members, varying, columns in self.groups:
-            source = parameters if varying else parameters[:1]
-            inputs = source[:, self.inputs[members]]
-            if columns.size:
-                values[:, members], jacobian = _evaluate(function_index, inputs, columns)
-            else:
-                values[:, members], jacobian = _evaluate_values(function_index, inputs), None
+        for index, ((function_index, _, _, columns), writes) in enumerate(zip(self.groups, self.writes)):
+            arguments, lead = self._arguments(parameters, index)
+            width = columns.size
+            jacobian = np.zeros(lead + (4, width), complex) if width else None
+            for o, item in enumerate(_function_outputs(function_index, arguments, columns)):
+                if isinstance(item, Dual):
+                    if not np.isscalar(item.tan):
+                        jacobian[..., o, :] = np.moveaxis(np.broadcast_to(item.tan, (width,) + lead), 0, -1)
+                    item = item.val
+                self._write(entries, writes[o], item, lead)
             tape.append(jacobian)
-        return self._gather(values), tape
+        return entries, tape
 
     def back(self, tape, entries_bar, parameter_count):
         """entries_bar: (R, E) -> real parameter cotangent summed over the rows (P,)."""
@@ -786,7 +820,8 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
         N = plan.noise_values(noise_entries[block])
         count = V.shape[0]
         if start == 0:
-            plan._analyze(V[0])
+            if plan.order is None:
+                plan._analyze(V[0])
             order, position = plan.order, plan.position
             scale = plan.scale[order]
             rhs_places, rhs_scale = position[plan.rhs_rows], plan.scale[plan.rhs_rows]
