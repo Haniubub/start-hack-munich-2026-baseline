@@ -1,6 +1,6 @@
 # Nachtlauf auf Branch `philip-nacht`: was geändert wurde und was es bringt
 
-Stand: Sa 21.11.2026, 07:10. Der Branch enthält `origin/noel` bis `6635856` (05:38) und `origin/max/nacht` (`f1000e9`) und darauf die Änderungen dieser Nacht. Was nicht funktioniert hat, steht in [`FEHLVERSUCHE.md`](FEHLVERSUCHE.md).
+Stand: Sa 21.11.2026, 07:30. Der Branch enthält `origin/noel` bis `6b67cfd` (06:58) und `origin/max/nacht` (`f1000e9`) und darauf die Änderungen dieser Nacht. Was nicht funktioniert hat, steht in [`FEHLVERSUCHE.md`](FEHLVERSUCHE.md).
 
 ## Ergebnis auf x86-Linux
 
@@ -22,6 +22,8 @@ Maschine: Intel Xeon 2,1 GHz (Emerald Rapids, Nachfolge-Generation des Xeon Plat
 | Fehler gegen Feyers Referenz | 5,3742e-06 | 5,3743e-06 | 5,3743e-06 |
 
 Alle drei Spalten stammen aus einer Messreihe (07:03). Zwei Code-Commits kamen danach: `36b3ea7` (ein Callback weniger im Readout, im Minimum rund 5 ms) und Änderung 20 (Vorwärtslauf rund 3 ms).
+
+**Endstand 07:29** (10 Läufe, abwechselnd): `noel` (`6b67cfd`, vierte Runde) 712,4 / 686,9 ms, `philip-nacht` (`010b1b0`) **610,0 / 568,4 ms**. Lower 40,2 → 32,3, Kompilieren 223,9 → 168,1, Vorwärtslauf 75,5 → 52,8, Gradient 34,9 → 10,3, Sensitivität 3,1 → 1,8, warm gesamt 84,1 → 53,1 ms.
 
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
