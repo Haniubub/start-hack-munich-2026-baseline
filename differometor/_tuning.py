@@ -415,6 +415,32 @@ def _bind_jit(*args, **params):
 _applied = False
 
 
+def _code_objects(function):
+    """The code object of `function` and of everything defined inside it."""
+    pending = [inspect.unwrap(function).__code__]
+    while pending:
+        code = pending.pop()
+        yield code
+        pending.extend(constant for constant in code.co_consts if isinstance(constant, types.CodeType))
+
+
+def _names_used(function):
+    """The global and attribute names the compiled function refers to."""
+    return {name for code in _code_objects(function) for name in code.co_names}
+
+
+def _texts_used(function):
+    """The string constants of the compiled function, keyword names of its calls included."""
+    texts = set()
+    for code in _code_objects(function):
+        for constant in code.co_consts:
+            if isinstance(constant, str):
+                texts.add(constant)
+            elif isinstance(constant, tuple):
+                texts.update(item for item in constant if isinstance(item, str))
+    return texts
+
+
 def _read_environment():
     """Apply `DIFFEROMETOR_TUNING`; returns False if it asks for no tuning at all."""
     text = os.environ.get("DIFFEROMETOR_TUNING", "").strip()
@@ -487,7 +513,9 @@ def _install_lowering_in_place():
     parameters = list(inspect.signature(original).parameters.values())
     if [p.name for p in parameters[:2]] != ["module_name", "jaxpr"] or any(p.kind is not p.KEYWORD_ONLY for p in parameters[2:]):
         raise TypeError("lower_jaxpr_to_module has another signature than expected")
-    if type(mlir._uncacheable_primitives) is not set or "_uncacheable_primitives" not in inspect.getsource(mlir.jaxpr_subcomp):
+    # Asked of the compiled function: reading its source text (inspect.getsource) costs 1 to 2 ms
+    # per function at import, for the same answer.
+    if type(mlir._uncacheable_primitives) is not set or "_uncacheable_primitives" not in _names_used(mlir.jaxpr_subcomp):
         raise TypeError("the lowering does not decide about caching the way this measure expects")
     _jaxprs_in_params = core.jaxprs_in_params
     _jax_lower_jaxpr_to_module = original
@@ -506,8 +534,7 @@ def _install_bind_jit():
     primitive = pjit.jit_p
     if not primitive.multiple_results or "bind" in vars(primitive):
         raise TypeError("the jit primitive is not what this measure expects")
-    source = inspect.getsource(pjit.pjit_staging_rule)
-    if not all(f'"{name}"' in source or f"'{name}'" in source for name in needed):
+    if not _texts_used(pjit.pjit_staging_rule).issuperset(needed):
         raise TypeError("the jit primitive has other parameters than expected")
     _bind_jit_parts = (core.trace_ctx, (ad.LinearizeTrace, ad.JVPTrace), core.eval_jaxpr, UnspecifiedValue, core.Ref)
     _jax_bind_jit = primitive.bind

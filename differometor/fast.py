@@ -121,7 +121,17 @@ def _load_sparsetools():
     return None
 
 
-_sparsetools = _load_sparsetools()
+# Only `_CondensedLU` uses these kernels. With the native kernel a run never gets there, so the
+# module is loaded the first time it is asked for (`_csr_kernels`). None: not available.
+_UNLOADED = object()
+_sparsetools = _UNLOADED
+
+
+def _csr_kernels():
+    global _sparsetools
+    if _sparsetools is _UNLOADED:
+        _sparsetools = _load_sparsetools()
+    return _sparsetools
 
 
 def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", small_supernodes=False):
@@ -852,7 +862,8 @@ class _BlockCSR:
 
     def subtract(self, x, transposed=False):
         flat = x.reshape(-1)
-        kernel = _sparsetools.csc_matvecs if transposed else _sparsetools.csr_matvecs
+        kernels = _csr_kernels()
+        kernel = kernels.csc_matvecs if transposed else kernels.csr_matvecs
         kernel(self.total, self.total, x.shape[2], self.pointers, self.indices, self.data, flat, flat)
 
 
@@ -959,7 +970,7 @@ class _CondensedLU:
         ids, used = np.arange(entries), entries
         self.stages = []
         remaining = np.ones(size, bool)
-        if _sparsetools is not None and self.MAX_STAGES:
+        if _csr_kernels() is not None and self.MAX_STAGES:
             square = np.zeros(store.shape[0])
             one = np.zeros(store.shape[0], bool)
             square[:entries] = _largest_square(store[:entries])
