@@ -112,4 +112,4 @@ python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 | 1 | Im Rückwärtslauf nicht neu rechnen, was der Vorwärtslauf schon hatte (Pläne, `signal_values`, Dual-Auswertung der Einträge) | 10–14 ms | Braucht einen Zwischenspeicher auf der Host-Seite, die Callbacks sind dann nicht mehr zustandslos |
 | 2 | Verwaltung der Vorab-Elimination straffen (Auswahl und Schur-Komplement kosten zusammen 12 ms) | 3–6 ms | Kleinteilig |
 | 3 | Rückwärtsformeln im Layout `(Einträge, F)` rechnen statt `(F, Einträge)` | 3–4 ms | Y, MU und Z müssten als Residuen anders liegen |
-| 4 | XLA-Flags für schnelleres Kompilieren | bis 250 ms | Regelfrage B6 |
+| 4 | XLA-Flags für schnelleres Kompilieren | rund 100 ms. Nur zur Einordnung gemessen, nicht eingebaut: `XLA_FLAGS=--xla_backend_optimization_level=0` senkt Readout von 185 auf 120 ms und Gradient von 91 auf 68 ms | Regelfrage B6 |
