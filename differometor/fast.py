@@ -24,9 +24,11 @@ How it works
   values (bilinear pairing), so signal adjoints solve with `S^-T`, not `S^-H`.
 
 The JAX integration (`simulate_fast`) is a `jax.custom_vjp` around two
-`jax.pure_callback`s. The callbacks keep no Python state: the forward callback returns
-every residual the backward pass needs as arrays that flow through JAX, and the backward
-callback rebuilds the sparsity plan from them.
+`jax.pure_callback`s. The forward callback returns every residual the backward pass needs
+as arrays that flow through JAX, so the backward callback can rebuild everything from them.
+It only does so when it has to: a forward pass that is followed by a pullback keeps its
+plans, matrix entries and factorization in a small cache (`FORWARD_CACHE`), and the pullback
+finds them through a key that travels with the residuals.
 """
 
 import importlib.machinery
@@ -816,6 +818,9 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     Y = conj(Z conj(w_d)) here and the signal adjoint S^-T signal_bar in `backward` without a
     second factorization, whenever the cotangent of the signal lives on the detector rows.
 
+    The last return value (carrier factorization, signal matrix values, placing pre-values) is
+    what `backward` would otherwise compute a second time.
+
     Per frequency this takes one factorization and two solves with two right-hand sides each:
     first S^T Z = [e_d], then S [X, MU] = [rhs, (N + N^H) Y / 2]. Simple unknowns are eliminated
     exactly beforehand and the rest goes through SuperLU as one block-diagonal system for all
@@ -825,7 +830,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
     carrier = carrier_lu.solve(carrier_rhs)
-    V, _ = plan.signal_values(signal_entries, carrier)
+    V, pre = plan.signal_values(signal_entries, carrier)
     w = plan.detector_weights(carrier)
     N = plan.noise_values(noise_entries)
     F = V.shape[0]
@@ -850,7 +855,7 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     X = np.ascontiguousarray(solutions[:, :, 0])
     MU = np.ascontiguousarray(solutions[:, :, 1])
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, X, noise, Y, MU, Z
+    return carrier, X, noise, Y, MU, Z, (carrier_lu, V, pre)
 
 
 def _signal_adjoint(plan, V, Z, signal_bar):
@@ -865,11 +870,19 @@ def _signal_adjoint(plan, V, Z, signal_bar):
     return lam
 
 
-def backward(plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar):
-    """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention)."""
+def backward(
+    plan, carrier_entries, signal_entries, carrier, X, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar, kept=None
+):
+    """Cotangents of the carrier, signal and noise entries (JAX's bilinear convention).
+
+    `kept` is the last return value of `forward` for the same inputs, when it is still available.
+    """
     n, m = plan.n, plan.m
-    carrier_lu, _ = plan.carrier_matrix(carrier_entries)
-    V, pre = plan.signal_values(signal_entries, carrier)
+    if kept is None:
+        carrier_lu, _ = plan.carrier_matrix(carrier_entries)
+        V, pre = plan.signal_values(signal_entries, carrier)
+    else:
+        carrier_lu, V, pre = kept
     F = V.shape[0]
     carrier_bar = carrier_bar.astype(complex).copy()
     V_bar = np.empty((F, plan.size), complex)
@@ -959,22 +972,49 @@ def _output_shapes(arrays):
     return n, m, F, noise_shape
 
 
-def _host_forward(optimized_parameters, *host_arrays):
+# Work of the forward pass that the backward pass can reuse: both plans, the matrix entries
+# with their Jacobian tape, the signal matrix values and the carrier factorization. This is a
+# shortcut only. Everything the backward pass needs still flows through JAX as residuals, and
+# when the entry of a pullback is gone, or FORWARD_CACHE is off, it is recomputed from them.
+FORWARD_CACHE = True
+_FORWARD_CACHE_SIZE = 2
+_forward_cache = {}
+
+
+def _host_forward(optimized_parameters, *host_arrays, taped=False):
     A = dict(zip(HOST_KEYS, host_arrays))
-    entries = EntryPlan(A).values(optimized_parameters)  # derivatives are only taped in the backward pass
-    carrier, X, noise, Y, MU, Z = forward(SystemPlan(A), *entries)
-    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z
+    entry_plan, plan = EntryPlan(A), SystemPlan(A)
+    if taped:  # a pullback will follow: evaluate the entries with derivatives once, here
+        entries, tape = entry_plan.entries(optimized_parameters)
+    else:
+        entries, tape = entry_plan.values(optimized_parameters), None
+    carrier, X, noise, Y, MU, Z, kept = forward(plan, *entries)
+    token = 0
+    if taped:
+        token = int.from_bytes(os.urandom(6), "little") + 1  # exact in float64, never reused in practice
+        while len(_forward_cache) >= _FORWARD_CACHE_SIZE:
+            del _forward_cache[next(iter(_forward_cache))]
+        _forward_cache[token] = (np.array(optimized_parameters, float), entry_plan, plan, entries, tape, kept)
+    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z, np.float64(token)
+
+
+def _host_forward_taped(optimized_parameters, *host_arrays):
+    return _host_forward(optimized_parameters, *host_arrays, taped=FORWARD_CACHE)
 
 
 def _host_backward(optimized_parameters, *rest):
     k = len(HOST_KEYS)
-    A = dict(zip(HOST_KEYS, rest[:k]))
-    carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
+    carrier, signal, noise, Y, MU, Z, token, carrier_bar, signal_bar, noise_bar = rest[k:]
     F = Y.shape[0]
-    entry_plan = EntryPlan(A)
-    (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
+    cached = _forward_cache.get(int(token))
+    if cached is not None and np.array_equal(cached[0], optimized_parameters):
+        _, entry_plan, plan, (carrier_entries, signal_entries, _), tape, kept = cached
+    else:
+        A = dict(zip(HOST_KEYS, rest[:k]))
+        entry_plan, plan, kept = EntryPlan(A), SystemPlan(A), None
+        (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
     entries_bar = backward(
-        SystemPlan(A),
+        plan,
         carrier_entries,
         signal_entries,
         np.asarray(carrier)[:, 0],
@@ -986,12 +1026,13 @@ def _host_backward(optimized_parameters, *rest):
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar).T,
         np.asarray(noise_bar, float).reshape(F),
+        kept=kept,
     )
     gradient = entry_plan.pullback(tape, *entries_bar, value_count=optimized_parameters.shape[0])
     return gradient.astype(optimized_parameters.dtype)
 
 
-def _forward_callback(optimized_parameters, host):
+def _forward_callback(optimized_parameters, host, taped=False):
     n, m, F, noise_shape = _output_shapes(host)
     result_shapes = (
         jax.ShapeDtypeStruct((n, 1), jnp.complex128),
@@ -1000,11 +1041,16 @@ def _forward_callback(optimized_parameters, host):
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
+        jax.ShapeDtypeStruct((), jnp.float64),  # key into the forward cache, see FORWARD_CACHE
     )
-    carrier, signal, noise, Y, MU, Z = jax.pure_callback(
-        _host_forward, result_shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), vmap_method="sequential"
+    carrier, signal, noise, Y, MU, Z, token = jax.pure_callback(
+        _host_forward_taped if taped else _host_forward,
+        result_shapes,
+        optimized_parameters,
+        *(host[k] for k in HOST_KEYS),
+        vmap_method="sequential",
     )
-    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU, Z)
+    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU, Z, token)
 
 
 def _is_primal(x):
@@ -1035,15 +1081,15 @@ def _fast_fwd(optimized_parameters, host, others):
         full = lambda p, host, others: simulate_jax(optimized_parameters=p, **host, **others)
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
-    outputs, (Y, MU, Z) = _forward_callback(p, host)
-    return outputs, (p, host, outputs, Y, MU, Z)
+    outputs, (Y, MU, Z, token) = _forward_callback(p, host, taped=True)
+    return outputs, (p, host, outputs, Y, MU, Z, token)
 
 
 def _fast_bwd(residuals, cotangents):
     cotangents = tuple(_zeros_if_symbolic(c) for c in cotangents)
     if len(residuals) == 1:
         return residuals[0](cotangents)
-    p, host, (carrier, signal, noise), Y, MU, Z = residuals
+    p, host, (carrier, signal, noise), Y, MU, Z, token = residuals
     gradient = jax.pure_callback(
         _host_backward,
         jax.ShapeDtypeStruct(p.shape, p.dtype),
@@ -1055,6 +1101,7 @@ def _fast_bwd(residuals, cotangents):
         Y,
         MU,
         Z,
+        token,
         *cotangents,
         vmap_method="sequential",
     )
