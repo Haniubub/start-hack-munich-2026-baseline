@@ -26,6 +26,7 @@ from differometor.setups import Setup
 from differometor.build import build, pairs_to_arrays, prepare_arrays, LINKING_FUNCTIONS
 from differometor.components import FUNCTIONS, UNIT_VACUUM, H_PLANCK, F0
 from differometor import fast
+from differometor.sparse import dense_matrix
 
 
 jax.config.update("jax_enable_x64", True)
@@ -322,6 +323,9 @@ def simulate_jax(
     - Conjugation and block manipulation follow the conventions used for upper and lower
       sidebands in frequency-domain interferometer models.
     """
+    # The build step stores the base matrices sparse (`differometor.sparse.BaseMatrix`).
+    carrier_matrix, signal_matrix, noise_matrix = map(dense_matrix, (carrier_matrix, signal_matrix, noise_matrix))
+
     # Insert optimized parameter values into the base parameter row.
     parameters = parameters.at[[0], optimized_parameter_indices].set(
         optimized_parameters[optimized_value_indices]

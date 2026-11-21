@@ -40,6 +40,7 @@ import numpy as np
 
 import differometor.components as components
 from differometor.components import UNIT_VACUUM, H_PLANCK, F0
+from differometor.sparse import base_entries
 
 NOISE_SCALE = UNIT_VACUUM * H_PLANCK * F0 * 0.25
 
@@ -420,12 +421,6 @@ class EntryPlan:
 # ---------------------------------------------------------------------
 
 
-def _flat_nonzero(matrix):
-    """Flat indices of the nonzero entries of a complex matrix (faster than `np.flatnonzero`)."""
-    parts = np.ascontiguousarray(matrix).view(np.float64).reshape(-1, 2) != 0
-    return np.flatnonzero(parts[:, 0] | parts[:, 1])
-
-
 def _last_writer(rows, columns, width):
     """Mask of scatter entries that survive `.at[rows, columns].set(...)` (last write wins)."""
     flat = rows * width + columns
@@ -440,10 +435,13 @@ class SystemPlan:
 
     def __init__(self, A):
         get = lambda key: np.asarray(A[key])
-        self.carrier_base = get("carrier_matrix")
-        self.n = n = self.carrier_base.shape[0]
-        signal_base = get("signal_matrix")
-        self.m = m = signal_base.shape[0]
+        # Base matrices arrive as sparse entries (`BaseMatrix`) or, from older callers, dense.
+        carrier_index, carrier_values, (n, _) = base_entries(A["carrier_matrix"])
+        signal_index, signal_values, (m, _) = base_entries(A["signal_matrix"])
+        self.n, self.m = n, m
+        # The carrier system is small (n x (n + 1)), so its base stays dense on the host.
+        self.carrier_base = np.zeros((n, n + 1), complex)
+        self.carrier_base.reshape(-1)[carrier_index] = carrier_values
 
         # Carrier system: pattern of the n x n matrix, right-hand side in column n.
         self.cmi = get("carrier_matrix_indices") % np.array([[n], [n + 1]])
@@ -460,12 +458,13 @@ class SystemPlan:
         smi = get("signal_matrix_indices") % np.array([[m], [m + 1]])
         placing = get("signal_carrier_placing_indices") % np.array([[m], [m + 1]])
         self.signal_carrier_indices = get("signal_carrier_indices").ravel()
-        base_rows, base_cols = np.divmod(_flat_nonzero(signal_base), m + 1)
         key = lambda rows, cols: cols * m + rows
-        keys = np.unique(np.concatenate([key(base_rows, base_cols), key(smi[0], smi[1]), key(placing[0], placing[1])]))
+        base_keys = key(*np.divmod(signal_index, m + 1))
+        keys = np.unique(np.concatenate([base_keys, key(smi[0], smi[1]), key(placing[0], placing[1])]))
         cols, rows = np.divmod(keys, m)
         self.rows, self.cols, self.size = rows, cols, rows.size
-        self.signal_base = signal_base[rows, cols]
+        self.signal_base = np.zeros(keys.size, complex)
+        self.signal_base[np.searchsorted(keys, base_keys)] = signal_values
         self.update_positions = np.searchsorted(keys, key(smi[0], smi[1]))
         self.update_live = _last_writer(smi[0], smi[1], m + 1)
         self.placing_positions = np.searchsorted(keys, key(placing[0], placing[1]))
@@ -483,15 +482,14 @@ class SystemPlan:
         self.rhs_rows = rows[~self.in_matrix]
 
         # Noise matrix: base entries plus entries written by noise component functions.
-        noise_base = get("noise_matrix")
+        noise_index, noise_values, _ = base_entries(A["noise_matrix"])
         nmi = get("noise_system_matrix_indices") % m
         self.noise_live = _last_writer(nmi[0], nmi[1], m)
-        base = _flat_nonzero(noise_base)
-        base = base[~np.isin(base, nmi[0] * m + nmi[1])]
-        base_rows, base_cols = np.divmod(base, m)
+        constant = ~np.isin(noise_index, nmi[0] * m + nmi[1])
+        base_rows, base_cols = np.divmod(noise_index[constant], m)
         self.noise_rows = np.concatenate([base_rows, nmi[0][self.noise_live]])
         self.noise_cols = np.concatenate([base_cols, nmi[1][self.noise_live]])
-        self.noise_base = noise_base[base_rows, base_cols]
+        self.noise_base = noise_values[constant]
         self.noise_by_row = _grouping(self.noise_rows)
         self.noise_by_col = _grouping(self.noise_cols)
         self.selection = get("noise_selection_vectors")[0, 0]

@@ -40,6 +40,7 @@ or block-shift errors are difficult to debug in linearized optical simulations.
 import numpy as np
 import jax.numpy as jnp
 from differometor.setups import Setup
+from differometor.sparse import BaseMatrix
 from collections import defaultdict
 from differometor.components import (
     F,
@@ -1434,9 +1435,10 @@ def build(setup: Setup):
         (carrier_instructions, signal_instructions, noise_instructions, signal_components, parameter_names),
         (
             _device_array([parameters], dtype=complex),
-            _device_array(carrier_matrix),
-            _device_array(signal_matrix),
-            _device_array(noise_matrix, dtype=complex),
+            # The three base matrices are stored sparse, see `differometor.sparse`.
+            BaseMatrix.from_dense(carrier_matrix),
+            BaseMatrix.from_dense(signal_matrix),
+            BaseMatrix.from_dense(noise_matrix),
             _device_array(noise_selection_vectors, dtype=complex),
             _device_array(qhd_parameter_indices, dtype=int),
             _device_array(qhd_placing_indices, dtype=int),
