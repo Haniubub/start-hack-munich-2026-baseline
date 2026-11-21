@@ -235,7 +235,7 @@ Zusammen auf der Cloud-Maschine (8 Läufe, abwechselnd): `d043e68` 679,1 / 576,5
 
 Noch nicht übernommen, liegen als Branches vor: `sub/imports` (Pause des Garbage Collectors und träge JAX-Module während `import jax`, braucht einen Träger vor `import jax`: `.pth`-Datei aus `pip install -e .` oder eine Datei `statistics.py` neben `benchmark.py`; dazu als eigene, abgeschaltete Stufe der Vorimport vor dem Timer) und `sub/cache` (Compile-Cache trotz Zeile 170 von `benchmark.py`, opt-in).
 
-## Branch `philip-fastest` (Sa 21.11.2026, 18:35)
+## Branch `philip-fastest` (Sa 21.11.2026, 20:00)
 
 Abzweig von `philip-nacht` (`38f670e`). Alle Zahlen: Nebius-VM, Intel Xeon Platinum 8468, Python 3.12.3, `python benchmark.py --cpus 1 --repeats 3`, frische Prozesse im Wechsel, Median / Minimum in ms, alle Läufe `PASS`. Rohdaten in `_nacht/vm/jobs/` auf dem Branch `philip`.
 
@@ -250,6 +250,22 @@ Abzweig von `philip-nacht` (`38f670e`). Alle Zahlen: Nebius-VM, Intel Xeon Plati
 
 | 31 | Die jit-Objekte von JAX' eigenen Funktionen entstehen erst bei der ersten Nutzung (`LAZY_JITS`): `import jax` dekoriert 234 Funktionen mit `jax.jit`, ein Lauf ruft rund 15 davon auf | `_startup.py` | Auftrag `jits-1825`, 14 Läufe: Erstlauf 316,3 → 305,9, Imports 192,9 → 182,9 |
 
+| 32 | Balanced-Homodyne-Detektoren (`qhd`) im schnellen Weg: Phasenfaktor auf dem Auswahlvektor des Rauschdetektors (`EntryPlan.selection`), Ableitung nach der Phase, falls sie Designvariable ist (`selection_cotangent`). Nach Noels `8cb5eff` | `fast.py`, `simulate.py` | Auftrag `homodyn-1944`: Homodyne-Variante des Benchmark-Setups 35 505 (Auftrag `stand-1642`) → 323 ms. Öffentliches Setup unverändert (14 Läufe: 319,2 → 320,3, Ausgaben bit-identisch) |
+
+**Stand mit 32 auf Varianten des Setups, Auftrag `homodyn-1944`** (offizieller `benchmark.py`, Referenz aus dem Original-Code auf derselben VM, je 3 Läufe, Erstlauf-Median, alle `PASS`, Fehler höchstens 3,6e-08):
+
+| Variante | Auslese | `philip-fastest` | `noel` (`91baf9c`) |
+| --- | --- | ---: | ---: |
+| Benchmark-Setup mit Homodyne statt Detektor | Homodyne | 323,4 | 718,5 |
+| Zufalls-UIFO Seed 0 | Homodyne | 317,3 | 706,7 |
+| Zufalls-UIFO Seed 1 | Homodyne | 324,7 | 703,4 |
+| Zufalls-UIFO Seed 4 | Homodyne | 313,5 | 708,0 |
+| Benchmark-Setup, Werte leicht verändert | Detektor | 316,1 | 701,5 |
+| Benchmark-Setup, ein Zentrum und eine Quelle getauscht | Detektor | 316,4 | 687,9 |
+| Zufalls-UIFO Seed 2 | Detektor | 311,9 | 697,4 |
+
+Diese Messreihe lief am Abend rund 4 % langsamer als die Reihe `jits-1825` (Imports 190 statt 183 ms).
+
 **Stand mit 31 gegen `e842662`, Auftrag `jits-1825`:** Erstlauf 316,3 / 306,7 → **305,9 / 301,4 ms**. Ausgaben bit-identisch.
 
 **Stand `03ec2a3` gegen `50341f9` (25 bis 27), Auftrag `neu-1804`:** Erstlauf 355,8 / 344,5 → **315,3 / 309,5 ms**, Imports 225,3 → 192,7, Lower 31,6 → 25,8, alles andere gleich. Ausgaben und Gradient sind bit-identisch zum Stand davor.
@@ -262,7 +278,10 @@ Was man wissen muss:
 - **31 im Detail.** `jax.jit` gibt für Funktionen aus einem `jax.`-Modul ein `_LazyJit` zurück. Es trägt Name, Docstring, Signatur und `_fun` wie das echte Objekt, lässt sich als Methode binden und baut das echte jit-Objekt mit JAX' eigenem `make_jit` beim ersten Aufruf oder beim ersten Zugriff auf `.lower`, `.trace`, `._jit_info` und Ähnliches. Funktionen von ausserhalb (also auch die aus `benchmark.py`) bekommen sofort das echte Objekt. Zwei sichtbare Unterschiede: `type(jnp_funktion)` ist `_LazyJit` statt `PjitFunction`, und ein Fehler, der durch eine solche Funktion läuft, hat im Traceback eine zusätzliche Zeile aus `_startup.py`.
 - **Prüfen:** `python runs/flags/test_tuning.py` und `python runs/philip/test_startup.py`, beide auch unter Linux mit Python 3.12.3 gelaufen. `test_startup.py` lässt dazu `runs/philip/jax_battery.py` (83 JAX-Aufrufe: jax.numpy, Array-Methoden, grad, vmap, jit, Kontrollfluss, Zufall, Fehlerfälle) einmal mit und einmal ohne alle Start-Massnahmen laufen und vergleicht Zahlen, Namen, Signaturen und Fehlermeldungen.
 - **Schalter:** `DIFFEROMETOR_STARTUP=gc,lazy` nimmt 28, 29 und 31 heraus (`gc,lazy,defer,dataclass` nur 31), `DIFFEROMETOR_TUNING=INLINE_JITS_UNDER_AD=0,DIRECT_LOWERING_SMALL_PROGRAMS=0` nimmt 30 heraus, `ENABLED = False` in `statistics.py` alle Start-Massnahmen.
-- **Offen:** Balanced-Homodyne-Setups laufen auf diesem Branch weiter über den dichten JAX-Weg (35,5 s auf dem Xeon, Auftrag `stand-1642`). Noels `8cb5eff` zeigt den Umbau.
+- **32 im Detail.** Ein Homodyne-Detektor ist weiter ein einziger Rauschdetektor; sein zweiter Port bekommt in beiden Seitenbändern den Faktor exp(i·Phase). Beim Readout des Benchmarks (`signals[0] - signals[1]`) und Phase 180° ist der Kotangent des Signals ein Vielfaches der Detektorgewichte, dann gilt die Abkürzung aus Änderung 14. Bei jeder anderen Phase kostet der Rückwärtslauf eine weitere Lösung mit der Zerlegung des Vorwärtslaufs. `runs/philip/test_homodyne.py` vergleicht mit `simulate_jax`: gespeichertes Setup `uifo_20_5000.json`, andere Phasen, Phase als Designvariable, andere Readouts, Zufalls-UIFOs, Voyager, zustandslose Callbacks, `vmap`. Grösste Abweichung von ln s 1,1e-09, Gradient 4,2e-09 (VM, nativer Kern).
+- **Schlecht konditionierte Setups.** Beim Zufalls-UIFO 3×3 mit Seed 1 und den Startwerten des Generators (Konditionszahl 1e15) weichen schneller Weg und `simulate_jax` um 3e-04 in ln s ab. Gegen eine exakt nachgerechnete Lösung (Nachiteration mit rational summierten Residuen) liegt der schnelle Weg an den Detektorzeilen 3e-11 daneben, `simulate_jax` 2e-05. Bei einem solchen Setup wäre Feyers Referenz selbst ungenauer als die Toleranz 1e-5.
+- **Offen:** Verknüpfte Parameter (Amplitudenmodulation), mehrere Carrier-Arbeitspunkte und mehr als ein Rauschdetektor laufen weiter über den dichten JAX-Weg. Ebenso jedes `df.run(...)` ohne Designvariablen: Der Build setzt dann einen Platzhalter vom Typ complex ein, den `fast.supports` ablehnt (betrifft `examples/aligo.py` und `examples/uifo.py`; mit reellem Platzhalter 6,7 s → 0,04 s auf dem M4, nur gemessen, nicht eingebaut).
+- **Prüfskripte richtig starten.** Mehrere Skripte unter `runs/` setzen den Suchpfad nicht selbst. Ohne `PYTHONPATH=.` prüfen sie das installierte Paket statt dieses Checkouts.
 
 Gemessen und nicht eingebaut (`prof-1726`, je 20 Läufe): `SHORT_LOCATIONS_AT_IMPORT`, `INLINE_DISPATCH_AT_IMPORT` und `DIFFEROMETOR_GC=off` bringen je höchstens 0,5 ms. `--xla_disable_all_hlo_passes` macht das Kompilieren von Readout und Gradient langsamer und bricht Programme mit Scatter.
 

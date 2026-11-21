@@ -1,9 +1,11 @@
 """
 Fast host-side simulation path: sparse LU solves with SuperLU and a hand-written adjoint.
 
-`differometor.simulate.simulate` dispatches here for setups without parameter linking,
-without homodyne detectors (qhd), with exactly one quantum noise detector and a single
-carrier operating point. Everything else uses the original JAX implementation.
+`differometor.simulate.simulate` dispatches here for setups without parameter linking, with
+exactly one quantum noise detector (a `qnoised` or a balanced homodyne detector `qhd`) and a
+single carrier operating point. Everything else uses the original JAX implementation.
+A balanced homodyne detector reads two ports, the second one with a phase factor from its
+`phase` parameter (`EntryPlan.selection`); the phase may be a design variable.
 
 How it works
 ------------
@@ -439,6 +441,13 @@ class EntryPlan:
             if np.any(np.imag(values) != 0):
                 raise ValueError("fast path requires real changing values")
         changing = self.signal_changing_indices
+        # Balanced homodyne detector (qhd): the entries `qhd_places` of the noise detector's
+        # selection vector carry the factor exp(1j * phase), phase in degrees (`selection`).
+        self.qhd_parameter_indices = np.asarray(A["qhd_parameter_indices"], np.intp).reshape(-1)
+        self.qhd_places = np.asarray(A["qhd_placing_indices"], np.intp).reshape(-1, 3)[:, 2]
+        self.selection_base = np.asarray(A["noise_selection_vectors"])[0, 0]
+        # Only a phase that is a design variable needs the cotangent of the selection vector.
+        self.phase_is_design_variable = bool(np.isin(self.qhd_parameter_indices, self.optimized_parameter_indices).any())
         # Parameter slots whose derivative reaches a design variable (see `pullback`).
         differentiable = np.zeros(self.base.size, bool)
         differentiable[self.optimized_parameter_indices] = True
@@ -449,9 +458,27 @@ class EntryPlan:
         )
         self.carrier, self.signal, self.noise = block("carrier"), block("signal", changing), block("noise", changing)
 
-    def _rows(self, optimized_parameters):
+    def _design_row(self, optimized_parameters):
+        """The parameter row with the design variables in place, before the sweeps."""
         P = self.base.copy()
         P[self.optimized_parameter_indices] = np.asarray(optimized_parameters, float)[self.optimized_value_indices]
+        return P
+
+    def selection(self, optimized_parameters):
+        """
+        The selection vector of the noise detector, shape (m,). A balanced homodyne detector
+        multiplies the entries of its second port by exp(1j * phase), as `simulate_jax` does
+        with `lax.scatter_mul`. Without one this is the stored vector itself.
+        """
+        selection = self.selection_base
+        if self.qhd_parameter_indices.size:
+            phases = np.exp(1j * np.radians(self._design_row(optimized_parameters)[self.qhd_parameter_indices]))
+            selection = selection.astype(complex)
+            np.multiply.at(selection, self.qhd_places, phases)
+        return selection
+
+    def _rows(self, optimized_parameters):
+        P = self._design_row(optimized_parameters)
         carrier_rows = np.tile(P, (self.carrier_changing_values.shape[1], 1))
         carrier_rows[:, self.carrier_changing_indices] = np.real(self.carrier_changing_values).T
         signal_rows = np.tile(carrier_rows[0], (self.signal_changing_values.shape[1], 1))
@@ -470,10 +497,12 @@ class EntryPlan:
         noise, noise_tape = self.noise.run(signal_rows)
         return (carrier[:, 0], signal, noise), (carrier_tape, signal_tape, noise_tape)
 
-    def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count, compact=False):
+    def pullback(self, tape, carrier_bar, signal_bar, noise_bar, value_count, compact=False, optimized_parameters=None, selection_bar=None):
         """Gradient with respect to the design variables from the cotangents of the entries.
 
         With `compact`, `signal_bar` only has the rows of `self.signal.wanted` (see `backward`).
+        `selection_bar` is the cotangent of `selection(optimized_parameters)`; it is needed when
+        the phase of a balanced homodyne detector is a design variable.
         """
         carrier_tape, signal_tape, noise_tape = tape
         parameter_count = self.base.size
@@ -483,6 +512,11 @@ class EntryPlan:
         signal_rows_bar[self.signal_changing_indices] = 0.0  # overwritten by the sweep values
         P_bar = self.carrier.back(carrier_tape, carrier_bar[:, None], parameter_count) + signal_rows_bar
         P_bar[self.carrier_changing_indices] = 0.0
+        if selection_bar is not None and self.qhd_parameter_indices.size:
+            # selection = base * exp(1j * radians(phase)), so d selection / d phase = 1j * pi / 180 * selection.
+            places = self.qhd_places
+            phase_bar = (selection_bar[places] * 1j * self.selection(optimized_parameters)[places]).real * (np.pi / 180)
+            np.add.at(P_bar, self.qhd_parameter_indices, phase_bar)
         return np.bincount(self.optimized_value_indices, P_bar[self.optimized_parameter_indices], value_count)
 
 
@@ -1281,6 +1315,20 @@ def backward(
     return carrier_entries_bar, signal_entries_bar, noise_entries_bar
 
 
+def selection_cotangent(carrier, noise, MU, noise_bar):
+    """
+    Cotangent of the noise detector's selection vector, shape (m,). The detector weights are
+    w = selection * carrier on the upper sideband, conj(selection * carrier) on the lower one and
+    the selection itself elsewhere (`SystemPlan.detector_weights`); their cotangent is the
+    `w_bar` of `backward`.
+    """
+    n = carrier.shape[0]
+    selection_bar = 2 * np.conj((noise_bar * NOISE_SCALE / noise) @ MU)
+    selection_bar[:n] *= carrier
+    selection_bar[n : 2 * n] = np.conj(selection_bar[n : 2 * n]) * carrier
+    return selection_bar
+
+
 # ---------------------------------------------------------------------
 # JAX integration
 # ---------------------------------------------------------------------
@@ -1298,6 +1346,8 @@ HOST_KEYS = (
     "signal_matrix",
     "noise_matrix",
     "noise_selection_vectors",
+    "qhd_parameter_indices",
+    "qhd_placing_indices",
     "carrier_function_input_indices",
     "carrier_function_indices",
     "carrier_output_indices",
@@ -1316,11 +1366,14 @@ HOST_KEYS = (
 
 
 def supports(arrays):
-    """Static (shape/dtype only) check whether the fast path covers these `simulate` arguments."""
+    """
+    Static (shape/dtype only) check whether the fast path covers these `simulate` arguments:
+    no parameter links, exactly one quantum noise detector (a `qnoised` or a balanced homodyne
+    detector `qhd`), a single carrier operating point and real design variables.
+    """
     optimized = arrays["optimized_parameters"]
     return (
         arrays["linked_indices"].shape[0] == 0
-        and arrays["qhd_parameter_indices"].shape[0] == 0
         and arrays["noise_selection_vectors"].shape[0] == 1
         and arrays["carrier_changing_values"].ndim == 2
         and arrays["carrier_changing_values"].shape[1] == 1
@@ -1356,6 +1409,7 @@ def _run_forward(optimized_parameters, host_arrays, taped):
     """The forward pass on the host: results (carrier, signal, noise, Y, MU) and the reusable work."""
     A = dict(zip(HOST_KEYS, host_arrays))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
+    plan.selection = entry_plan.selection(optimized_parameters)  # with the phase of a homodyne detector
     if taped:  # a pullback will follow: evaluate the entries with derivatives once, here
         entries, tape = entry_plan.entries(optimized_parameters)
     else:
@@ -1369,6 +1423,7 @@ def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, 
     carrier, signal, noise, Y, MU = results
     entry_plan, plan, entries, tape, kept = work
     F = Y.shape[0]
+    noise_bar = np.asarray(noise_bar, float).reshape(F)
     entries_bar = backward(
         plan,
         entries[0],
@@ -1380,12 +1435,17 @@ def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, 
         MU,
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar),
-        np.asarray(noise_bar, float).reshape(F),
+        noise_bar,
         kept=kept,
         wanted=entry_plan.signal.wanted,  # only the entries the pullback reads
         varying=entry_plan.signal.entry_varying,
     )
-    gradient = entry_plan.pullback(tape, *entries_bar, value_count=optimized_parameters.shape[0], compact=True)
+    selection_bar = None
+    if entry_plan.phase_is_design_variable:
+        selection_bar = selection_cotangent(carrier, np.asarray(noise).reshape(F), MU, noise_bar)
+    gradient = entry_plan.pullback(
+        tape, *entries_bar, value_count=optimized_parameters.shape[0], compact=True, optimized_parameters=optimized_parameters, selection_bar=selection_bar
+    )
     return gradient.astype(optimized_parameters.dtype)
 
 
@@ -1417,6 +1477,7 @@ def _host_backward(optimized_parameters, *rest):
     carrier, signal, noise, Y, MU, carrier_bar, signal_bar, noise_bar = rest[k:]
     A = dict(zip(HOST_KEYS, rest[:k]))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
+    plan.selection = entry_plan.selection(optimized_parameters)
     entries, tape = entry_plan.entries(optimized_parameters)
     results = (np.asarray(carrier)[:, 0], np.asarray(signal), np.asarray(noise).reshape(-1), np.asarray(Y), np.asarray(MU))
     return _run_backward(optimized_parameters, results, (entry_plan, plan, entries, tape, None), carrier_bar, signal_bar, noise_bar)

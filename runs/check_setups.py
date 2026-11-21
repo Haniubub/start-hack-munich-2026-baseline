@@ -2,7 +2,7 @@
 
 aLIGO (space / frequency modulation): one noise detector, no qhd, no links  -> fast path
 aLIGO (amplitude modulation): linked parameter                             -> JAX fallback
-Voyager: qhd homodyne detector with two noise detectors                    -> JAX fallback
+Voyager: balanced homodyne detector (qhd)                                  -> fast path
 """
 import os
 import json
@@ -60,4 +60,4 @@ err = np.abs(np.log(np.asarray(s)) - np.log(aligo_data["sensitivities"])).max()
 print(f"  aLIGO vs public test data: max |log diff| {err:.2e} (example uses atol 1e-6)")
 check("aLIGO frequency_modulation", *aligo("frequency_modulation"), True)
 check("aLIGO amplitude_modulation (linked)", *aligo("amplitude_modulation"), False)
-check("Voyager (qhd)", *voyager(), False)
+check("Voyager (qhd)", *voyager(), True)
