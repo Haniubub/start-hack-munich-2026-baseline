@@ -907,12 +907,12 @@ class _CondensedLU:
 
 # With `NATIVE_LU` the signal systems are factorized and solved by the C kernel in
 # `_native/pattern_lu.c` (`_PatternLU`) instead of `_CondensedLU`. The switch is read in every
-# host callback, so it can be changed at any time. It is off by default because the results
+# host callback, so it can be changed at any time. It is on by default. The results
 # differ from the SuperLU path in the last digits (about 1e-9 relative; both paths are that close
-# to the exact solution). DIFFEROMETOR_NATIVE_LU=1 in the environment switches it on without a
+# to the exact solution). DIFFEROMETOR_NATIVE_LU=0 in the environment switches it off without a
 # code change. When the shared library is missing or cannot be loaded, or when the kernel finds
 # no pivot sequence that is stable at every frequency, `_CondensedLU` does the work as before.
-NATIVE_LU = os.environ.get("DIFFEROMETOR_NATIVE_LU", "") == "1"
+NATIVE_LU = os.environ.get("DIFFEROMETOR_NATIVE_LU", "1") != "0"
 
 _pattern_lu_library = None  # None: not tried yet, False: unavailable
 
