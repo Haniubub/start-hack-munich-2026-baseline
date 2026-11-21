@@ -571,9 +571,14 @@ class SystemPlan:
         M[self.cmi[0][self.carrier_live], self.cmi[1][self.carrier_live]] = carrier_entries[self.carrier_live]
         return _splu(n, M[self.carrier_rows, self.carrier_cols], self.carrier_rows, self.carrier_ptr), M[:, -1]
 
-    def signal_values(self, signal_entries, carrier):
-        """Nonzero values of the augmented signal matrices, shape (size, F), plus placing pre-values."""
-        V = np.empty((self.size, signal_entries.shape[1]), complex)
+    def signal_values(self, signal_entries, carrier, spare=0):
+        """
+        Nonzero values of the augmented signal matrices, shape (size, F), plus placing pre-values.
+
+        With `spare`, the values are the first rows of a larger array (`V.base`) with that many
+        more rows, so that `_CondensedLU` can work in it without copying them.
+        """
+        V = np.empty((self.size + spare, signal_entries.shape[1]), complex)[: self.size]
         V[:] = self.signal_base[:, None]
         if self.update_live.all():
             V[self.update_positions] = signal_entries
@@ -585,9 +590,9 @@ class SystemPlan:
         np.negative(V.imag, out=V.imag, where=self.conjugated[:, None])  # conjugate those rows in place
         return V, pre
 
-    def signal_factors(self, V):
+    def signal_factors(self, V, overwrite=False):
         """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
-        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix)
+        return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix, overwrite)
 
     def reverse_layout(self, wanted=None, varying=None):
         """The `_ReverseLayout` for these signal entries (kept for the next call with the same ones)."""
@@ -795,13 +800,31 @@ class _CondensedLU:
     MIN_SHARE = 0.25  # stop when a stage would remove less than this share of the unknowns
     ORDERING = "MMD_ATA"  # 5-10 % less SuperLU work than COLAMD on the reduced systems
 
-    def __init__(self, size, rows, cols, values, select=None):
+    @staticmethod
+    def room(entries):
+        """Rows of the value store for a pattern with this many entries: all stages, with room for fill-in."""
+        return 3 * entries + 256
+
+    def __init__(self, size, rows, cols, values, select=None, overwrite=False):
         entries, F = rows.size, values.shape[1]
-        store = np.empty((3 * entries + 256, F), complex)  # entry values of all stages, with room for fill-in
-        if select is None:
-            store[:entries] = values
-        else:
-            np.compress(select, values, axis=0, out=store[:entries])
+        # With `overwrite` the caller gives the values up. If they are the head of a larger array
+        # with enough room behind them (`SystemPlan.signal_values(..., spare=...)`) and the entries
+        # are its first rows, the stages work in that array. Otherwise the values are copied.
+        store = values.base if overwrite else None
+        in_place = (
+            isinstance(store, np.ndarray)
+            and store.dtype == np.complex128
+            and store.shape == (max(store.shape[0], self.room(entries)), F)
+            and store.flags.c_contiguous
+            and store.__array_interface__["data"][0] == values.__array_interface__["data"][0]
+            and (select is None or bool(select[:entries].all()))
+        )
+        if not in_place:
+            store = np.empty((self.room(entries), F), complex)
+            if select is None:
+                store[:entries] = values
+            else:
+                np.compress(select, values, axis=0, out=store[:entries])
         ids, used = np.arange(entries), entries
         self.stages = []
         remaining = np.ones(size, bool)
@@ -877,31 +900,34 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     rest goes through SuperLU as one block-diagonal system for all frequencies (`_CondensedLU`).
     Everything between the two solves is evaluated for all frequencies at once.
 
-    The last return value (carrier factorization, signal matrix values, placing pre-values,
-    signal factorization) is what `backward` would otherwise compute a second time.
+    The last return value (carrier factorization, placing pre-values, signal factorization) is
+    what `backward` would otherwise compute a second time.
     """
     m = plan.m
     carrier_lu, carrier_rhs = plan.carrier_matrix(carrier_entries)
     carrier = carrier_lu.solve(carrier_rhs)
-    V, pre = plan.signal_values(signal_entries, carrier)
+    # The matrix values are built in the array the factorization works in. The factorization
+    # overwrites them, so the right-hand side column is taken out first.
+    V, pre = plan.signal_values(signal_entries, carrier, spare=max(0, _CondensedLU.room(plan.matrix_rows.size) - plan.size))
     w = plan.detector_weights(carrier)
     N = plan.noise_values(noise_entries)
     F = V.shape[1]
-    factors = plan.signal_factors(V)
+    right_hand_sides = np.zeros((F, m, 2), complex)
+    right_hand_sides[:, plan.rhs_rows, 0] = V[~plan.in_matrix].T
+    factors = plan.signal_factors(V, overwrite=True)
+    del V
     # S^-H w = conj(S^-T conj(w))
     Y = factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T")[:, :, 0]
     np.conjugate(Y, out=Y)
     q = _scatter_sum(N * Y[:, plan.noise_cols], plan.noise_by_row, m)  # N y
     qh = _scatter_sum(np.conj(N) * Y[:, plan.noise_rows], plan.noise_by_col, m)  # N^H y
     power = np.einsum("fm,fm->f", np.conj(Y), q).real
-    right_hand_sides = np.zeros((F, m, 2), complex)
-    right_hand_sides[:, plan.rhs_rows, 0] = V[~plan.in_matrix].T
     right_hand_sides[:, :, 1] = 0.5 * (q + qh)
     solutions = factors.solve(right_hand_sides, overwrite=True)
     signal = np.ascontiguousarray(solutions[:, :, 0].T)
     MU = np.ascontiguousarray(solutions[:, :, 1])
     noise = np.sqrt(2 * power * NOISE_SCALE)
-    return carrier, signal, noise, Y, MU, (carrier_lu, V, pre, factors)
+    return carrier, signal, noise, Y, MU, (carrier_lu, pre, factors)
 
 
 class _ReverseLayout:
@@ -1026,7 +1052,7 @@ def backward(
         V, pre = plan.signal_values(signal_entries, carrier)
         factors = None
     else:
-        carrier_lu, V, pre, factors = kept
+        (carrier_lu, pre, factors), V = kept, None
     F = Y.shape[0]
     layout = plan.reverse_layout(wanted, varying)
     carrier_bar = carrier_bar.astype(complex).copy()
@@ -1140,7 +1166,7 @@ def _output_shapes(arrays):
 
 
 # Work of the forward pass that the backward pass can reuse: both plans, the matrix entries
-# with their Jacobian tape, the signal matrix values, both factorizations, and the results
+# with their Jacobian tape, the placing pre-values, both factorizations, and the results
 # with the adjoint helpers Y and MU. With the cache on, a forward pass that is followed by a
 # pullback leaves all of this on the host and hands JAX only the outputs and a key; the pullback
 # finds its forward pass through the key. Nothing depends on the entry still being there: when

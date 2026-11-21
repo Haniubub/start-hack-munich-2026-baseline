@@ -21,7 +21,7 @@ Maschine: Intel Xeon 2,1 GHz (Emerald Rapids, Nachfolge-Generation des Xeon Plat
 | Warm Gradient | 77,8 / 68,3 | 33,0 / 28,2 | 8,4 / 7,3 |
 | Fehler gegen Feyers Referenz | 5,3742e-06 | 5,3743e-06 | 5,3743e-06 |
 
-Alle drei Spalten stammen aus einer Messreihe (07:03). Der letzte Code-Commit (`36b3ea7`, ein Callback weniger im Readout) kam danach und bringt im Minimum noch rund 5 ms.
+Alle drei Spalten stammen aus einer Messreihe (07:03). Zwei Code-Commits kamen danach: `36b3ea7` (ein Callback weniger im Readout, im Minimum rund 5 ms) und Änderung 20 (Vorwärtslauf rund 3 ms).
 
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
@@ -54,6 +54,7 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 ist das Kompilieren der
 | 17 | Detektor-Ports werden auf dem Host ausgewählt, kein XLA-Gather und -Scatter im Readout | `components.py` | Kompilieren 232,9 → 179,3 ms, Lower 37,5 → 34,4 ms, **Erstlauf 701,0 → 637,3 ms** (10 Läufe). Bit-identisch |
 | 18 | Detektor nur für die gewählten Ports auswerten, ein Callback statt zwei | `components.py` | Minimum von 10 Läufen: Kompilieren 161,7 → 157,6, Gradient 10,7 → 9,9, Sensitivität 2,5 → 1,9 ms |
 | 19 | Nullensuche in den dichten Build-Matrizen mit einem Vergleich | `sparse.py` | 0,9 → 0,6 ms für die Signalmatrix |
+| 20 | Signalwerte entstehen direkt in dem Feld, in dem die Vorab-Elimination arbeitet (eine Kopie von 4 MB weniger) | `fast.py` | Vorwärts 61,4 → 58,1 ms, warm 55,1 → 51,9 ms (12 Läufe). Bit-identisch |
 | – | Übernommen: Noels Runden 2 und 3 (Tests, Notizen) und Max' Aufteilung in nachgeladene Module | `setups.py`, `simulate.py`, `_*.py`, `runs/noel/` | Ohne `.pyc` übersetzt Python beim Import rund ein Sechstel weniger Quelltext (in der langsamen Phase gemessen: 33 → 28 ms) |
 
 ### 1. Basismatrizen sparse
