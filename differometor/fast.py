@@ -590,8 +590,26 @@ class SystemPlan:
         np.negative(V.imag, out=V.imag, where=self.conjugated[:, None])  # conjugate those rows in place
         return V, pre
 
-    def signal_factors(self, V, overwrite=False):
-        """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`."""
+    def signal_factors(self, V, overwrite=False, restore=None):
+        """Solver for S_f x = b and S_f^T z = b at every frequency (rows of `V`), see `_CondensedLU`.
+
+        With `NATIVE_LU` the native kernel is tried first (`_PatternLU`). It works in place like
+        `_CondensedLU`, so after a failed attempt with `overwrite` the values are gone: `restore`
+        must then return them again (same layout as `V`).
+        """
+        if NATIVE_LU:
+            # First with the pivots chosen from a few frequencies; if a pivot then fails the check
+            # at another frequency, once more with the choice made on all of them.
+            for samples in (None, 0):
+                factors, status = _PatternLU.create(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix, overwrite, samples)
+                if factors is not None:
+                    return factors
+                if overwrite and status != -1:
+                    if restore is None:
+                        raise ValueError("signal_factors(overwrite=True) needs `restore` when NATIVE_LU is on")
+                    V = restore()
+                if status != _PatternLU.UNSTABLE:
+                    break
         return _CondensedLU(self.m, self.matrix_rows, self.matrix_cols, V, self.in_matrix, overwrite)
 
     def reverse_layout(self, wanted=None, varying=None):
@@ -883,6 +901,160 @@ class _CondensedLU:
         return x
 
 
+# ---------------------------------------------------------------------
+# Native factorization with one pivot sequence for all frequencies (optional)
+# ---------------------------------------------------------------------
+
+# With `NATIVE_LU` the signal systems are factorized and solved by the C kernel in
+# `_native/pattern_lu.c` (`_PatternLU`) instead of `_CondensedLU`. The switch is read in every
+# host callback, so it can be changed at any time. It is off by default because the results
+# differ from the SuperLU path in the last digits (about 1e-9 relative; both paths are that close
+# to the exact solution). DIFFEROMETOR_NATIVE_LU=1 in the environment switches it on without a
+# code change. When the shared library is missing or cannot be loaded, or when the kernel finds
+# no pivot sequence that is stable at every frequency, `_CondensedLU` does the work as before.
+NATIVE_LU = os.environ.get("DIFFEROMETOR_NATIVE_LU", "") == "1"
+
+_pattern_lu_library = None  # None: not tried yet, False: unavailable
+
+
+def _pattern_lu():
+    """The native kernel as a ctypes library, or None when it cannot be loaded."""
+    global _pattern_lu_library
+    if _pattern_lu_library is None:
+        try:
+            import ctypes
+
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_native", "libpattern_lu.so")
+            library = ctypes.PyDLL(path)  # keeps the GIL: a factorization is never used by two threads at once
+            pointer, integer, real = ctypes.c_void_p, ctypes.c_int, ctypes.c_double
+            library.plu_factor.argtypes = [ctypes.POINTER(pointer)] + [integer] * 3 + [pointer] * 3 + [integer] * 2 + [real] * 2 + [integer] * 2 + [pointer]
+            library.plu_factor.restype = integer
+            library.plu_free.argtypes, library.plu_free.restype = [pointer], None
+            library.plu_solve.argtypes, library.plu_solve.restype = [pointer, pointer, pointer, integer], None
+            library.plu_solve_fmk.argtypes, library.plu_solve_fmk.restype = [pointer, pointer, pointer, integer, integer], integer
+            library.plu_stats.argtypes, library.plu_stats.restype = [pointer, pointer], None
+            library.plu_select.argtypes, library.plu_select.restype = [integer], integer
+            library.handle, library.byref = pointer, ctypes.byref
+            _pattern_lu_library = library
+        except Exception:
+            _pattern_lu_library = False
+    return _pattern_lu_library or None
+
+
+class _PatternLU:
+    """
+    Solves S_f x = b and S_f^T z = b for F matrices that share one sparsity pattern, like
+    `_CondensedLU`, with the native kernel `_native/pattern_lu.c`.
+
+    All frequencies are factorized with one pivot sequence. The values of a matrix entry at all
+    frequencies are one contiguous row, so every elimination step is a plain loop over that row:
+    no index work, no pivot search and no symbolic analysis per frequency (SuperLU repeats all
+    three for every frequency block). The sequence is chosen from `SAMPLES` frequencies: lowest
+    Markowitz count among the entries that are at least `U_SELECT` times the largest entry of
+    their row and of their column. The numeric factorization then checks every pivot against
+    `U_VERIFY` at every frequency, so multipliers are bounded by 1 / U_VERIFY in both factors
+    everywhere. Unit diagonal entries with small neighbours, the ones `_CondensedLU` eliminates
+    beforehand, come first here as well, because they cost nothing.
+
+    `create` returns None when the library is unavailable or no shared pivot sequence passes the
+    checks; the caller then uses `_CondensedLU`. Same arguments and layouts as `_CondensedLU`.
+    """
+
+    U_SELECT = 0.1
+    U_VERIFY = 0.025
+    SAMPLES = 8
+    UNSTABLE = 4  # status of the kernel: a pivot failed the check at a frequency outside the sample
+
+    def __init__(self, library, handle, store, size, frequencies):
+        self._library, self._handle, self._store = library, handle, store
+        self.size, self.F = size, frequencies
+
+    @classmethod
+    def create(cls, size, rows, cols, values, select=None, overwrite=False, samples=None):
+        """The factorization, or None with the status of the kernel (-1: no library)."""
+        library = _pattern_lu()
+        if library is None:
+            return None, -1
+        entries, F = rows.size, values.shape[1]
+        # Like `_CondensedLU`: work in the caller's array when it is given up and has room behind
+        # the entries, otherwise in a copy.
+        room = _CondensedLU.room(entries)
+        store = values.base if overwrite else None
+        in_place = (
+            isinstance(store, np.ndarray)
+            and store.dtype == np.complex128
+            and store.shape == (max(store.shape[0], room), F)
+            and store.flags.c_contiguous
+            and store.flags.writeable
+            and store.__array_interface__["data"][0] == values.__array_interface__["data"][0]
+            and (select is None or bool(select[:entries].all()))
+        )
+        if not in_place:
+            store = np.empty((room, F), complex)
+            if select is None:
+                store[:entries] = values
+            else:
+                np.compress(select, values, axis=0, out=store[:entries])
+        rows, cols = np.ascontiguousarray(rows, np.intc), np.ascontiguousarray(cols, np.intc)
+        handle, info = library.handle(), np.zeros(2, np.intc)
+        status = library.plu_factor(
+            library.byref(handle),
+            size,
+            F,
+            entries,
+            rows.ctypes.data,
+            cols.ctypes.data,
+            store.ctypes.data,
+            store.shape[0],
+            entries,
+            cls.U_SELECT,
+            cls.U_VERIFY,
+            cls.SAMPLES if samples is None else samples,
+            0,
+            info.ctypes.data,
+        )
+        if status:
+            return None, status
+        return cls(library, handle, store, size, F), 0
+
+    def __del__(self):
+        try:
+            if self._handle:
+                self._library.plu_free(self._handle)
+                self._handle = None
+        except Exception:  # interpreter shutdown
+            pass
+
+    def stats(self):
+        """Counters of the kernel (entries of L and U, update operations, times in ns, ...)."""
+        names = ("L", "U", "rows_used", "updates", "evaluations", "searched", "simd", "chunk", "unit_pivots", "ns_analysis", "ns_numeric")
+        out = np.zeros(len(names), np.int64)
+        self._library.plu_stats(self._handle, out.ctypes.data)
+        return dict(zip(names, out.tolist()))
+
+    def solve(self, b, trans="N", overwrite=False):
+        """x with S_f x_f = b_f (`trans="N"`) or S_f^T x_f = b_f (`trans="T"`), shapes (F, size, k).
+
+        With `overwrite`, a contiguous complex `b` is used as the work array and returned.
+        """
+        if overwrite and isinstance(b, np.ndarray) and b.dtype == np.complex128 and b.flags.c_contiguous and b.flags.writeable:
+            x = b
+        else:
+            x = np.array(b, dtype=complex, order="C")
+        if self._library.plu_solve_fmk(self._handle, x.ctypes.data, x.ctypes.data, x.shape[2], int(trans == "T")):
+            raise MemoryError("native solve: out of memory")
+        return x
+
+    def solve_rows(self, b, trans="N"):
+        """The same for one right-hand side of shape (size, F), the layout the kernel works in.
+
+        `b` must be a contiguous complex array; it is overwritten. Returns a new array.
+        """
+        x = np.empty((self.size, self.F), complex)
+        self._library.plu_solve(self._handle, b.ctypes.data, x.ctypes.data, int(trans == "T"))
+        return x
+
+
 def _scatter_sum(values, grouping, size):
     """Scatter-add the columns of `values` (F, E) into (F, size) target slots."""
     order, starts, slots = grouping
@@ -908,13 +1080,14 @@ def forward(plan, carrier_entries, signal_entries, noise_entries):
     carrier = carrier_lu.solve(carrier_rhs)
     # The matrix values are built in the array the factorization works in. The factorization
     # overwrites them, so the right-hand side column is taken out first.
-    V, pre = plan.signal_values(signal_entries, carrier, spare=max(0, _CondensedLU.room(plan.matrix_rows.size) - plan.size))
+    spare = max(0, _CondensedLU.room(plan.matrix_rows.size) - plan.size)
+    V, pre = plan.signal_values(signal_entries, carrier, spare=spare)
     w = plan.detector_weights(carrier)
     N = plan.noise_values(noise_entries)
     F = V.shape[1]
     right_hand_sides = np.zeros((F, m, 2), complex)
     right_hand_sides[:, plan.rhs_rows, 0] = V[~plan.in_matrix].T
-    factors = plan.signal_factors(V, overwrite=True)
+    factors = plan.signal_factors(V, overwrite=True, restore=lambda: plan.signal_values(signal_entries, carrier, spare=spare)[0])
     del V
     # S^-H w = conj(S^-T conj(w))
     Y = factors.solve(np.broadcast_to(np.conj(w)[:, None], (F, m, 1)), trans="T")[:, :, 0]
