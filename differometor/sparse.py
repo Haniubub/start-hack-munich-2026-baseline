@@ -160,6 +160,13 @@ class BaseMatrix:
         values = matrix.reshape(-1)[index].astype(np.complex128)
         return cls(structure_array(index), structure_array(values), tuple(matrix.shape))
 
+    @classmethod
+    def from_entries(cls, index, values, shape):
+        """From host arrays: row-major flat indices in ascending order and the values at those places."""
+        index = np.asarray(index, dtype=np.intp)
+        values = np.asarray(values, dtype=np.complex128)
+        return cls(structure_array(index), structure_array(values), tuple(shape))
+
     @property
     def dtype(self):
         return self.values.dtype

@@ -89,6 +89,24 @@ def _device_array(values, dtype=None) -> jnp.ndarray:
 # to the simulation arrays stay JAX arrays (`_device_array`).
 _structure_array = structure_array
 
+
+def _signal_base_matrix(carrier_base, system_size, full_size) -> BaseMatrix:
+    """
+    Constant entries of the signal matrix, taken from the entries of the finished carrier matrix.
+
+    The signal matrix `(full_size, full_size + 1)` holds the carrier matrix without its right-hand
+    side in both sideband blocks and a unit diagonal for the signal degrees of freedom; the
+    right-hand-side column stays empty. The entries come out in row-major order, as from the dense matrix.
+    """
+    rows, columns = np.divmod(np.asarray(carrier_base.index), system_size + 1)
+    inside = columns < system_size  # without the right-hand side of the carrier system
+    rows, columns, values = rows[inside], columns[inside], np.asarray(carrier_base.values)[inside]
+    width = full_size + 1
+    diagonal = np.arange(2 * system_size, full_size)
+    index = np.concatenate([rows * width + columns, (rows + system_size) * width + columns + system_size, diagonal * (width + 1)])
+    values = np.concatenate([values, values, np.ones(diagonal.size, dtype=complex)])
+    return BaseMatrix.from_entries(index, values, (full_size, width))
+
 # ---------------------------------------------------------------------
 # Global state for parameter linking
 # ---------------------------------------------------------------------
@@ -673,11 +691,10 @@ def build(setup: Setup):
         signal_size = 1
 
     # Signal matrix includes two carrier-sized blocks plus appended signal block, plus a right-hand-side column.
-    signal_matrix = np.zeros((system_size * 2 + signal_size, system_size * 2 + signal_size + 1), dtype=complex)
-    np.fill_diagonal(signal_matrix, 1.0)  # identity block without a dense temporary (9 MB for the benchmark)
-
     # Noise matrix has the same shape as the signal matrix without the right-hand side.
-    noise_matrix = np.zeros(signal_matrix[:, :-1].shape)
+    # Neither is built as a dense array (9 MB and 4.5 MB for the benchmark): their constant entries
+    # follow from the finished carrier matrix (`_signal_base_matrix`, called once the carrier matrix is complete).
+    full_size = system_size * 2 + signal_size
     noise_detectors = {}
 
     # Selection vectors map fields to detector readouts for quantum noise calculations.
@@ -1388,9 +1405,10 @@ def build(setup: Setup):
                 carrier_column_indices=system_matrix_column_indices,
             )
 
-    # Insert carrier matrix into both sideband blocks of the signal matrix.
-    signal_matrix[:system_size, :system_size] = carrier_matrix[:, :system_size]
-    signal_matrix[system_size:-signal_size, system_size:-signal_size - 1] = carrier_matrix[:, :system_size]
+    # The carrier matrix goes into both sideband blocks of the signal matrix.
+    carrier_base = BaseMatrix.from_dense(carrier_matrix)
+    signal_base = _signal_base_matrix(carrier_base, system_size, full_size)
+    noise_base = BaseMatrix.from_entries([], [], (full_size, full_size))
 
     # -----------------------------------------------------------------
     # Mark unused ports and inject vacuum noise at those ports.
@@ -1442,9 +1460,9 @@ def build(setup: Setup):
         (
             _device_array([parameters], dtype=complex),
             # The three base matrices are stored sparse, see `differometor.sparse`.
-            BaseMatrix.from_dense(carrier_matrix),
-            BaseMatrix.from_dense(signal_matrix),
-            BaseMatrix.from_dense(noise_matrix),
+            carrier_base,
+            signal_base,
+            noise_base,
             _structure_array(noise_selection_vectors, dtype=complex),
             _structure_array(qhd_parameter_indices, dtype=int),
             _structure_array(qhd_placing_indices, dtype=int),

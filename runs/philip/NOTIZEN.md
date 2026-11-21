@@ -27,6 +27,21 @@ Alle drei Spalten stammen aus einer Messreihe (07:03). Zwei Code-Commits kamen d
 
 **Dreier-Vergleich 08:41** (8 Läufe, abwechselnd, Maschine nach einem Neustart etwas langsamer als um 07:29): `max/nacht` (`f1000e9`) 858,5 / 769,9 ms, `noel` (`6b67cfd`) 775,5 / 704,8 ms, `philip-nacht` (`d897aef`) **670,5 / 613,4 ms**. In derselben Reihenfolge: Kompilieren 232,4 / 234,6 / 180,5, Vorwärtslauf 102,3 / 84,2 / 61,5, Gradient 65,3 / 38,7 / 11,3, warm gesamt 136,3 / 93,2 / 62,9 ms (jeweils Median).
 
+**Alle Branches 10:19** (10 Läufe, abwechselnd, Stand `0be1cfb` ohne Änderung 21; die Maschine war unruhig, Mediane liegen 70 bis 100 ms über den Minima):
+
+| Stand | Erstlauf Median / Minimum | Kompilieren | Vorwärtslauf | Gradient | Warm gesamt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `philip-nacht` (`0be1cfb`) | **682,8 / 605,5** | 189,8 | 62,1 | 12,4 | 63,7 |
+| `noel` (`e3c5126`, sechste Runde) | 809,0 / 710,3 | 253,7 | 70,5 | 40,4 | 90,1 |
+| `sx2` (`036194a`) | 839,8 / 775,5 | 165,7 | 125,4 | 104,8 | 213,5 |
+| `sx2-env` (`bf6bf60`) | 858,7 / 774,6 | 159,7 | 138,7 | 115,8 | 198,9 |
+| `max/nacht` (`f1000e9`) | 878,2 / 778,9 | 252,6 | 109,9 | 75,6 | 153,4 |
+| `sx` (`2c9e8bf`) | 966,7 / 866,8 | 257,1 | 139,7 | 121,0 | 206,6 |
+| `Joel` (`76e799f`) | 970,2 / 826,7 | 250,1 | 135,6 | 125,9 | 207,8 |
+| Experiment: `philip-nacht` mit den zwei XLA-Flags aus `sx2-env` | 616,0 / 547,5 | 131,7 | 60,8 | 13,0 | 68,3 |
+
+Joels vier Branches bauen auf `philip` (`ab82e42`) auf. Ihre drei Code-Änderungen (Detektoren als Host-Callback, Plotly bei Bedarf, SuperLU ohne SciPy-Import) gibt es hier, bei Noel und bei Max in eigener Fassung. `sx`, `sx2` und `sx2-env` setzen zusätzlich je eine Einstellung in `differometor/__init__.py` (XLA-Optimierungsstufe 1, `jax_disable_most_optimizations`, XLA-Stufe 0 ohne teure LLVM-Pässe). Das ist die Regelfrage B6. Die letzte Zeile ist nur gemessen und nicht eingebaut. Derselbe Vergleich für die Nebius-VM liegt als Paket bereit (`_nacht/vm/`, Skripte in `runs/philip/vm/`).
+
 **Die absoluten Zahlen hängen an der Tageszeit.** Die Messmaschine ist geteilt. Bis etwa 04:30 lief alles rund 25 % langsamer (damals `noel` 1045, dieser Branch 873), seit 06:50 läuft es schneller. Vergleichbar sind nur Stände aus derselben Reihe. Die Abstände innerhalb einer Reihe sind stabil, am genauesten in den Phasen Vorwärtslauf, Gradient und Lower.
 
 Ohne Bytecode-Cache (frischer Export mit `git archive`, `PYTHONDONTWRITEBYTECODE=1` wie im Dockerfile, 8 Läufe): `noel` 781,1 / 749,4, `philip-nacht` 646,3 / 601,6. Der Import kostet dann bei beiden rund 300 ms.
@@ -59,6 +74,7 @@ Die Zeiten sind anders verteilt als auf dem Mac. Auf x86 ist das Kompilieren der
 | 18 | Detektor nur für die gewählten Ports auswerten, ein Callback statt zwei | `components.py` | Minimum von 10 Läufen: Kompilieren 161,7 → 157,6, Gradient 10,7 → 9,9, Sensitivität 2,5 → 1,9 ms |
 | 19 | Nullensuche in den dichten Build-Matrizen mit einem Vergleich | `sparse.py` | 0,9 → 0,6 ms für die Signalmatrix |
 | 20 | Signalwerte entstehen direkt in dem Feld, in dem die Vorab-Elimination arbeitet (eine Kopie von 4 MB weniger) | `fast.py` | Vorwärts 61,4 → 58,1 ms, warm 55,1 → 51,9 ms (12 Läufe). Bit-identisch |
+| 21 | Signal- und Rauschmatrix entstehen im Build nie als dichte Arrays, ihre Einträge folgen aus der Trägermatrix (Idee aus Noels Runde 6) | `build.py`, `sparse.py` | Build-Schritt allein 18,1 → 13,8 ms (Minimum 15,8 → 12,8, je 16 frische Prozesse abwechselnd). Bit-identisch |
 | – | Übernommen: Noels Runden 2 und 3 (Tests, Notizen) und Max' Aufteilung in nachgeladene Module | `setups.py`, `simulate.py`, `_*.py`, `runs/noel/` | Ohne `.pyc` übersetzt Python beim Import rund ein Sechstel weniger Quelltext (in der langsamen Phase gemessen: 33 → 28 ms) |
 
 ### 1. Basismatrizen sparse
@@ -130,7 +146,7 @@ Seit Änderung 14 gibt es die Detektor-Basis Z nicht mehr. Im Zwischenspeicher l
 
 ### 10. Build
 
-`np.eye(n, dtype=complex)` hat für die Einheitsblöcke eine zweite dichte Matrix angelegt (9 MB bei der Signalmatrix), nur um ihre Diagonale zu kopieren. `np.fill_diagonal` schreibt nur die Diagonale. Der unberührte Teil der Nullmatrix bekommt gar keinen echten Speicher, bevor die Einträge herausgezogen werden.
+`np.eye(n, dtype=complex)` hat für die Einheitsblöcke eine zweite dichte Matrix angelegt (9 MB bei der Signalmatrix), nur um ihre Diagonale zu kopieren. `np.fill_diagonal` schreibt nur die Diagonale. Der unberührte Teil der Nullmatrix bekommt gar keinen echten Speicher, bevor die Einträge herausgezogen werden. Seit Änderung 21 gilt das nur noch für die Trägermatrix, Signal- und Rauschmatrix entstehen gar nicht mehr als dichte Felder.
 
 ### 13. Struktur-Arrays als Host-Konstanten
 
@@ -183,6 +199,14 @@ Das Readout-Programm des Benchmarks hat damit 31 statt 42 Operationen, das Gradi
 Geprüft auch in einem frischen Klon mit neuer Umgebung aus `requirements.txt`, unter Python 3.12 und 3.13.
 
 `test_ports.py` vergleicht mit der normalen Indexierung und mit dem JAX-Detektor: sechs Arten von Port-Arrays, int32 und int64, getracte und konstante Indizes, `jit`, `grad`, `vjp` mit vorgegebenem Kotangenten, `vmap`, `cond`, andere Formen, und alle übrigen Arten, die Ausgabe zu benutzen.
+
+### 21. Signal- und Rauschmatrix ohne dichte Arrays
+
+Die Idee stammt aus Noels Runde 6 (`7d12ba7`). Der Build schreibt in die Rauschmatrix nichts und in die Signalmatrix nur die Trägermatrix (ohne rechte Seite) in beide Seitenband-Blöcke, dazu eine Einheitsdiagonale für die Signal-Freiheitsgrade. Bisher hat der Build dafür 9 MB und 4,5 MB Nullfelder angelegt, gefüllt und wieder nach Einträgen durchsucht. Jetzt berechnet `_signal_base_matrix` die Einträge direkt aus denen der Trägermatrix (`BaseMatrix.from_entries`), die Rauschmatrix ist eine leere `BaseMatrix`.
+
+Die Schnittstelle bleibt, wie sie war: `run_build_step` liefert weiter `BaseMatrix`-Objekte. `test_build_entries.py` vergleicht für sechs Setups (Benchmark, `uifo_20_5000`, aLIGO in drei Varianten, Voyager) mit dem früheren dichten Aufbau: Indizes, Werte, Datentypen und Formen sind gleich. Die Arrays des Benchmarks (Carrier, Signal, Noise, Sensitivität, Powers, Gradient) sind bit-identisch zum Stand davor.
+
+Gemessen am Build-Schritt allein (`Setup.from_data`, `constrain_inter_grid_cell_spaces`, `run_build_step` im frischen Prozess, je 16 Prozesse abwechselnd): Median 18,1 → 13,8 ms, Minimum 15,8 → 12,8 ms. In der Gesamtzeit geht das an diesem Vormittag im Rauschen der Messmaschine unter (Build-Phase im Wechselvergleich, 12 Läufe: Median 64,9 → 62,6 ms, Minimum 58,1 → 52,7 ms).
 
 ## Wo die Zeit auf x86 jetzt steckt
 
@@ -237,6 +261,7 @@ python runs/philip/test_compat.py
 python runs/philip/test_static.py
 python runs/philip/test_reverse.py
 python runs/philip/test_ports.py
+python runs/philip/test_build_entries.py
 # Wechselvergleich unter Linux mit --cpus 1 (Vergleichsstand als Git-Worktree in einem zweiten Ordner)
 python runs/philip/ab_linux.py 10 vorher=<ordner_vorher> neu=.
 # Derselbe Wechselvergleich auf der Nebius-VM (Xeon Platinum 8468), vom Mac aus und für beliebige Commits.
