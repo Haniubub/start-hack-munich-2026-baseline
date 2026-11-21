@@ -99,13 +99,32 @@ INLINE_DISPATCH_AT_IMPORT = False
 # but not the Python call stack.
 SHORT_LOCATIONS_AT_IMPORT = False
 
+# jnp.abs, jnp.mean, x / y and most other jax.numpy functions are `jit(inline=True)`: their body
+# is meant to become part of the program that calls them. Under jax.vjp / jax.grad JAX still
+# differentiates every such call as a unit: it traces the body into a linearized program of its
+# own and inlines that afterwards (the benchmark's readout has a dozen such calls). With this
+# switch the body of an inline jit is evaluated directly in the differentiating trace: the same
+# operations with the same derivative rules, produced in one pass. Only acts under jax.vjp, grad,
+# jvp or linearize, for an inline jit with a plain body (no effects, no shardings or layouts).
+INLINE_JITS_UNDER_AD = True
+
+# JAX lowers every equation of a program by first writing its operations into a private MLIR
+# function of their own (so that a repeated equation can reuse it) and then copying that function's
+# body to where it is needed. A small program has hardly any repeated equations, so this is pure
+# overhead per operation, and the private functions travel on to XLA. With this switch the
+# operations of a program with at most SMALL_PROGRAM_OPERATIONS equations are written in place,
+# the way JAX itself lowers the primitives it marks as not cacheable. Same operations, outputs
+# bit-identical (M4: lower + compile of the three benchmark programs 48.6 -> 45.2 ms).
+DIRECT_LOWERING_SMALL_PROGRAMS = True
+
 # What apply() did, per measure: "on", "off", or the reason it was skipped. For diagnosis only.
 STATUS = {}
 
 _SWITCHES = (
     "SMALL_PROGRAM_OPERATIONS", "SMALL_PROGRAM_ELEMENTS", "CLASSIC_KERNEL_EMITTER", "ONE_CODEGEN_MODULE",
     "UNOPTIMIZED_SMALL_PROGRAMS", "PLAIN_SMALL_REDUCTIONS", "SHARED_MLIR_CONTEXT", "MLIR_CONTEXT_REUSES", "FAST_ASARRAY",
-    "LAZY_MHLO_CLASSES_AT_IMPORT", "INLINE_DISPATCH_AT_IMPORT", "SHORT_LOCATIONS_AT_IMPORT",
+    "LAZY_MHLO_CLASSES_AT_IMPORT", "INLINE_DISPATCH_AT_IMPORT", "SHORT_LOCATIONS_AT_IMPORT", "INLINE_JITS_UNDER_AD",
+    "DIRECT_LOWERING_SMALL_PROGRAMS",
 )
 
 # --------------------------------------------------------------------------------------------
@@ -306,6 +325,80 @@ def _asarray(a, dtype=None, order=None, *, copy=None, device=None, out_sharding=
 
 
 # --------------------------------------------------------------------------------------------
+# Lowering in place
+# --------------------------------------------------------------------------------------------
+
+_jax_lower_jaxpr_to_module = None
+_jaxprs_in_params = None
+_lowering = threading.local()  # .in_place: the program this thread is lowering right now is small
+
+
+class _Uncacheable(set):
+    """`mlir._uncacheable_primitives`: while a small program is lowered, it contains every primitive."""
+
+    def __contains__(self, primitive):
+        return getattr(_lowering, "in_place", False) or set.__contains__(self, primitive)
+
+
+def _is_small_jaxpr(closed_jaxpr):
+    """At most SMALL_PROGRAM_OPERATIONS equations, sub-programs included."""
+    try:
+        pending, count = [closed_jaxpr.jaxpr], 0
+        while pending:
+            jaxpr = pending.pop()
+            count += len(jaxpr.eqns)
+            if count > SMALL_PROGRAM_OPERATIONS:
+                return False
+            for equation in jaxpr.eqns:
+                pending.extend(_jaxprs_in_params(equation.params))
+        return True
+    except Exception:
+        return False
+
+
+def _lower_jaxpr_to_module(module_name, jaxpr, **kwargs):
+    """`jax._src.interpreters.mlir.lower_jaxpr_to_module`, with small programs lowered in place."""
+    previous = getattr(_lowering, "in_place", False)
+    _lowering.in_place = DIRECT_LOWERING_SMALL_PROGRAMS and _is_small_jaxpr(jaxpr)
+    try:
+        return _jax_lower_jaxpr_to_module(module_name, jaxpr, **kwargs)
+    finally:
+        _lowering.in_place = previous
+
+
+# --------------------------------------------------------------------------------------------
+# Inline jits under differentiation
+# --------------------------------------------------------------------------------------------
+
+_jax_bind_jit = None
+_bind_jit_parts = None  # (current trace, differentiating trace classes, eval_jaxpr, UnspecifiedValue, Ref)
+
+
+def _bind_jit(*args, **params):
+    """`jit_p.bind`; the body of an inline jit is evaluated in place when the caller is being differentiated."""
+    if INLINE_JITS_UNDER_AD and params.get("inline"):
+        try:
+            trace_context, differentiating, eval_jaxpr, unspecified, reference = _bind_jit_parts
+            closed = params["jaxpr"]
+            plain = (
+                isinstance(trace_context.trace, differentiating)
+                and not params["compiler_options_kvs"]
+                and not closed.effects
+                and not getattr(closed.jaxpr, "is_high", False)
+                and all(isinstance(sharding, unspecified) for sharding in params["in_shardings"])
+                and all(isinstance(sharding, unspecified) for sharding in params["out_shardings"])
+                and all(layout is None for layout in params["in_layouts"])
+                and all(layout is None for layout in params["out_layouts"])
+                and not any(isinstance(const, reference) for const in closed.consts)
+            )
+        except Exception:  # parameters this code does not know: leave the call to JAX
+            plain = False
+        if plain:
+            return eval_jaxpr(closed.jaxpr, closed.consts, *args)
+    return _jax_bind_jit(*args, **params)
+
+
+# --------------------------------------------------------------------------------------------
 # Installation
 # --------------------------------------------------------------------------------------------
 
@@ -375,6 +468,42 @@ def _install_asarray():
     jax.numpy.asarray = _asarray
 
 
+def _install_lowering_in_place():
+    global _jax_lower_jaxpr_to_module, _jaxprs_in_params
+    from jax._src import core
+    from jax._src.interpreters import mlir
+
+    original = mlir.lower_jaxpr_to_module
+    parameters = list(inspect.signature(original).parameters.values())
+    if [p.name for p in parameters[:2]] != ["module_name", "jaxpr"] or any(p.kind is not p.KEYWORD_ONLY for p in parameters[2:]):
+        raise TypeError("lower_jaxpr_to_module has another signature than expected")
+    if type(mlir._uncacheable_primitives) is not set or "_uncacheable_primitives" not in inspect.getsource(mlir.jaxpr_subcomp):
+        raise TypeError("the lowering does not decide about caching the way this measure expects")
+    _jaxprs_in_params = core.jaxprs_in_params
+    _jax_lower_jaxpr_to_module = original
+    mlir._uncacheable_primitives = _Uncacheable(mlir._uncacheable_primitives)
+    functools.update_wrapper(_lower_jaxpr_to_module, original)
+    mlir.lower_jaxpr_to_module = _lower_jaxpr_to_module
+
+
+def _install_bind_jit():
+    global _jax_bind_jit, _bind_jit_parts
+    from jax._src import core, pjit
+    from jax._src.interpreters import ad
+    from jax._src.sharding_impls import UnspecifiedValue
+
+    needed = ("jaxpr", "inline", "compiler_options_kvs", "in_shardings", "out_shardings", "in_layouts", "out_layouts")
+    primitive = pjit.jit_p
+    if not primitive.multiple_results or "bind" in vars(primitive):
+        raise TypeError("the jit primitive is not what this measure expects")
+    source = inspect.getsource(pjit.pjit_staging_rule)
+    if not all(f'"{name}"' in source or f"'{name}'" in source for name in needed):
+        raise TypeError("the jit primitive has other parameters than expected")
+    _bind_jit_parts = (core.trace_ctx, (ad.LinearizeTrace, ad.JVPTrace), core.eval_jaxpr, UnspecifiedValue, core.Ref)
+    _jax_bind_jit = primitive.bind
+    primitive.bind = _bind_jit
+
+
 def _configure(name, value):
     import jax
 
@@ -400,6 +529,8 @@ def apply():
         ("lazy_mhlo", LAZY_MHLO_CLASSES_AT_IMPORT, _install_lazy_mhlo),
         ("inline_dispatch", INLINE_DISPATCH_AT_IMPORT, lambda: _configure("jax_cpu_enable_async_dispatch", False)),
         ("short_locations", SHORT_LOCATIONS_AT_IMPORT, lambda: _configure("jax_include_full_tracebacks_in_locations", False)),
+        ("inline_jits_under_ad", True, _install_bind_jit),
+        ("lowering_in_place", True, _install_lowering_in_place),
     ):
         if not wanted:
             STATUS[name] = "off"

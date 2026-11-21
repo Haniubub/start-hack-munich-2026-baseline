@@ -13,6 +13,7 @@ os.environ.pop("DIFFEROMETOR_TUNING", None)
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import jax
+import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 
@@ -54,7 +55,7 @@ def describe(a):
     return (type(a), str(a.dtype), a.shape, a.weak_type, a.committed, str(a.sharding), str(a.aval), np.asarray(a).tobytes())
 
 
-check("all measures installed", all(tuning.STATUS.get(k) == "on" for k in ("compile", "mlir_context", "asarray", "lazy_mhlo")), str(tuning.STATUS))
+check("all measures installed", all(tuning.STATUS.get(k) == "on" for k in ("compile", "mlir_context", "asarray", "lazy_mhlo", "inline_jits_under_ad", "lowering_in_place")), str(tuning.STATUS))
 
 # ---- jnp.asarray --------------------------------------------------------------------------------
 original_asarray = tuning._jax_asarray
@@ -126,8 +127,9 @@ def compiled_with(function, n, **jit_options):
 
 
 (overrides, level, passes), tuned = compiled_with(readout, 101)
-check("compile: small program with a host callback gets classic emitter, one module, level 0",
-      overrides == {"xla_cpu_use_fusion_emitters": False, "xla_cpu_parallel_codegen_split_count": 1} and level == 0 and passes == "", f"{overrides} {level} {passes!r}")
+check("compile: small program with a host callback gets classic emitter, one module, level 0, plain sums",
+      overrides == {"xla_cpu_use_fusion_emitters": False, "xla_cpu_parallel_codegen_split_count": 1} and level == 0
+      and passes == ("tree_reduction_rewriter" if tuning.PLAIN_SMALL_REDUCTIONS else ""), f"{overrides} {level} {passes!r}")
 (overrides, level, _), _ = compiled_with(plain, 101)
 check("compile: small program without host callback keeps LLVM optimization", len(overrides) == 2 and level == 3, f"{overrides} {level}")
 (overrides, level, _), _ = compiled_with(readout, 5000)
@@ -249,6 +251,60 @@ def model(p):
 batch = jax.vmap(lambda p: jnp.sum(jnp.abs(p * (1 + 2j)) ** 2))(jnp.arange(6.0).reshape(2, 3))
 check("jit, grad and vmap give the expected numbers", np.allclose(jax.jit(model)(jnp.arange(3.0)), 5 * np.sum(np.arange(3.0) ** 2))
       and np.allclose(jax.grad(lambda p: jnp.sum(jnp.abs(p * (1 + 2j)) ** 2))(jnp.arange(3.0)), 10 * np.arange(3.0)) and np.allclose(batch, [25.0, 250.0]))
+
+# ---- inline jits under differentiation, lowering in place ----------------------------------------
+def readout_like(x, reference):
+    detected = jnp.abs(x[0] - x[1]).squeeze()
+    sensitivity = (reference / detected).squeeze()
+    return jnp.mean(jnp.log10(sensitivity / reference)) + jnp.sum(jnp.sin(x.real) * jnp.exp(-x.imag ** 2))
+
+
+def variants(function, *arguments):
+    """Values and derivatives of `function` through several transformations, as NumPy arrays."""
+    value, pullback = jax.vjp(function, *arguments)
+    out = [value, *pullback(jnp.ones_like(value))]
+    out += [jax.jvp(function, arguments, tuple(jnp.ones_like(a) for a in arguments))[1]]
+    out += [jax.jit(lambda *a: jax.vjp(function, *a)[1](1.0))(*arguments)[0]]
+    out += [jax.vmap(lambda a: jax.grad(lambda r: function(a, r))(arguments[1]))(jnp.stack([arguments[0], 2 * arguments[0]]))]
+    out += [jax.hessian(lambda r: function(arguments[0], r))(arguments[1])]
+    return [np.asarray(item) for item in out]
+
+
+def with_switches(function, *arguments, **switches):
+    saved = {name: getattr(tuning, name) for name in switches}
+    for name, value in switches.items():
+        setattr(tuning, name, value)
+    try:
+        jax.clear_caches()
+        return variants(function, *arguments)
+    finally:
+        for name, value in saved.items():
+            setattr(tuning, name, value)
+
+
+x0 = jnp.asarray(np.random.default_rng(3).normal(size=(2, 1, 7)) + 1j * np.random.default_rng(4).normal(size=(2, 1, 7)))
+r0 = jnp.asarray(np.random.default_rng(5).uniform(1.0, 2.0, 7))
+jax_way = with_switches(readout_like, x0, r0, INLINE_JITS_UNDER_AD=False, DIRECT_LOWERING_SMALL_PROGRAMS=False)
+for title, switches in (("inline jits under differentiation", dict(INLINE_JITS_UNDER_AD=True, DIRECT_LOWERING_SMALL_PROGRAMS=False)),
+                        ("lowering in place", dict(INLINE_JITS_UNDER_AD=False, DIRECT_LOWERING_SMALL_PROGRAMS=True)),
+                        ("both", dict(INLINE_JITS_UNDER_AD=True, DIRECT_LOWERING_SMALL_PROGRAMS=True))):
+    ours = with_switches(readout_like, x0, r0, **switches)
+    worst = max(float(np.max(np.abs(a - b))) for a, b in zip(jax_way, ours))
+    check(f"{title}: vjp, jvp, jit, vmap of grad and hessian as without it", len(jax_way) == len(ours) and worst <= 1e-13, f"largest difference {worst:.2e}")
+
+with Spy("_jax_lower_jaxpr_to_module") as spy:
+    jax.clear_caches()
+    jax.block_until_ready(jax.jit(long_program)(jnp.arange(4.0)))
+    small_then = tuning._is_small_jaxpr(jax.make_jaxpr(lambda v: jnp.sin(v) + 1)(jnp.arange(4.0)))
+check("lowering in place: a long program is lowered the way JAX lowers it", len(spy.calls) >= 1 and small_then
+      and not tuning._is_small_jaxpr(jax.make_jaxpr(long_program)(jnp.arange(4.0))))
+check("lowering in place: nothing stays switched on after a lowering", not getattr(tuning._lowering, "in_place", False))
+ordered = []
+jax.clear_caches()
+jax.jit(lambda v: (jax.experimental.io_callback(lambda a: ordered.append(float(a)) or a, v, v, ordered=True),
+                   jax.experimental.io_callback(lambda a: ordered.append(float(a) + 1) or a, v, v, ordered=True))[1])(jnp.float64(5.0))
+jax.effects_barrier()
+check("lowering in place: ordered callbacks keep their order", ordered == [5.0, 6.0], str(ordered))
 
 print(f"\n{len(failures)} failed" if failures else "\nall checks passed")
 sys.exit(1 if failures else 0)
