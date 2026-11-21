@@ -142,6 +142,17 @@ Am gespeicherten Design sind alle Abweichungen zum Original-JAX unverändert (Se
 
 Nicht eingebaut, weil es eine Regelfrage ist: Der Schalter `jax_disable_most_optimizations` würde die Kompilation des Readouts aus `benchmark.py` in Docker um rund 42 ms verkürzen (Mac: 13 ms). Die Frage steht als B6 in `FRAGEN_AN_FEYER.md`.
 
+## Vierte Runde vom 21.11. (Branch `noel`)
+
+Eine Änderung: Der Rückwärtslauf speichert Ableitungen der Komponentenfunktionen nur noch für die Ausgänge, die wirklich von einer Designvariable abhängen. Vorher füllte er pro Funktionsgruppe ein dichtes Array, das grösstenteils aus Nullen bestand.
+
+| Umgebung | Erstlauf Runde 3 | Erstlauf Runde 4 | Gradient-Phase | Warm |
+|---|---:|---:|---|---|
+| Apple M4, macOS (16 Läufe im Wechsel) | 0,438 s | **0,436 s** | 10,7 → 9,8 ms | 32,4 → 31,3 ms |
+| Docker, Linux aarch64, `--cpus 1` (12 Läufe im Wechsel) | 0,519 s | **0,515 s** | 16,4 → 14,8 ms | 40,3 → 38,4 ms |
+
+Alle Prüfungen fallen aus wie zuvor. Gemessen und bewusst nicht übernommen wurde eine Bündelung der kleinen Arrays für den Rückwärtslauf: Sie macht den Erstlauf in Docker 3 ms schneller, die warmen Wiederholungen dort aber 6 ms langsamer. Die Einzelheiten stehen in `runs/noel/NOTIZEN.md`.
+
 ## Wo die verbleibende Zeit steckt
 
 Im First-Run (ca. 0,4 s auf macOS) steckt kaum noch Physik:

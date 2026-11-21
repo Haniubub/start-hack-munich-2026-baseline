@@ -1,6 +1,6 @@
 # Optimierung auf Branch `noel`: Stand, Messmethode, offene Ideen
 
-Stand: Sa 21.11.2026, nach der dritten Runde (Commit `1442ef3`). Diese Datei ist das Gedächtnis für die nächste Optimierungsrunde.
+Stand: Sa 21.11.2026, nach der vierten Runde (Commit `ba8f1f2`). Diese Datei ist das Gedächtnis für die nächste Optimierungsrunde.
 
 ## Messwerte
 
@@ -24,7 +24,29 @@ Phasen (Median, ms):
 | Gradient (inkl. Sensitivity, Transfer) | 26,9 | 16,4 | 13,2 | 11,7 | 39,3 | 27,7 | 21,9 | 17,7 |
 | Warm (Median) | 66,9 | 43,6 | 38,3 | 32,8 | 84,0 | 62,0 | 51,9 | 38,6 |
 
-Die Reports `mac-neu.json`, `mac-neu.png` und `docker-neu.json` zeigen den Stand `1442ef3` (Erstlauf 430,8 ms bzw. 519,8 ms, warm 30,5 bzw. 37,8 ms). Der Mac-Report ist der mittlere von drei Läufen (427,1 bis 445,4 ms, der Rechner war dabei ruhiger als in der Messreihe oben), der Docker-Report der mittlere von fünf (513,4 bis 522,6 ms). Die `*-vorher`-Reports zeigen Philip + Max.
+Runde 4 gegen Runde 3, eigene Messreihe (Mac 16 Läufe, Docker 12 Läufe, Median):
+
+| Umgebung | Erstlauf Runde 3 (`6635856`) | Erstlauf Runde 4 (`ba8f1f2`) | Gradient-Phase | Warm |
+| --- | ---: | ---: | --- | --- |
+| Mac | 437,9 ms | **435,9 ms** | 10,7 → 9,8 ms | 32,4 → 31,3 ms |
+| Docker `--cpus 1` | 519,3 ms | **515,0 ms** | 16,4 → 14,8 ms | 40,3 → 38,4 ms |
+
+Die Reports `mac-neu.json`, `mac-neu.png` und `docker-neu.json` zeigen den Stand `ba8f1f2` (Erstlauf 433,5 ms bzw. 505,7 ms, warm 30,8 bzw. 41,3 ms). Der Mac-Report ist der mittlere von drei Läufen (424,1 bis 435,4 ms), der Docker-Report der mittlere von fünf (499,5 bis 514,8 ms). Der Rechner war dabei ruhiger als in den Messreihen oben. Die `*-vorher`-Reports zeigen Philip + Max.
+
+## Was in Runde 4 geändert wurde
+
+| Nr. | Änderung | Datei | Gewinn im Wechselvergleich |
+| --- | --- | --- | --- |
+| 17 | Der Rückwärtslauf speichert Ableitungen nur noch für Funktionsausgänge, die wirklich von einer Designvariable abhängen, und zwar in der Form, in der die Dual-Zahlen sie liefern. Vorher füllte `_EntryBlock.run` pro Gruppe ein dichtes Array (Zeilen × Aufrufe × 4 Ausgänge × Eingänge), grösstenteils Nullen. Ableitungen, die nicht von der Frequenz abhängen, behalten eine einzige Zeile | `fast.py`, `_EntryBlock.run` und `back` | Rückwärts-Callback einzeln auf dem Mac 8,0 → 7,2 ms. Gradient-Phase: Mac 10,7 → 9,8 ms, Docker 16,4 → 14,8 ms |
+
+In dieser Runde gemessen und nicht übernommen:
+
+| Versuch | Ergebnis |
+| --- | --- |
+| Die 22 kleinen Arrays für den Rückwärtslauf im Forward-Callback zu zwei Residuen bündeln (36 → 15 Callback-Argumente, 23 → 1 durchgereichtes Residuum) | Erstlauf: Docker 514,6 → 511,4 ms (Gradient-Phase 16,1 → 13,8 ms), Mac 438,0 → 436,6 ms, je 12 Läufe. Aber warm in Docker 38,9 → 44,8 ms. Grund: Ohne die vielen kleinen Arrays stutzt glibc den Heap nach jedem Aufruf, und jeder Aufruf fasst wieder rund 4'400 (Forward) und 3'300 (Rückwärts) frische Seiten an. Auf dem Mac bleibt warm gleich. Eine Variante, die nur die 18 Index-Arrays bündelt, verhält sich warm genauso. Zurückgenommen, Entscheid bei Noel |
+| Alle Ergebnis-Arrays des Forward-Laufs in einem gemeinsamen Speicherblock anlegen | 886 → 472 Seitenfehler, aber nur 0,1 bis 0,3 ms. Nicht der Mühe wert |
+| SuperLU mit anderen Werten für `PanelSize` (1, 2, 4, 8) und `Relax` (1, 2, 3, 4, 6), mit und ohne `SymmetricMode` | Keine Einstellung ist messbar schneller als `PanelSize=1`, `Relax=1` (12,96 ms im Median für Zerlegung und beide Lösungen auf dem Mac). Die beste andere liegt bei 12,83 ms, also innerhalb der Streuung. Ab `Relax=2` wird es langsamer, bis 17,8 ms |
+| Idee 1 als Wegwerf-Versuch: Forward-Callback ohne die zwei dichten Matrizen | Forward-Phase im Erstlauf in Docker 32,7 → 29,2 ms (−3,5 ms), rund 3'000 Seitenfehler weniger, warm −0,8 ms. Damit ist die Schätzung für Idee 1 durch eine Messung ersetzt |
 
 ## Was in Runde 3 geändert wurde
 
@@ -63,7 +85,7 @@ Zu Nr. 9: Die Skalierung macht den Löser auch genauer. Bei zufällig verändert
 | 6 | Schnellerer Aufbau des Matrix-Musters (Schlüssel + `searchsorted` statt dichter Masken) | `fast.py`, `SystemPlan` | 3,6 → 1,8 ms je Aufruf |
 | 7 | Plotly erst bei Bedarf laden (Max' Fassung) | `__init__.py` | Import `differometor` 107 → 15 ms (zusammen mit Nr. 1) |
 
-## Wo die restliche Zeit steckt (Docker, Stand Runde 3)
+## Wo die restliche Zeit steckt (Docker, Stand Runde 3, Gradient Runde 4)
 
 | Phase | ms | Unser Anteil |
 | --- | ---: | --- |
@@ -76,9 +98,19 @@ Zu Nr. 9: Die Skalierung macht den Löser auch genauer. Bei zufällig verändert
 | Sensitivity: Kompilation | 66 | nichts. Das ist der Readout aus `benchmark.py` in XLA |
 | Gradient: Lowering | 5 | wenig |
 | Gradient: Kompilation | 36 | nichts |
-| Gradient | 16 | fast alles. Callback 11,8 ms: Funktionen mit Ableitung 4,5, Schleife in `backward` 4,0, Rückrechnung auf die Parameter 1,9. Ausserhalb ca. 3,5 ms Übergabe |
+| Gradient | 15 | fast alles. Callback 10,0 bis 10,7 ms: Funktionen mit Ableitung 3,5 bis 4,0, Schleife in `backward` 3,6, Rückrechnung auf die Parameter 1,3. Ausserhalb ca. 3,5 ms Übergabe (36 Argumente) |
 
 Rund 430 von 520 ms sind fix, solange `benchmark.py` unverändert bleibt und keine JAX-Schalter gesetzt werden dürfen.
+
+## Erkenntnisse aus Runde 4 (Messungen, Erklärungen sind als solche bezeichnet)
+
+| Thema | Befund |
+| --- | --- |
+| Warum warme Aufrufe in Docker mal schnell und mal langsam sind | Gemessen: Mit einer festen Stutz-Schwelle von 19 MB fallen pro warmem Forward-Aufruf 2'900 bis 4'700 Seitenfehler an, mit einer sehr grossen Schwelle 700 bis 1'600. Erklärung: glibc passt zwei Schwellen laufend an. Die mmap-Schwelle wird so gross wie der grösste freigegebene Block (hier die 9-MB-Kopien der dichten Matrizen), die Stutz-Schwelle doppelt so gross (18 MB). Ab dem zweiten Aufruf liegen die zwei 9-MB-Kopien im Heap des Arbeits-Threads. Werden sie und unsere Zwischenarrays freigegeben, ist oben mehr als 18 MB frei, und glibc gibt den Speicher ans System zurück. Der nächste Aufruf fasst ihn wieder frisch an |
+| Warum das bisher meist nicht passierte | Vermutung, passend zu den Messungen: Kleine, länger lebende Arrays (die durchgereichten Index-Arrays, der zurückgegebene Gradient) liegen zufällig über den freigegebenen Bereichen und verhindern das Stutzen. Mit weniger kleinen Arrays (Bündelungs-Versuch) trat es in 10 von 12 Läufen auf, vorher in 2 von 12. Das ist ein Zufall des Speicherlayouts, kein Verdienst des Codes |
+| Feste Schwellen als Gegenprobe | Mit `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=9500000:glibc.malloc.trim_threshold=2000000000` (nur zur Messung gesetzt, zusammen mit dem Bündelungs-Versuch): Forward-Phase im Erstlauf 33,4 → 31,7 ms, Gradient-Phase 13,4 → 11,6 ms (Mittel aus zwei bis drei Läufen im selben Messskript). Der Rückwärts-Callback hat dann schon im ersten Aufruf keine Seitenfehler mehr. Rund 3,5 ms im Erstlauf, aber eine Einstellung der Umgebung, also Regelfrage B6 |
+| Kosten pro Callback-Argument | Rund 11 µs pro Argument und Aufruf, dazu je rund 15 µs beim Lowering und 20 µs bei der Kompilation (Versuch mit 0, 10 und 40 Argumenten). Ein durchgereichtes Residuum kostet rund 10 µs Lowering und 20 µs Kompilation |
+| Build | `run_build_step` braucht warm 6,5 bis 7,5 ms: `build` 4,8 ms (davon `set_instructions` geschätzt 2 ms in 519 Aufrufen), `pairs_to_arrays` 1,5 ms, `prepare_arrays` 0,1 ms. Die Übergabe der 38 Arrays an JAX kostet zusammen nur 0,6 ms |
 
 ## Erkenntnisse aus Runde 3 (alle gemessen)
 
@@ -111,7 +143,7 @@ source .venv/bin/activate
 # Wechselvergleich lokal: Vergleichsstand als Kopie (runs/noel/vergleich) oder Git-Worktree
 python runs/noel/ab.py 12 vorher=runs/noel/vergleich neu=.
 # Wechselvergleich in Docker (Linux, --cpus 1), beliebig viele Images
-docker build -q -t differometor-bench:neu . && python runs/noel/ab_docker.py 10 vorher=differometor-bench:runde3 neu=differometor-bench:neu
+docker build -q -t differometor-bench:neu . && python runs/noel/ab_docker.py 10 vorher=differometor-bench:runde4 neu=differometor-bench:neu
 # Profil der Host-Callbacks, lokal oder im Image
 source runs/env.sh && python runs/noel/profil.py . forward
 docker run --rm --cpuset-cpus 0 --entrypoint python differometor-bench:neu /app/runs/noel/profil.py /app backward
@@ -119,7 +151,7 @@ docker run --rm --cpuset-cpus 0 --entrypoint python differometor-bench:neu /app/
 
 Einzelne Läufe streuen um bis zu 40 ms. Darum immer abwechselnd messen und Median und Minimum ansehen. Der erste Lauf eines frisch gebauten Images ist ein Ausreisser (562 statt 520 ms) und zählt nicht.
 
-Vorhandene Docker-Images: `differometor-bench:base` (Philip + Max), `:vorher` (`c261b63`), `:kandidat3` (`49d386b`), `:runde3` (`1442ef3`), `:joel` (`76e799f`).
+Vorhandene Docker-Images: `differometor-bench:base` (Philip + Max), `:vorher` (`c261b63`), `:kandidat3` (`49d386b`), `:runde3` (`1442ef3`), `:runde4` (`ba8f1f2`), `:joel` (`76e799f`).
 
 ## Korrektheit prüfen (nach jeder Änderung)
 
@@ -138,7 +170,7 @@ python runs/noel/test_perturbed.py .    # veränderte Designvariablen gegen das 
 python benchmark.py --repeats 3 --output orig.json --save-arrays orig.npz
 ```
 
-Sollwerte (Stand `1442ef3`, auf Noels M4, unverändert seit Runde 2):
+Sollwerte (Stand `ba8f1f2`, auf Noels M4, unverändert seit Runde 2):
 
 | Grösse | Abweichung gegen das Original-JAX (max, relativ zum Maximum) |
 | --- | ---: |
@@ -175,10 +207,10 @@ Sollwerte (Stand `1442ef3`, auf Noels M4, unverändert seit Runde 2):
 
 | Nr. | Idee | Schätzung | Haken |
 | --- | --- | --- | --- |
-| 1 | Sparse-Form der Signal- und Rauschmatrix im Build erzeugen und als zusätzliche Argumente an `simulate` geben. Dann gehen die dichten Matrizen nie mehr durch einen Callback | geschätzt 4 bis 6 ms in Docker (19 MB Kopie, rund 5'000 Seitenfehler, zwei Suchläufe), 2 bis 3 ms auf dem Mac | Sparse-Form und dichte Matrix können auseinanderlaufen, wenn jemand die Arrays von Hand ändert. Entscheid fürs Team, Noel wurde am 21.11. gefragt (Empfehlung: lassen) |
-| 2 | Jacobi-Einträge im Rückwärtslauf nur für Ausgänge speichern, die wirklich von einer Designvariable abhängen | geschätzt 0,5 bis 1 ms im Erstlauf (2'100 Seitenfehler in `_EntryBlock.run`) | Umbau von `run` und `back` |
-| 3 | `build.py` straffen (`set_instructions` 519 Aufrufe, `pairs_to_arrays`) | geschätzt 3 ms | Viel Code für wenig Gewinn |
-| 4 | Falls Feyer JAX-Einstellungen im Code erlaubt (B6): eine Zeile `jax.config.update("jax_disable_most_optimizations", True)` in `differometor/__init__.py` | gemessen: 42 ms in Docker, 13 ms auf dem Mac | Nur nach Zusage von Feyer |
+| 1 | Die dichte Signal- und Rauschmatrix nicht mehr durch den Forward-Callback schicken, sondern ihre Sparse-Form aus dem Build mitgeben | gemessen im Wegwerf-Versuch: 3,5 ms im Erstlauf in Docker, 0,8 ms warm | Als zusätzliche Einträge im `arrays`-Dict könnten Sparse-Form und dichte Matrix auseinanderlaufen, wenn jemand die Matrix von Hand ersetzt. Ohne dieses Risiko ginge es nur, wenn die Sparse-Form am Matrix-Objekt selbst hängt (eigener Pytree-Typ statt `jax.Array` für drei Werte im Dict, rund 120 Zeilen). Entscheid fürs Team, Noel wurde am 21.11. gefragt (Empfehlung: lassen) |
+| 2 | Kleine Arrays für den Rückwärtslauf bündeln (in Runde 4 gebaut, gemessen, zurückgenommen) | gemessen: 3,2 ms im Erstlauf in Docker, 1,4 ms auf dem Mac | Warm in Docker 6 ms langsamer (siehe Runde 4). Nur sinnvoll, wenn allein der Erstlauf zählt. Entscheid bei Noel |
+| 3 | `build.py` straffen (`set_instructions` 519 Aufrufe, `pairs_to_arrays`) | geschätzt 2 bis 3 ms | Das ist Upstream-Code mit vielen kleinen NumPy-Schritten pro Bauteil. Ein Umbau wäre gross und müsste für alle Setups gleich bleiben |
+| 4 | Falls Feyer Einstellungen im Code erlaubt (B6): eine Zeile `jax.config.update("jax_disable_most_optimizations", True)` in `differometor/__init__.py`, dazu feste glibc-Schwellen über `mallopt` | gemessen: 42 ms in Docker und 13 ms auf dem Mac für den JAX-Schalter, rund 3,5 ms in Docker für die glibc-Schwellen | Nur nach Zusage von Feyer |
 | 5 | `noel` auf Joels x86-Maschine messen (AMD EPYC, `taskset -c 14 python benchmark.py --cpus 1`) | – | Joel fragen |
 
 ## Stand der anderen Branches
@@ -187,11 +219,11 @@ Vor jeder Runde: `git fetch --all --prune`, dann alle fremden Branches auf neue 
 
 | Branch | Zuletzt gesehen | Stand in `noel` |
 | --- | --- | --- |
-| `origin/philip` | `ab82e42` (20.11. 19:58), unverändert am 21.11. 05:32 | vollständig enthalten |
+| `origin/philip` | `ab82e42` (20.11. 19:58), unverändert am 21.11. 06:35 | vollständig enthalten |
 | `origin/max/lu-once` | `79ae580` (20.11. 20:08), unverändert | vollständig enthalten |
 | `origin/max/nacht` | `f1000e9` (21.11. 03:25), neu in Runde 3 | zusammengeführt in `7279114`. Übernommen: nachgeladene Module, `_EntryBlock.back`, In-place-Produkte, `signal_values` ohne Zwischenkopie. Ersetzt durch den Stand von `noel`: Spaltenordnung `MMD_ATA` (7'916 Faktoreinträge gegen 6'100) |
-| `origin/Joel` | `76e799f` (21.11. 05:19), baut auf Philips `ab82e42` auf | nichts zu übernehmen. Joels drei Code-Änderungen (Host-Detektoren, Plotly bei Bedarf, SuperLU ohne SciPy-Import) hat `noel` seit Runde 1 in eigener Fassung |
-| `origin/sx`, `origin/sx2`, `origin/sx2-env` | `2c9e8bf`, `036194a`, `bf6bf60` (21.11. 03:33 bis 04:00) | nicht übernommen. Das sind Joels vorbereitete Varianten mit XLA-Flags bzw. `jax_disable_most_optimizations`, laut seinem README erst nach Zusage von Feyer zu aktivieren. Gleiche Regelfrage wie unser B6 |
+| `origin/Joel` | `76e799f` (21.11. 05:19), unverändert am 21.11. 06:35, baut auf Philips `ab82e42` auf | nichts zu übernehmen. Joels drei Code-Änderungen (Host-Detektoren, Plotly bei Bedarf, SuperLU ohne SciPy-Import) hat `noel` seit Runde 1 in eigener Fassung |
+| `origin/sx`, `origin/sx2`, `origin/sx2-env` | `2c9e8bf`, `036194a`, `bf6bf60` (21.11. 03:33 bis 04:00), unverändert am 21.11. 06:35 | nicht übernommen. Das sind Joels vorbereitete Varianten mit XLA-Flags bzw. `jax_disable_most_optimizations`, laut seinem README erst nach Zusage von Feyer zu aktivieren. Gleiche Regelfrage wie unser B6 |
 | `origin/main` | `5eece1d` | unverändertes Kit |
 
 Joels Stand gegen `noel` auf Noels Rechner (je 10 Läufe im Wechsel, Median):
