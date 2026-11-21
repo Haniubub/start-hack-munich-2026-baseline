@@ -27,8 +27,8 @@ The JAX integration (`simulate_fast`) is a `jax.custom_vjp` around two
 `jax.pure_callback`s. The forward callback returns every residual the backward pass needs
 as arrays that flow through JAX, so the backward callback can rebuild everything from them.
 It only does so when it has to: a forward pass that is followed by a pullback keeps its
-plans, matrix entries and factorization in a small cache (`FORWARD_CACHE`), and the pullback
-finds them through a key that travels with the residuals.
+work on the host in a small cache (`FORWARD_CACHE`), and the pullback finds it through a key
+that travels with the residuals.
 """
 
 import importlib.machinery
@@ -1043,15 +1043,21 @@ def _output_shapes(arrays):
 
 
 # Work of the forward pass that the backward pass can reuse: both plans, the matrix entries
-# with their Jacobian tape, the signal matrix values and the carrier factorization. This is a
-# shortcut only. Everything the backward pass needs still flows through JAX as residuals, and
-# when the entry of a pullback is gone, or FORWARD_CACHE is off, it is recomputed from them.
+# with their Jacobian tape, the signal matrix values, the carrier factorization, and the results
+# with the adjoint helpers Y, MU and Z. With the cache on, a forward pass that is followed by a
+# pullback leaves all of this on the host and hands JAX only the outputs and a key; the pullback
+# finds its forward pass through the key. Nothing depends on the entry still being there: when
+# it is gone the backward callback runs the forward pass again from its own inputs.
+#
+# With `FORWARD_CACHE = False` (read when a function is traced) the callbacks keep no state:
+# Y, MU and Z flow through JAX as residuals and the backward callback rebuilds the rest.
 FORWARD_CACHE = True
 _FORWARD_CACHE_SIZE = 2
 _forward_cache = {}
 
 
-def _host_forward(optimized_parameters, *host_arrays, taped=False):
+def _run_forward(optimized_parameters, host_arrays, taped):
+    """The forward pass on the host: results (carrier, signal, noise, Y, MU, Z) and the reusable work."""
     A = dict(zip(HOST_KEYS, host_arrays))
     entry_plan, plan = EntryPlan(A), SystemPlan(A)
     if taped:  # a pullback will follow: evaluate the entries with derivatives once, here
@@ -1059,40 +1065,24 @@ def _host_forward(optimized_parameters, *host_arrays, taped=False):
     else:
         entries, tape = entry_plan.values(optimized_parameters), None
     carrier, X, noise, Y, MU, Z, kept = forward(plan, *entries)
-    token = 0
-    if taped:
-        token = int.from_bytes(os.urandom(6), "little") + 1  # exact in float64, never reused in practice
-        while len(_forward_cache) >= _FORWARD_CACHE_SIZE:
-            del _forward_cache[next(iter(_forward_cache))]
-        _forward_cache[token] = (np.array(optimized_parameters, float), entry_plan, plan, entries, tape, kept)
-    return carrier[:, None], np.ascontiguousarray(X.T), noise.reshape(-1), Y, MU, Z, np.float64(token)
+    return (carrier, np.ascontiguousarray(X.T), noise, Y, MU, Z), (entry_plan, plan, entries, tape, kept)
 
 
-def _host_forward_taped(optimized_parameters, *host_arrays):
-    return _host_forward(optimized_parameters, *host_arrays, taped=FORWARD_CACHE)
-
-
-def _host_backward(optimized_parameters, *rest):
-    k = len(HOST_KEYS)
-    carrier, signal, noise, Y, MU, Z, token, carrier_bar, signal_bar, noise_bar = rest[k:]
+def _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, noise_bar):
+    """The backward pass on the host, from the results and the work of the forward pass."""
+    carrier, signal, noise, Y, MU, Z = results
+    entry_plan, plan, entries, tape, kept = work
     F = Y.shape[0]
-    cached = _forward_cache.get(int(token))
-    if cached is not None and np.array_equal(cached[0], optimized_parameters):
-        _, entry_plan, plan, (carrier_entries, signal_entries, _), tape, kept = cached
-    else:
-        A = dict(zip(HOST_KEYS, rest[:k]))
-        entry_plan, plan, kept = EntryPlan(A), SystemPlan(A), None
-        (carrier_entries, signal_entries, _), tape = entry_plan.entries(optimized_parameters)
     entries_bar = backward(
         plan,
-        carrier_entries,
-        signal_entries,
-        np.asarray(carrier)[:, 0],
-        np.asarray(signal),
-        np.asarray(noise).reshape(F),
-        np.asarray(Y),
-        np.asarray(MU),
-        np.asarray(Z),
+        entries[0],
+        entries[1],
+        carrier,
+        signal,
+        noise,
+        Y,
+        MU,
+        Z,
         np.asarray(carrier_bar)[:, 0],
         np.asarray(signal_bar),
         np.asarray(noise_bar, float).reshape(F),
@@ -1102,25 +1092,71 @@ def _host_backward(optimized_parameters, *rest):
     return gradient.astype(optimized_parameters.dtype)
 
 
-def _forward_callback(optimized_parameters, host, taped=False):
+def _host_forward(optimized_parameters, *host_arrays):
+    """Stateless forward callback: the outputs and the adjoint helpers Y, MU, Z."""
+    (carrier, signal, noise, Y, MU, Z), _ = _run_forward(optimized_parameters, host_arrays, taped=False)
+    return carrier[:, None], signal, noise.reshape(-1), Y, MU, Z
+
+
+def _host_forward_plain(optimized_parameters, *host_arrays):
+    """Forward callback when no pullback follows: only the outputs."""
+    return _host_forward(optimized_parameters, *host_arrays)[:3]
+
+
+def _host_forward_cached(optimized_parameters, *host_arrays):
+    """Forward callback in front of a pullback: the outputs and the key of the cache entry."""
+    results, work = _run_forward(optimized_parameters, host_arrays, taped=True)
+    token = int.from_bytes(os.urandom(6), "little") + 1  # exact in float64, never reused in practice
+    while len(_forward_cache) >= _FORWARD_CACHE_SIZE:
+        del _forward_cache[next(iter(_forward_cache))]
+    _forward_cache[token] = (np.array(optimized_parameters, float), results, work)
+    carrier, signal, noise = results[:3]
+    return carrier[:, None], signal, noise.reshape(-1), np.float64(token)
+
+
+def _host_backward(optimized_parameters, *rest):
+    """Stateless backward callback: everything comes from the residuals."""
+    k = len(HOST_KEYS)
+    carrier, signal, noise, Y, MU, Z, carrier_bar, signal_bar, noise_bar = rest[k:]
+    A = dict(zip(HOST_KEYS, rest[:k]))
+    entry_plan, plan = EntryPlan(A), SystemPlan(A)
+    entries, tape = entry_plan.entries(optimized_parameters)
+    results = (np.asarray(carrier)[:, 0], np.asarray(signal), np.asarray(noise).reshape(-1), np.asarray(Y), np.asarray(MU), np.asarray(Z))
+    return _run_backward(optimized_parameters, results, (entry_plan, plan, entries, tape, None), carrier_bar, signal_bar, noise_bar)
+
+
+def _host_backward_cached(optimized_parameters, *rest):
+    """Backward callback for `_host_forward_cached`: reuses the forward pass, or repeats it if it is gone."""
+    k = len(HOST_KEYS)
+    token, carrier_bar, signal_bar, noise_bar = rest[k:]
+    cached = _forward_cache.get(int(token))
+    if cached is not None and np.array_equal(cached[0], optimized_parameters):
+        _, results, work = cached
+    else:
+        results, work = _run_forward(optimized_parameters, rest[:k], taped=True)
+    return _run_backward(optimized_parameters, results, work, carrier_bar, signal_bar, noise_bar)
+
+
+def _result_shapes(host):
+    """Shapes of the forward outputs and of the adjoint helpers, plus the shape of `noise`."""
     n, m, F, noise_shape = _output_shapes(host)
-    result_shapes = (
+    outputs = (
         jax.ShapeDtypeStruct((n, 1), jnp.complex128),
         jax.ShapeDtypeStruct((m, F), jnp.complex128),
         jax.ShapeDtypeStruct((F,), jnp.float64),
+    )
+    helpers = (
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m), jnp.complex128),
         jax.ShapeDtypeStruct((F, m, DETECTOR_WIDTH), jnp.complex128),
-        jax.ShapeDtypeStruct((), jnp.float64),  # key into the forward cache, see FORWARD_CACHE
     )
-    carrier, signal, noise, Y, MU, Z, token = jax.pure_callback(
-        _host_forward_taped if taped else _host_forward,
-        result_shapes,
-        optimized_parameters,
-        *(host[k] for k in HOST_KEYS),
-        vmap_method="sequential",
+    return outputs, helpers, noise_shape
+
+
+def _call_host(function, shapes, optimized_parameters, host, *more):
+    return jax.pure_callback(
+        function, shapes, optimized_parameters, *(host[k] for k in HOST_KEYS), *more, vmap_method="sequential"
     )
-    return (carrier, signal, noise.reshape(noise_shape)), (Y, MU, Z, token)
 
 
 def _is_primal(x):
@@ -1135,8 +1171,9 @@ def _zeros_if_symbolic(value):
 
 @jax.custom_vjp
 def _fast(optimized_parameters, host, others):
-    outputs, _ = _forward_callback(optimized_parameters, host)
-    return outputs
+    outputs, _, noise_shape = _result_shapes(host)
+    carrier, signal, noise = _call_host(_host_forward_plain, outputs, optimized_parameters, host)
+    return carrier, signal, noise.reshape(noise_shape)
 
 
 def _fast_fwd(optimized_parameters, host, others):
@@ -1151,30 +1188,22 @@ def _fast_fwd(optimized_parameters, host, others):
         full = lambda p, host, others: simulate_jax(optimized_parameters=p, **host, **others)
         outputs, pullback = jax.vjp(full, p, host, others)
         return outputs, (pullback,)
-    outputs, (Y, MU, Z, token) = _forward_callback(p, host, taped=True)
-    return outputs, (p, host, outputs, Y, MU, Z, token)
+    outputs, helpers, noise_shape = _result_shapes(host)
+    if FORWARD_CACHE:
+        key = jax.ShapeDtypeStruct((), jnp.float64)
+        carrier, signal, noise, token = _call_host(_host_forward_cached, outputs + (key,), p, host)
+        return (carrier, signal, noise.reshape(noise_shape)), (p, host, token)
+    carrier, signal, noise, Y, MU, Z = _call_host(_host_forward, outputs + helpers, p, host)
+    return (carrier, signal, noise.reshape(noise_shape)), (p, host, carrier, signal, noise, Y, MU, Z)
 
 
 def _fast_bwd(residuals, cotangents):
     cotangents = tuple(_zeros_if_symbolic(c) for c in cotangents)
     if len(residuals) == 1:
         return residuals[0](cotangents)
-    p, host, (carrier, signal, noise), Y, MU, Z, token = residuals
-    gradient = jax.pure_callback(
-        _host_backward,
-        jax.ShapeDtypeStruct(p.shape, p.dtype),
-        p,
-        *(host[k] for k in HOST_KEYS),
-        carrier,
-        signal,
-        noise,
-        Y,
-        MU,
-        Z,
-        token,
-        *cotangents,
-        vmap_method="sequential",
-    )
+    p, host, *rest = residuals
+    function = _host_backward_cached if len(rest) == 1 else _host_backward
+    gradient = _call_host(function, jax.ShapeDtypeStruct(p.shape, p.dtype), p, host, *rest, *cotangents)
     return gradient, None, None
 
 
