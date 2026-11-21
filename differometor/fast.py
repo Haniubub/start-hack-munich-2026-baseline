@@ -432,22 +432,25 @@ class _EntryBlock:
 
     def run(self, parameters):
         """
-        parameters: (R, P). Returns entries (R, E) and the Jacobian tape for the reverse pass:
-        per group an array (R or 1, calls, 4, differentiated inputs), or None without derivatives.
+        parameters: (R, P). Returns entries (R, E) and the tape for the reverse pass.
+
+        The tape lists, per group, the function outputs that depend on a differentiated input:
+        pairs (output index, tangent) with a tangent of shape (differentiated inputs, R or 1,
+        calls). A tangent that is the same in every row keeps a single row.
         """
         entries = np.empty((parameters.shape[0], self.outputs.shape[1]), complex)
         tape = []
         for index, ((function_index, _, _, columns), writes) in enumerate(zip(self.groups, self.writes)):
             arguments, lead = self._arguments(parameters, index)
-            width = columns.size
-            jacobian = np.zeros(lead + (4, width), complex) if width else None
+            derivatives = []
             for o, item in enumerate(_function_outputs(function_index, arguments, columns)):
                 if isinstance(item, Dual):
                     if not np.isscalar(item.tan):
-                        jacobian[..., o, :] = np.moveaxis(np.broadcast_to(item.tan, (width,) + lead), 0, -1)
+                        rows = item.tan.shape[-2] if item.tan.ndim > 1 else 1
+                        derivatives.append((o, np.broadcast_to(item.tan, (columns.size, rows, lead[1]))))
                     item = item.val
                 self._write(entries, writes[o], item, lead)
-            tape.append(jacobian)
+            tape.append(derivatives)
         return entries, tape
 
     def back(self, tape, entries_bar, parameter_count):
@@ -459,8 +462,8 @@ class _EntryBlock:
         slot_calls, slot_outputs = slots // 4, slots % 4
         position = np.empty(calls, np.intp)
         parameters_bar = np.zeros(parameter_count)
-        for (function_index, members, varying, columns), jacobian in zip(self.groups, tape):
-            if jacobian is None:
+        for (function_index, members, varying, columns), derivatives in zip(self.groups, tape):
+            if not derivatives:
                 continue
             # Output cotangents of this group's calls only: the scatter slots that belong to them
             # (`picked`) and their place in a (members, 4) block (`local`).
@@ -472,12 +475,18 @@ class _EntryBlock:
                 outputs_bar = np.zeros((rows, members.size * 4), complex)
                 if picked.size:
                     outputs_bar[:, local] = summed[:, picked]
-                inputs_bar = np.einsum("rco,rcoj->cj", outputs_bar.reshape(rows, members.size, 4), jacobian).real
-            else:  # identical Jacobian in every row
-                outputs_bar = np.zeros(members.size * 4, complex)
+            else:  # identical outputs in every row: only the sum over the rows matters
+                outputs_bar = np.zeros((1, members.size * 4), complex)
                 if picked.size:
-                    outputs_bar[local] = summed[:, picked].sum(0)
-                inputs_bar = np.einsum("co,coj->cj", outputs_bar.reshape(members.size, 4), jacobian[0]).real
+                    outputs_bar[0, local] = summed[:, picked].sum(0)
+            outputs_bar = outputs_bar.reshape(-1, members.size, 4)
+            inputs_bar = np.zeros((members.size, columns.size))
+            for o, tangent in derivatives:
+                bar = outputs_bar[:, :, o]
+                if tangent.shape[1] == 1:  # same derivative in every row
+                    inputs_bar += (bar.sum(0) * tangent[:, 0]).real.T
+                else:
+                    inputs_bar += np.einsum("rc,jrc->cj", bar, tangent).real
             parameters_bar += np.bincount(self.inputs[members][:, columns].ravel(), inputs_bar.ravel(), parameter_count)
         return parameters_bar
 
