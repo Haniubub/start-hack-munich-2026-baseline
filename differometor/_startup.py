@@ -192,6 +192,19 @@ LAZY_MODULES = frozenset({
     "jaxlib.mlir.dialects.sdy", "jaxlib.mlir.passmanager",
 })
 
+# Modules of the standard library that the header of benchmark.py and `import jax` load with a
+# plain `import x` and use inside functions only, none of them in a CPU run: jax._src.profiler
+# (gzip, socketserver, which brings socket and selectors), jax._src.tree_util (difflib),
+# opt_einsum (bisect, random), jax._src.hardware_utils (glob) and urllib.parse (ipaddress, through
+# pathlib). Found like LAZY_MODULES: wrapped lazily and still unloaded after the timed phases of
+# both benchmarks (runs/max/test_lazy_stdlib.py). They join LAZY_MODULES from Python 3.12.3 on:
+# these are modules that programs use from threads, and the lazy loader takes a lock for the
+# first use since that version. bz2 and lzma would qualify too, but shutil probes them with
+# `import` to set a feature flag, so they stay as they are.
+# Loading the seven costs 3.3 to 4.2 ms in Docker on an M-series core when the standard library
+# has bytecode, and 24 to 26 ms when it has none (the python:3.12-slim image ships without).
+LAZY_STDLIB_MODULES = frozenset({"bisect", "difflib", "glob", "gzip", "ipaddress", "random", "socketserver"})
+
 # Modules of LAZY_MODULES that JAX imports inside a function, after `import jax` is done:
 # `jax._src.dispatch._device_put_sharding_impl` imports `multihost_utils` on the first
 # `device_put` (the first `jnp.asarray` of a run) and only uses it for sharded arrays. The finder
@@ -1269,6 +1282,8 @@ def early(carrier="pth"):
         return info
     pause = "gc" in options
     lazy = LAZY_MODULES if "lazy" in options else frozenset()
+    if lazy and sys.version_info >= (3, 12, 3):
+        lazy = lazy | LAZY_STDLIB_MODULES
     # A module that is loaded already stays as it is.
     deferred = {name: plan for name, plan in DEFERRED_MODULES.items() if name not in sys.modules} if "defer" in options else {}
     if "report" in options:
