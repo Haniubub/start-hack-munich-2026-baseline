@@ -1583,9 +1583,9 @@ def pairs_to_arrays(
         arrays["function_input_indices"].append(component_function_input_indices)
         arrays["function_indices"].extend(instructions[component]["function_indices"])
         arrays["output_column_indices"].append(instructions[component]["output_column_indices"])
-        arrays["output_row_indices"].append(
-            np.array([float(len(components) - 1)] * len(instructions[component]["output_column_indices"]))
-        )
+        # Every carrier or noise component has one function output row. Only the number of its
+        # output columns is noted here; `combine_arrays` expands all rows in one step.
+        arrays["output_row_counts"].append(len(instructions[component]["output_column_indices"]))
         arrays["system_matrix_row_indices"].append(instructions[component]["system_matrix_row_indices"])
         arrays["system_matrix_column_indices"].append(instructions[component]["system_matrix_column_indices"])
 
@@ -1649,7 +1649,12 @@ def pairs_to_arrays(
             )
 
         function_input_indices = np.vstack(arrays["function_input_indices"])
-        output_indices = np.stack((np.concatenate(arrays["output_row_indices"]), np.concatenate(arrays["output_column_indices"])))
+        if signal:
+            output_rows = np.concatenate(arrays["output_row_indices"])
+        else:  # component k fills row k, see `append_information`
+            counts = arrays["output_row_counts"]
+            output_rows = np.repeat(np.arange(len(counts)), counts)
+        output_indices = np.stack((output_rows, np.concatenate(arrays["output_column_indices"])))
         system_matrix_indices = np.stack((np.concatenate(arrays["system_matrix_row_indices"]), np.concatenate(arrays["system_matrix_column_indices"])))
 
         if signal:
