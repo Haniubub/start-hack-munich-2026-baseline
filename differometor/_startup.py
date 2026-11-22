@@ -192,6 +192,14 @@ LAZY_MODULES = frozenset({
     "jaxlib.mlir.dialects.sdy", "jaxlib.mlir.passmanager",
 })
 
+# Modules of LAZY_MODULES that JAX imports inside a function, after `import jax` is done:
+# `jax._src.dispatch._device_put_sharding_impl` imports `multihost_utils` on the first
+# `device_put` (the first `jnp.asarray` of a run) and only uses it for sharded arrays. The finder
+# that hands out the lazy loader is gone by then, so the module would be executed in full
+# (with `jax._src.prng`, `jax.sharding` and `jaxlib.gpu_prng` behind it). It is created, lazily
+# like the others, right before the finder goes (`_Watcher.remove`).
+LAZY_LATE_MODULES = ("jax.experimental.multihost_utils",)
+
 # What the header of benchmark.py imports (lines 6 to 40), in its order. Used by PREIMPORT only.
 _BENCHMARK_HEADER = (
     "argparse", "datetime", "hashlib", "importlib.metadata", "json", "os", "pathlib", "platform",
@@ -1127,6 +1135,12 @@ class _Watcher:
         self._busy = False
 
     def remove(self):
+        for name in LAZY_LATE_MODULES:  # while this finder can still hand out the lazy loader
+            if name in self.lazy and name not in sys.modules and name.rpartition(".")[0] in sys.modules:
+                try:
+                    __import__(name)
+                except Exception:
+                    sys.modules.pop(name, None)
         try:
             sys.meta_path.remove(self)
         except ValueError:
