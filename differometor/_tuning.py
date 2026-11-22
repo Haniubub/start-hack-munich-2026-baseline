@@ -117,6 +117,16 @@ INLINE_JITS_UNDER_AD = True
 # bit-identical (M4: lower + compile of the three benchmark programs 48.6 -> 45.2 ms).
 DIRECT_LOWERING_SMALL_PROGRAMS = True
 
+# A program with at most SMALL_PROGRAM_OPERATIONS equations that consists of host callbacks and
+# of floating point / complex arithmetic, comparisons and a few shape operations is not lowered
+# and compiled at all: `jax.jit(f).lower(*args).compile()` hands out an object that carries out
+# the traced equations with NumPy (`differometor/_interpret.py`, which lists the operations and
+# what else the objects can do). The same operations run on the same inputs, without MLIR and
+# without XLA. Any other program takes JAX's path with the measures above. Results can differ in
+# the last bit (`log`, complex `abs`, order of a sum). Only acts through the staged API
+# (`.lower()` / `.compile()`); a plain `jax.jit(f)(x)` call compiles as before.
+INTERPRET_SMALL_PROGRAMS = True
+
 # What apply() did, per measure: "on", "off", or the reason it was skipped. For diagnosis only.
 STATUS = {}
 
@@ -124,7 +134,7 @@ _SWITCHES = (
     "SMALL_PROGRAM_OPERATIONS", "SMALL_PROGRAM_ELEMENTS", "CLASSIC_KERNEL_EMITTER", "ONE_CODEGEN_MODULE",
     "UNOPTIMIZED_SMALL_PROGRAMS", "PLAIN_SMALL_REDUCTIONS", "SHARED_MLIR_CONTEXT", "MLIR_CONTEXT_REUSES", "FAST_ASARRAY",
     "LAZY_MHLO_CLASSES_AT_IMPORT", "INLINE_DISPATCH_AT_IMPORT", "SHORT_LOCATIONS_AT_IMPORT", "INLINE_JITS_UNDER_AD",
-    "DIRECT_LOWERING_SMALL_PROGRAMS",
+    "DIRECT_LOWERING_SMALL_PROGRAMS", "INTERPRET_SMALL_PROGRAMS",
 )
 
 # --------------------------------------------------------------------------------------------
@@ -504,6 +514,12 @@ def _install_bind_jit():
     primitive.bind = _bind_jit
 
 
+def _install_interpreter():
+    from differometor import _interpret
+
+    _interpret.install(sys.modules[__name__])
+
+
 def _configure(name, value):
     import jax
 
@@ -531,6 +547,7 @@ def apply():
         ("short_locations", SHORT_LOCATIONS_AT_IMPORT, lambda: _configure("jax_include_full_tracebacks_in_locations", False)),
         ("inline_jits_under_ad", True, _install_bind_jit),
         ("lowering_in_place", True, _install_lowering_in_place),
+        ("interpreter", True, _install_interpreter),
     ):
         if not wanted:
             STATUS[name] = "off"

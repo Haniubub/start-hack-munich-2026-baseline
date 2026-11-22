@@ -180,6 +180,9 @@ except Exception:
 check("a wrong program still raises its own error", raised)
 
 # ---- MLIR context -------------------------------------------------------------------------------
+# These checks are about lowering itself, so the programs must not be interpreted
+# (INTERPRET_SMALL_PROGRAMS has its own test, runs/max/test_interpret.py).
+tuning.INTERPRET_SMALL_PROGRAMS = False
 tuning._retire_shared_context()
 with Spy("_jax_make_ir_context") as contexts:
     lowered = [jax.jit(lambda x, k=k: jnp.tanh(x) * k).lower(jnp.arange(3.0)) for k in range(1, 6)]
@@ -193,6 +196,7 @@ with Spy("_jax_make_ir_context") as contexts:
     for k in range(tuning.MLIR_CONTEXT_REUSES + 1):
         jax.jit(lambda x, k=k: x * k).lower(jnp.arange(2.0))
 check("mlir: the context is replaced after MLIR_CONTEXT_REUSES lowerings", len(contexts.calls) == 2, str(len(contexts.calls)))
+tuning.INTERPRET_SMALL_PROGRAMS = True
 constant, many, two = np.arange(100000.0), jnp.ones(100000), jnp.ones(2)
 tuning._retire_shared_context()
 with Spy("_jax_make_ir_context") as contexts:
