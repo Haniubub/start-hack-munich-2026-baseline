@@ -647,6 +647,12 @@ _DESCRIPTIVE = frozenset({
     "__file__", "__cached__", "__doc__", "__builtins__",
 })
 _PLAN = "__deferred_plan__"
+# How long a thread waits for another thread that is running the code of a put-off module. Such a
+# wait ends when that code is through, which takes milliseconds. Two put-off modules whose codes
+# touch each other from two threads, or a module code that joins a thread which touches the module,
+# would wait for each other forever; after this many seconds the waiting thread reads the module as
+# it is, the way it reads an ordinary module that another thread is still importing.
+_FIRST_USE_WAIT = 30.0
 _OWNER = "__deferred_owner__"
 
 
@@ -823,6 +829,7 @@ class _DeferredPlan:
         self.served = {}  # early attributes handed out so far
         self.stand_ins = {}  # the stand-in classes among them
         self.lock = _thread.RLock()
+        self.running = 0  # while the module's code runs: the thread that runs it (holding the lock)
 
 
 class _DeferredModule(type(sys)):
@@ -840,16 +847,29 @@ class _DeferredModule(type(sys)):
             return object.__getattribute__(self, name)
         plan = namespace.get(_PLAN)
         if plan is not None:
-            early = plan.early.get(name)
-            if early is not None:
-                with plan.lock:
-                    if namespace.get(_PLAN) is plan:
-                        if name not in plan.served:
-                            plan.served[name] = early(self)
-                            if early.stand_in:
-                                plan.stand_ins[name] = plan.served[name]
-                        return plan.served[name]
-            _load_deferred(self)
+            running = plan.running
+            if running:
+                # The module's code is running and has not defined this name yet. The thread that
+                # runs it gets what an ordinary half-initialized module gives; any other thread
+                # waits in `_load_deferred` until the code is through.
+                import _thread
+
+                if running == _thread.get_ident():
+                    return object.__getattribute__(self, name)
+            else:
+                early = plan.early.get(name)
+                if early is not None and plan.lock.acquire(True, _FIRST_USE_WAIT):
+                    try:
+                        if namespace.get(_PLAN) is plan and not plan.running:
+                            if name not in plan.served:
+                                plan.served[name] = early(self)
+                                if early.stand_in:
+                                    plan.stand_ins[name] = plan.served[name]
+                            return plan.served[name]
+                    finally:
+                        plan.lock.release()
+            if _load_deferred(self) is False:  # gave up waiting for the thread that runs the code
+                return object.__getattribute__(self, name)
         return getattr(self, name)
 
 
@@ -859,15 +879,22 @@ def _load_deferred(module):
     plan = namespace.get(_PLAN)
     if plan is None:
         return
-    with plan.lock:
-        if namespace.get(_PLAN) is not plan:
+    if not plan.lock.acquire(True, _FIRST_USE_WAIT):
+        return False
+    try:
+        if namespace.get(_PLAN) is not plan or plan.running:
             return  # loaded meanwhile, or being loaded further up on this thread
-        del namespace[_PLAN]
-        object.__setattr__(module, "__class__", type(sys))
+        import _thread
+
+        # The module stays a `_DeferredModule` with its plan until its code is through: a second
+        # thread that touches it meanwhile ends up at the lock above instead of reading a name
+        # the code has not defined yet.
+        plan.running = _thread.get_ident()
         try:
             plan.loader.exec_module(module)
         except BaseException:
             # As after a failed ordinary import: the half-built module must not stay around.
+            _settle(module, namespace, _PLAN, _DeferredModule)
             if sys.modules.get(namespace.get("__name__")) is module:
                 del sys.modules[namespace["__name__"]]
             raise
@@ -879,7 +906,17 @@ def _load_deferred(module):
                 subclass.__bases__ = tuple(real if base is stand_in else base for base in subclass.__bases__)
             if plan.after is not None:
                 plan.after(stand_in, real)
+        _settle(module, namespace, _PLAN, _DeferredModule)
         state().setdefault("deferred_loaded", []).append(namespace.get("__name__"))
+    finally:
+        plan.lock.release()
+
+
+def _settle(module, namespace, key, waiting_class):
+    """The module's code has run: drop its plan and make it an ordinary module (unless its code chose a class itself)."""
+    namespace.pop(key, None)
+    if type(module) is waiting_class:
+        object.__setattr__(module, "__class__", type(sys))
 
 
 def numpy_docs():
@@ -891,7 +928,8 @@ def numpy_docs():
         # file deferred it).
         if module is not None and _PLAN in vars(module):
             _load_deferred(module)
-            ran.append(name)
+            if _PLAN not in vars(module):  # not while its code is still running further up
+                ran.append(name)
     return ran
 
 
@@ -954,6 +992,7 @@ class _LaterPlan:
         self.loader, self.window = loader, window
         self.handed = {}  # name -> the `_Later` handed out for it
         self.lock = _thread.RLock()
+        self.running = 0  # while the module's code runs: the thread that runs it (holding the lock)
 
 
 class _Later:
@@ -986,8 +1025,10 @@ class _Later:
     def __getattr__(self, name):  # reached only for names that are not in __slots__
         if name.startswith("_later_"):
             raise AttributeError(name)  # a slot that is not set yet
-        if not name.startswith("__") and _LATER in object.__getattribute__(self._later_module, "__dict__"):
-            return _Later(self._later_module, self._later_path + (name,))
+        if not name.startswith("__"):
+            plan = object.__getattribute__(self._later_module, "__dict__").get(_LATER)
+            if plan is not None and not plan.running:
+                return _Later(self._later_module, self._later_path + (name,))
         return getattr(self._later_resolve(), name)
 
     def __call__(self, *args, **kwargs):
@@ -1020,12 +1061,19 @@ class _LaterModule(type(sys)):
             return object.__getattribute__(self, name)
         plan = namespace.get(_LATER)
         if plan is not None:
-            if plan.window[0] and not name.startswith("__"):
+            running = plan.running
+            if running:  # as in `_DeferredModule`: the running thread reads on, any other waits
+                import _thread
+
+                if running == _thread.get_ident():
+                    return object.__getattribute__(self, name)
+            elif plan.window[0] and not name.startswith("__"):
                 later = plan.handed.get(name)
                 if later is None:
                     later = plan.handed[name] = _Later(self, (name,))
                 return later
-            _run_later(self)
+            if _run_later(self) is False:  # gave up waiting for the thread that runs the code
+                return object.__getattribute__(self, name)
         return getattr(self, name)
 
 
@@ -1035,15 +1083,19 @@ def _run_later(module):
     plan = namespace.get(_LATER)
     if plan is None:
         return
-    with plan.lock:
-        if namespace.get(_LATER) is not plan:
+    if not plan.lock.acquire(True, _FIRST_USE_WAIT):
+        return False
+    try:
+        if namespace.get(_LATER) is not plan or plan.running:
             return  # ran meanwhile, or is running further up on this thread
-        del namespace[_LATER]
-        object.__setattr__(module, "__class__", type(sys))
+        import _thread
+
+        plan.running = _thread.get_ident()  # see `_load_deferred`
         try:
             plan.loader.exec_module(module)
         except BaseException:
             # As after a failed ordinary import: the half-built module must not stay around.
+            _settle(module, namespace, _LATER, _LaterModule)
             if sys.modules.get(namespace.get("__name__")) is module:
                 del sys.modules[namespace["__name__"]]
             raise
@@ -1058,7 +1110,10 @@ def _run_later(module):
             for key, value in list(names.items()):
                 if type(value) is _Later and value._later_module is module:
                     names[key] = value._later_resolve()
+        _settle(module, namespace, _LATER, _LaterModule)
         state().setdefault("later_loaded", []).append(namespace.get("__name__"))
+    finally:
+        plan.lock.release()
 
 
 class _LaterLoader:
