@@ -18,7 +18,9 @@ How it works
 - The carrier system and the signal system of every frequency are assembled as sparse
   CSC matrices and factorized with SuperLU, the solver behind `scipy.sparse.linalg.splu`.
   The compiled SuperLU module is loaded directly (`_load_superlu`), because importing
-  `scipy.sparse.linalg` costs more time than the whole simulation.
+  `scipy.sparse.linalg` costs more time than the whole simulation. It is loaded the first time
+  a factorization asks for it: with the native kernel (`NATIVE_LU`, further down) both systems
+  go through that kernel and SuperLU is never loaded.
 - All frequencies share one sparsity pattern. The column order is computed once (COLAMD) and
   reused; per frequency there is one factorization and two solve calls.
 - The quantum noise of the (single) detector is `Re(y^H N y)` with `y = S^-H w`; the
@@ -93,7 +95,17 @@ def _load_superlu():
     return _superlu
 
 
-_superlu = _load_superlu()
+# Both compiled SciPy modules are loaded the first time they are asked for. With the native
+# kernel a run never gets there: it factorizes the carrier system and the signal systems itself.
+_UNLOADED = object()
+_superlu = _UNLOADED
+
+
+def _superlu_module():
+    global _superlu
+    if _superlu is _UNLOADED:
+        _superlu = _load_superlu()
+    return _superlu
 
 
 def _load_sparsetools():
@@ -121,9 +133,7 @@ def _load_sparsetools():
     return None
 
 
-# Only `_CondensedLU` uses these kernels. With the native kernel a run never gets there, so the
-# module is loaded the first time it is asked for (`_csr_kernels`). None: not available.
-_UNLOADED = object()
+# Only `_CondensedLU` uses these kernels (`_csr_kernels`). None: not available.
 _sparsetools = _UNLOADED
 
 
@@ -151,7 +161,7 @@ def _splu(size, values, row_indices, column_pointers, column_order="COLAMD", sma
     if small_supernodes:
         options["PanelSize"] = 1
         options["Relax"] = 1
-    return _superlu.gstrf(
+    return _superlu_module().gstrf(
         size,
         row_indices.size,
         np.ascontiguousarray(values, dtype=np.complex128),
@@ -734,11 +744,19 @@ class SystemPlan:
         self._layout = None
 
     def carrier_matrix(self, carrier_entries):
-        """Factorization of the carrier matrix and its right-hand side (n,)."""
+        """Factorization of the carrier matrix and its right-hand side (n,).
+
+        The factorization has a `solve(b, trans="N")` for b of shape (n,). With `NATIVE_LU` it
+        comes from the native kernel (`_SingleLU`), otherwise or when the kernel declines from SuperLU.
+        """
         values = self.carrier_base_values.copy()
         values[self.carrier_matrix_slots] = carrier_entries[self.carrier_matrix_entries]
         rhs = self.carrier_base_rhs.copy()
         rhs[self.carrier_rhs_rows] = carrier_entries[self.carrier_rhs_entries]
+        if NATIVE_LU:
+            factors, _ = _PatternLU.create(self.n, self.carrier_rows, self.carrier_cols, values[:, None])
+            if factors is not None:
+                return _SingleLU(factors), rhs
         return _splu(self.n, values, self.carrier_rows, self.carrier_ptr), rhs
 
     @property
@@ -1281,6 +1299,19 @@ class _PatternLU:
                 work[rows] += values
             solutions.append(self.solve_rows(work, trans))
         return solutions
+
+
+class _SingleLU:
+    """
+    A `_PatternLU` of a single matrix (the carrier system) with the `solve` of a SuperLU
+    factorization: right-hand side and solution have shape (size,).
+    """
+
+    def __init__(self, factors):
+        self.factors = factors
+
+    def solve(self, b, trans="N"):
+        return self.factors.solve_rows(np.array(b, dtype=complex).reshape(-1, 1), trans)[:, 0]
 
 
 def forward(plan, carrier_entries, signal_entries, noise_entries):
