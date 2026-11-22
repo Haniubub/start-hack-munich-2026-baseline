@@ -88,12 +88,16 @@ case("integer powers, complex", lambda a: (a**2, a**-2, a**3), z)
 case("maximum and minimum", lambda a, b: (jnp.maximum(a, b), jnp.minimum(a, 0.5)), x, y)
 case("comparisons and where", lambda a, b: (jnp.where(a > b - 2, a, b), jnp.where(a == 0, 1.0, a), a <= b, (a < 0) | (b > 3), ~(a > 0)), x, y)
 case("abs of complex with its derivative", lambda a: jax.grad(lambda t: jnp.sum(jnp.abs(t)), holomorphic=False)(a), w)
+case("trigonometric and hyperbolic", lambda a, c: (jnp.tan(a), jnp.arcsin(a / 4), jnp.arccos(a / 4), jnp.arctan(a), jnp.sinh(a), jnp.cosh(a), jnp.arcsinh(a), jnp.arccosh(c), jnp.arctanh(a / 4)), x, y)
+case("outside the domain: arcsin, arccosh, arctanh", lambda a: (jnp.arcsin(a), jnp.arccosh(a), jnp.arctanh(a)), zeros)
+case("sign and clip", lambda a, c: (jnp.sign(a), jnp.sign(zeros), jnp.clip(a, -0.5, 0.5), jax.lax.clamp(jnp.asarray(-0.25, F), a, c)), x, y)
 # shapes
 case("sums and means", lambda a: (a.sum(), a.sum(0), a.mean(1), a.max(), a.min(0), jnp.prod(a, axis=1)), x)
 case("reshape, transpose, squeeze, expand", lambda a: (a.reshape(7, 4), a.T, a[None].squeeze(0), a[:, None, :] * jnp.ones((4, 3, 7), F)), x)
 case("concatenate and static slices", lambda a, b: (jnp.concatenate([a, b]), jax.lax.slice(a, (1, 0), (3, 7), (1, 2))), x, y)
 case("indexing (XLA)", lambda a: (a[1:3, ::2], a[0]), x, interpreted=False)
 case("complex from parts", lambda a, b: jax.lax.complex(a, b), x, y)
+case("pad and flip", lambda a: (jnp.pad(a, ((1, 2), (0, 3))), jax.lax.pad(a, jnp.asarray(1.5, F), ((0, 1, 1), (2, 0, 2))), a[::-1], jnp.flip(a, (0, 1)), jax.lax.pad(a[:0], jnp.asarray(0.0, F), ((1, 1, 0), (0, 0, 0)))), x)
 case("conversions", lambda a, b: (a.astype(C), b.real.astype(F), (a > 0).astype(F), a.astype(jnp.int32)), x, z)
 # program structure
 case("arguments are results", lambda a, b: (a, {"b": b, "sum": a + b}, a), x, y)
@@ -133,6 +137,21 @@ _, compiled_vjp = case("vjp with auxiliary output", lambda vals, ref: jax.vjp(la
 loss, pullback, aux = compiled_vjp(values, reference)
 case("pullback as an argument", lambda pull, bar: pull(bar), pullback, jnp.asarray(1.0, F))
 case("value and gradient", jax.value_and_grad(lambda a, b: jnp.sum(jnp.log(jnp.abs(a) + b**2))), z, x)
+
+
+def two_ports(values, reference):  # a balanced readout: two detector ports are subtracted
+    carrier, signals, noise = values
+    detected = signals[0] - signals[1]
+    sensitivity = noise / jnp.abs(detected * carrier)
+    return jnp.mean(jnp.log10(sensitivity / reference)), sensitivity
+
+
+values2 = (w, jnp.stack([w * 2 + 1, w.conj() - 0.5]), jnp.abs(v) + 1)
+_, compiled_two = case("two ports: vjp of a difference of rows", lambda vals, ref: jax.vjp(lambda t: two_ports(t, ref), vals, has_aux=True), values2, reference)
+_, pullback2, _ = compiled_two(values2, reference)
+case("two ports: the pullback (pad and summed cotangents)", lambda pull, bar: pull(bar), pullback2, jnp.asarray(1.0, F))
+case("a value used twice in reverse mode", jax.grad(lambda a: jnp.sum(a[0] * a[1] + a[1] / (a[2] + 3) - a[0])), x)
+case("negative padding (XLA)", lambda a: jax.lax.pad(a, jnp.asarray(0.0, F), ((-1, 0, 0), (0, 0, 0))), x, interpreted=False)
 # left to XLA: operations the interpreter does not know, integers, large programs
 case("sort (XLA)", lambda a: jnp.sort(a, axis=1), x, interpreted=False)
 case("integer arithmetic (XLA)", lambda a: a // 2 + a % 3, jnp.arange(12).reshape(3, 4), interpreted=False)

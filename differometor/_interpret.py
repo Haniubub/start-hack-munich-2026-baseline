@@ -11,8 +11,8 @@ the same operations run on the same inputs, only without a compiler in between.
 
 What is interpreted: a program with at most `_tuning.SMALL_PROGRAM_OPERATIONS` equations whose
 equations are all in `_BUILDERS` below with the operand types listed there (floating point and
-complex arithmetic, comparisons, a few shape operations, host callbacks, calls of custom
-derivative rules). Any other program, and any request for non-default lowering or compile
+complex arithmetic, comparisons, a few shape operations with what reverse mode makes of them,
+host callbacks, calls of custom derivative rules). Any other program, and any request for non-default lowering or compile
 options, takes JAX's own path unchanged. There is no limit on array sizes: NumPy's loops are
 compiled code already.
 
@@ -145,6 +145,35 @@ def _concatenate(equation):
     return lambda *operands: np.concatenate(operands, axis=dimension)
 
 
+def _pad(equation):
+    config = [(int(low), int(high), int(interior)) for low, high, interior in equation.params["padding_config"]]
+    _need(len(equation.invars) == 2 and all(low >= 0 and high >= 0 and interior >= 0 for low, high, interior in config))
+    shape = tuple(equation.outvars[0].aval.shape)
+    dtype = np.dtype(equation.outvars[0].aval.dtype)
+    inner = tuple(equation.invars[0].aval.shape)
+    _need(all(isinstance(extent, int) for extent in inner))
+    index = tuple(slice(low, low + (extent - 1) * (interior + 1) + 1, interior + 1) for (low, _, interior), extent in zip(config, inner))
+    empty = not all(inner)
+
+    def run(operand, value):
+        out = np.full(shape, value, dtype)
+        if not empty:
+            out[index] = operand
+        return out
+
+    return run
+
+
+def _rev(equation):
+    dimensions = tuple(int(d) for d in equation.params["dimensions"])
+    return lambda x: np.flip(x, dimensions)
+
+
+def _clamp(equation):
+    _need(_kinds(equation) == "fff")
+    return lambda low, x, high: np.minimum(np.maximum(x, low), high)
+
+
 def _slice(equation):
     strides = equation.params["strides"] or (1,) * len(equation.params["start_indices"])
     index = tuple(slice(int(a), int(b), int(c)) for a, b, c in zip(equation.params["start_indices"], equation.params["limit_indices"], strides))
@@ -166,10 +195,21 @@ _BUILDERS = {
     "sin": _elementwise(np.sin, _FLOATING),
     "cos": _elementwise(np.cos, _FLOATING),
     "tanh": _elementwise(np.tanh, _FLOATING),
+    "tan": _elementwise(np.tan, _REAL),
+    "asin": _elementwise(np.arcsin, _REAL),
+    "acos": _elementwise(np.arccos, _REAL),
+    "atan": _elementwise(np.arctan, _REAL),
+    "sinh": _elementwise(np.sinh, _REAL),
+    "cosh": _elementwise(np.cosh, _REAL),
+    "asinh": _elementwise(np.arcsinh, _REAL),
+    "acosh": _elementwise(np.arccosh, _REAL),
+    "atanh": _elementwise(np.arctanh, _REAL),
+    "sign": _elementwise(np.sign, _REAL),
     "square": _elementwise(np.square, _FLOATING),
     "is_finite": _elementwise(np.isfinite, _REAL),
     "not": _elementwise(np.logical_not, _BOOL),
     "add": _elementwise(np.add, _FLOATING),
+    "add_any": _elementwise(np.add, _FLOATING),  # how reverse mode sums the cotangents of one value
     "sub": _elementwise(np.subtract, _FLOATING),
     "mul": _elementwise(np.multiply, _FLOATING),
     "div": _elementwise(np.true_divide, _FLOATING),
@@ -199,6 +239,9 @@ _BUILDERS = {
     "complex": _complex,
     "concatenate": _concatenate,
     "slice": _slice,
+    "pad": _pad,  # reverse mode of a slice
+    "rev": _rev,
+    "clamp": _clamp,
     "copy": lambda equation: np.array,
     "copy_p": lambda equation: np.array,
 }
