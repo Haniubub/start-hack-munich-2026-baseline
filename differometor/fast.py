@@ -225,14 +225,35 @@ class Dual:
         return Dual(self.val**exponent, exponent * self.val ** (exponent - 1) * self.tan)
 
 
-def _unary(function, derivative):
+def _chain(slope, tan):
+    """`slope * tan` for a function whose slope can be infinite (sqrt at 0, arcsin at 1).
+
+    At such a point (a mirror with reflectivity exactly 1 or 0) the derivative with respect to
+    the function's own argument does not exist. The plain product would spoil every other
+    direction too, because 0 * inf is nan: the tuning of that mirror would get a nan gradient.
+    A direction in which the argument does not change (tangent exactly 0) keeps the derivative
+    0, as in JAX's reverse mode, where such a direction never meets the infinite slope.
+    """
+    product = slope * tan
+    if np.all(np.isfinite(slope)):
+        return product
+    return np.where(tan == 0, 0.0, product)
+
+
+def _unary(function, derivative, singular=False):
     def wrapped(x):
         if not isinstance(x, Dual):
             return function(x)
         y = function(x.val)
         return Dual(y, derivative(x.val, y) * x.tan)
 
-    return wrapped
+    def wrapped_singular(x):
+        if not isinstance(x, Dual):
+            return function(x)
+        y = function(x.val)
+        return Dual(y, _chain(derivative(x.val, y), x.tan))
+
+    return wrapped_singular if singular else wrapped
 
 
 class _NumpyShim:
@@ -241,12 +262,12 @@ class _NumpyShim:
     pi, e, complex128, ndarray = np.pi, np.e, np.complex128, np.ndarray
     log10, log = staticmethod(np.log10), staticmethod(np.log)
     exp = staticmethod(_unary(np.exp, lambda x, y: y))
-    sqrt = staticmethod(_unary(np.sqrt, lambda x, y: 0.5 / y))
+    sqrt = staticmethod(_unary(np.sqrt, lambda x, y: 0.5 / y, singular=True))
     sin = staticmethod(_unary(np.sin, lambda x, y: np.cos(x)))
     cos = staticmethod(_unary(np.cos, lambda x, y: -np.sin(x)))
     sinh = staticmethod(_unary(np.sinh, lambda x, y: np.cosh(x)))
     cosh = staticmethod(_unary(np.cosh, lambda x, y: np.sinh(x)))
-    arcsin = staticmethod(_unary(np.arcsin, lambda x, y: 1.0 / np.sqrt(1.0 - x * x)))
+    arcsin = staticmethod(_unary(np.arcsin, lambda x, y: 1.0 / np.sqrt(1.0 - x * x), singular=True))
     radians = staticmethod(_unary(np.radians, lambda x, y: np.pi / 180.0))
 
     @staticmethod
