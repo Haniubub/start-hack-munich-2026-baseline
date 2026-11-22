@@ -23,10 +23,9 @@ the width of a proton. That is the signal.
 
 ## Goal (0:45–1:05), 39 words
 
-Most of these waves are far weaker, and today's detectors miss them. So the
-goal is sensitivity. A detector that hears three times further covers
-twenty-seven times the volume of space, and that means many more events to
-measure.
+The further away a collision is, the fainter it arrives. A more sensitive
+detector reaches deeper into space, in every direction. Double the reach, and
+you do not get twice as many events. You get eight times as many.
 
 ## Problem (1:05–1:35), 62 words
 
