@@ -293,10 +293,16 @@ def _retire_shared_context():
 class _MhloStandIn(types.ModuleType):
     """`jax._src.lib.mlir.dialects.mhlo` until something other than the dialect registration is needed."""
 
-    def __init__(self, owner, register):
+    def __init__(self, owner):
         super().__init__("jaxlib.mlir.dialects.mhlo")
         self.__dict__["_owner"] = owner
-        self.register_mhlo_dialect = register
+
+    def register_mhlo_dialect(self, *args, **kwargs):
+        # The native library with the registration is opened when the first MLIR context is made.
+        # A run whose programs are all interpreted makes none and never opens it.
+        from jaxlib.mlir._mlir_libs import _mlirHlo
+
+        return _mlirHlo.register_mhlo_dialect(*args, **kwargs)
 
     def __getattr__(self, name):
         if name.startswith("__") and name.endswith("__"):
@@ -483,9 +489,9 @@ def _install_lazy_mhlo():
 
     if "mhlo" in vars(dialects) or "jaxlib.mlir.dialects.mhlo" in sys.modules:
         return  # already imported, nothing to save
-    from jaxlib.mlir._mlir_libs import _mlirHlo
-
-    dialects.mhlo = _MhloStandIn(dialects, _mlirHlo.register_mhlo_dialect)
+    if importlib.util.find_spec("jaxlib.mlir._mlir_libs._mlirHlo") is None:
+        raise ImportError("jaxlib.mlir._mlir_libs._mlirHlo not found")
+    dialects.mhlo = _MhloStandIn(dialects)
 
 
 def _install_asarray():
