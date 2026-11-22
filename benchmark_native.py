@@ -27,13 +27,38 @@ What is different
     placeholder stands in for the module while the package is imported and refuses every call
     afterwards, so a code path that needs JAX fails loudly instead of running something else.
 
+Start-up measures of this script (all inside the timed window, none moves work in front of it)
+    1. The garbage collector pauses while the modules are imported and then runs with the
+       package's own relaxed thresholds. Imports create long-lived objects only; the collector
+       would walk them again and again without finding anything.
+    2. NumPy's two docstring modules (``numpy._core._add_newdocs``, ``_add_newdocs_scalars``) do
+       not run: they only attach ``__doc__`` texts to functions NumPy defines in C. NumPy computes
+       exactly what it computes otherwise. They run after the timed phases, before the report.
+    3. ``numpy.unique`` asks ``numpy.ma.is_masked`` on every call, which makes NumPy import its
+       masked-array package (4.5 ms on the Xeon Platinum 8468) in the middle of the forward pass.
+       For a plain ``ndarray`` the answer is False, and that answer is given here; anything else
+       loads ``numpy.ma`` and asks it.
+    4. ``numpy.linalg`` is loaded on first use. ``import numpy`` loads it to take four functions
+       (for ``numpy.matrix ** n`` and for ``numpy.roots`` / ``numpy.polyfit``) and calls none of
+       them; this run uses nothing of the package. The four names are handed out as functions
+       that load the package when they are called.
+    Measures 1 to 3 are part of the package's start-up code for the scored benchmark as well
+    (``differometor/_startup.py``: GC_PAUSE_JAX_IMPORT / GC_RUN, DEFER_NUMPY_DOCS,
+    DEFER_UNUSED_MODULES); they are repeated here in plain form because that code is built
+    around ``import jax``. ``--plain`` switches all four off.
+
 Only setups that the sparse host path covers (``differometor.fast.supports``) can run here.
 """
 from time import perf_counter
 
 IMPORT_START = perf_counter()
+import gc
 import os
 import sys
+
+PLAIN = "--plain" in sys.argv[1:]
+if not PLAIN:
+    gc.disable()  # measure 1; switched on again below, after the imports
 
 os.environ["DIFFEROMETOR_TUNING"] = "off"  # the tuning measures patch JAX, which is not here
 os.environ["DIFFEROMETOR_STARTUP"] = "none"  # the start-up measures prepare `import jax`
@@ -41,9 +66,10 @@ os.environ["DIFFEROMETOR_STARTUP"] = "none"  # the start-up measures prepare `im
 
 def _options(argv):
     """Read the command line by hand: `import argparse` would find the start-up carrier next to this file."""
+    argv = [item for item in argv if item != "--plain"]
     options = {"cpus": None, "repeats": 10, "output": None, "setup": "grid", "save_arrays": None}
     names = {"--cpus": "cpus", "--repeats": "repeats", "--output": "output", "--setup": "setup", "--save-arrays": "save_arrays"}
-    usage = "usage: benchmark_native.py [--cpus N] [--repeats N] [--setup grid|aligo] [--output FILE.json] [--save-arrays FILE.npz]"
+    usage = "usage: benchmark_native.py [--cpus N] [--repeats N] [--setup grid|aligo] [--output FILE.json] [--save-arrays FILE.npz] [--plain]"
     index = 0
     while index < len(argv):
         item = argv[index]
@@ -96,7 +122,89 @@ if OPTIONS["cpus"] is not None:
 import json
 import types
 
+_NUMPY_DOC_MODULES = ("numpy._core._add_newdocs", "numpy._core._add_newdocs_scalars")
+if not PLAIN:
+    for _name in _NUMPY_DOC_MODULES:  # measure 2: NumPy finds them "imported" and does not run them
+        sys.modules[_name] = types.ModuleType(_name)
+
+
+
+class _LinalgLater(types.ModuleType):
+    """`numpy.linalg` while NumPy is imported (measure 4).
+
+    `import numpy` takes four functions from the package and calls none of them: `matrix_power`
+    (numpy.matrixlib.defmatrix) and `eigvals`, `inv`, `lstsq` (numpy.lib._polynomial_impl). Each
+    is handed out as a function that loads the package when it is called. Any other name loads
+    the package at once, as an ordinary import would.
+    """
+
+    FUNCTIONS = ("matrix_power", "eigvals", "inv", "lstsq")
+
+    def real(self):
+        import importlib
+
+        if sys.modules.get("numpy.linalg") is self:
+            del sys.modules["numpy.linalg"]
+        return importlib.import_module("numpy.linalg")
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        if name in self.FUNCTIONS:
+
+            def later(*args, **kwargs):
+                return getattr(self.real(), name)(*args, **kwargs)
+
+            later.__name__ = later.__qualname__ = name
+            return later
+        return getattr(self.real(), name)
+
+
+if not PLAIN:
+    sys.modules["numpy.linalg"] = _LinalgLater("numpy.linalg")
+
 import numpy as np
+
+if isinstance(sys.modules.get("numpy.linalg"), _LinalgLater):
+    del sys.modules["numpy.linalg"]  # from here on `numpy.linalg` is NumPy's own lazy attribute
+
+
+def numpy_docs():
+    """Run NumPy's docstring modules now (measure 2 skipped them)."""
+    import importlib
+
+    for name in _NUMPY_DOC_MODULES:
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "__spec__", None) is None:  # still the empty stand-in
+            del sys.modules[name]
+            importlib.import_module(name)
+
+
+class _MaskedArraysLater(types.ModuleType):
+    """`numpy.ma` until somebody needs it (measure 3). `is_masked` of a plain ndarray is False."""
+
+    def real(self):
+        import importlib
+
+        if sys.modules.get("numpy.ma") is self:
+            del sys.modules["numpy.ma"]
+        if np.__dict__.get("ma") is self:
+            del np.ma
+        return importlib.import_module("numpy.ma")
+
+    def is_masked(self, x):
+        if type(x) is np.ndarray:
+            return False
+        return self.real().is_masked(x)
+
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return getattr(self.real(), name)
+
+
+if not PLAIN and "numpy.ma" not in sys.modules:
+    np.ma = sys.modules["numpy.ma"] = _MaskedArraysLater("numpy.ma")
 
 
 class _Placeholder:
@@ -158,6 +266,10 @@ from differometor import components, fast
 from differometor.setups import constrain_inter_grid_cell_spaces
 
 _Placeholder.sealed = True
+if not PLAIN:  # measure 1: what the imports created stays; the collector looks at young objects less often
+    gc.enable()
+    gc.freeze()
+    gc.set_threshold(*df._startup.GC_RELAXED_THRESHOLDS)
 IMPORT_SECONDS = perf_counter() - IMPORT_START
 
 # Same constants as benchmark.py.
@@ -330,6 +442,9 @@ def main():
     first_phases = list(phases)
     total = sum(phase["seconds"] for phase in first_phases)
     print(f"Complete first-run total without JAX (excluding validation): {total:.6f} s", flush=True)
+    # What the timed first run loaded of the two packages the start-up measures put off.
+    linalg_loaded = "numpy.linalg" in sys.modules
+    masked_arrays_loaded = "numpy.ma" in sys.modules and not isinstance(sys.modules["numpy.ma"], _MaskedArraysLater)
 
     repeat_samples = []
     for index in range(OPTIONS["repeats"]):
@@ -369,6 +484,8 @@ def main():
     if "jaxlib" in sys.modules or not isinstance(sys.modules.get("jax"), _JaxPlaceholder):
         raise RuntimeError("JAX was loaded during this run")
 
+    numpy_docs()
+
     import platform
     import statistics
     from datetime import datetime, timezone
@@ -399,6 +516,9 @@ def main():
             "python": platform.python_version(),
             "numpy": np.__version__,
             "jax_imported": False,
+            "startup_measures": [] if PLAIN else ["gc paused during imports, relaxed afterwards", "numpy docstring modules after the timed phases", "numpy.ma.is_masked answered for plain arrays", "numpy.linalg on first use"],
+            "numpy_ma_loaded_in_first_run": masked_arrays_loaded,
+            "numpy_linalg_loaded_in_first_run": linalg_loaded,
             "native_lu": bool(fast.NATIVE_LU and fast._pattern_lu() is not None),
             "thread_limits": {name: os.environ.get(name) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS")},
         },
