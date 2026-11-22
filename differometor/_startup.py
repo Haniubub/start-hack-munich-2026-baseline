@@ -33,7 +33,7 @@ kind (C)  does not remove work either. It leaves a module that the benchmark scr
 
 For measurements the switches can be overridden per process without editing this file:
 ``DIFFEROMETOR_STARTUP`` is a comma separated list out of ``gc``, ``lazy``, ``defer``,
-``dataclass``, ``jits``, ``report``, ``tpuprobe``, ``preimport`` (or ``none``) and replaces the eight early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
+``dataclass``, ``jits``, ``report``, ``tpuprobe``, ``npdocs``, ``hlo``, ``preimport`` (or ``none``) and replaces the ten early switches; ``DIFFEROMETOR_GC`` replaces ``GC_RUN``.
 """
 import sys
 
@@ -115,6 +115,31 @@ DEFER_REPORT_MODULES = True
 # so a machine with a TPU still gets its chips counted, here and on any other set-up.
 FAST_TPU_PROBE = True
 
+# early, kind (C): the two modules of NumPy that do nothing but attach docstrings to the functions
+# and types NumPy defines in C (`numpy._core._add_newdocs`, `_add_newdocs_scalars`; 3.0 + 0.4 ms
+# of `import numpy` on an M4) run on first use instead of inside the import. `import numpy` only
+# imports them, nothing reads them, so in a run like the benchmark their code does not run at all
+# and those `__doc__` attributes stay empty: NumPy computes exactly what it computes otherwise.
+# `help()` runs them first, `differometor._startup.numpy_docs()` runs them on request, and so does
+# anything that touches one of the two modules. Uses the mechanism of DEFER_UNUSED_MODULES.
+DEFER_NUMPY_DOCS = True
+
+# early, kind (C): the two MLIR dialect modules with the operations JAX lowers its primitives to
+# (HLO_DIALECT_MODULES: StableHLO and CHLO, generated Python classes for a few hundred operations
+# plus two native libraries; 4 ms of `import jax` on an M4) run when a program is lowered for the
+# first time. `import jax` reads about 120 names from them, and with every one it does the same
+# thing: it puts the function or class away to call it during a lowering
+# (`register_lowering(neg_p, partial(_nary_lower_hlo, hlo.negate))`, `token_type =
+# hlo.TokenType.get`). While `import jax` runs, such a read gets a `_Later`: an object that stands
+# for "this name of that module", runs the module when it is called (or asked anything else) and
+# then is the real function to its caller. After `import jax` the first read of either module
+# runs it, and the names JAX keeps in its own modules are set to the real objects.
+# Since small programs are interpreted (`_tuning.INTERPRET_SMALL_PROGRAMS`), a run like the
+# benchmark lowers nothing, so the two modules do not run at all; a program that XLA compiles
+# pays for them at its first lowering instead of at the import. Only for jaxlib 0.9.0, the
+# version whose use of the two modules was checked; with any other version nothing changes.
+DEFER_HLO_DIALECTS = True
+
 # early, kind (A): the jit objects of JAX's own functions are built on first use. `import jax`
 # decorates 323 of its functions with `jax.jit` (most of jax.numpy and lax); for each one JAX
 # reads the signature, resolves static arguments and builds the C++ dispatch object, 30 to 40
@@ -159,6 +184,12 @@ LAZY_MODULES = frozenset({
     "jaxlib.cpu_sparse", "jaxlib.gpu_linalg", "jaxlib.gpu_prng", "jaxlib.gpu_rnn",
     "jaxlib.gpu_solver", "jaxlib.gpu_sparse", "jaxlib.gpu_triton", "jaxlib.lapack",
     "jaxlib.mlir.dialects.builtin", "jaxlib.mosaic.python.mosaic_gpu", "jaxlib.mosaic.python.tpu",
+    # untouched since small programs are interpreted (`_tuning.INTERPRET_SMALL_PROGRAMS`): two
+    # MLIR dialects with their native bindings, the pass manager, and two helpers of the lowering.
+    # A program that is lowered after all (not small, or an operation the interpreter does not
+    # know) loads them at that point.
+    "jax._src.jaxpr_util", "jax._src.path", "jaxlib.mlir.dialects.func", "jaxlib.mlir.dialects.mpmd",
+    "jaxlib.mlir.dialects.sdy", "jaxlib.mlir.passmanager",
 })
 
 # What the header of benchmark.py imports (lines 6 to 40), in its order. Used by PREIMPORT only.
@@ -192,12 +223,14 @@ def _early_options():
                 ("jits", LAZY_JITS),
                 ("report", DEFER_REPORT_MODULES),
                 ("tpuprobe", FAST_TPU_PROBE),
+                ("npdocs", DEFER_NUMPY_DOCS),
+                ("hlo", DEFER_HLO_DIALECTS),
                 ("preimport", PREIMPORT),
             )
             if on
         }
     return {part.strip().lower() for part in value.split(",")} & {
-        "gc", "lazy", "defer", "dataclass", "jits", "report", "tpuprobe", "preimport"}
+        "gc", "lazy", "defer", "dataclass", "jits", "report", "tpuprobe", "npdocs", "hlo", "preimport"}
 
 
 # --------------------------------------------------------------------------------------------
@@ -746,6 +779,13 @@ REPORT_MODULES = {
     "subprocess": ({}, None),
 }
 
+# NumPy's docstring modules (see DEFER_NUMPY_DOCS), in the order NumPy runs them. Same form as
+# DEFERRED_MODULES.
+NUMPY_DOC_MODULES = {
+    "numpy._core._add_newdocs": ({}, None),
+    "numpy._core._add_newdocs_scalars": ({}, None),
+}
+
 # name -> (early attributes, what else to do with a (stand-in, real class) pair after the load)
 DEFERRED_MODULES = {
     "http.server": ({"SimpleHTTPRequestHandler": _stand_in("SimpleHTTPRequestHandler")}, None),
@@ -821,6 +861,36 @@ def _load_deferred(module):
         state().setdefault("deferred_loaded", []).append(namespace.get("__name__"))
 
 
+def numpy_docs():
+    """Run NumPy's docstring modules now if DEFER_NUMPY_DOCS put them off. Returns the names it ran."""
+    ran = []
+    for name in NUMPY_DOC_MODULES:
+        module = sys.modules.get(name)
+        # The plan in the namespace marks a module that has not run (whichever copy of this
+        # file deferred it).
+        if module is not None and _PLAN in vars(module):
+            _load_deferred(module)
+            ran.append(name)
+    return ran
+
+
+class _HelpWithDocs:
+    """`builtins.help` that makes sure NumPy's docstrings are there before it shows anything."""
+
+    def __init__(self, helper):
+        self._helper = helper
+
+    def __repr__(self):
+        return repr(self._helper)
+
+    def __call__(self, *args, **kwargs):
+        numpy_docs()
+        return self._helper(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._helper, name)
+
+
 class _DeferredLoader:
     """Loader wrapper: instead of running the module's code, turn the module into a `_DeferredModule`."""
 
@@ -842,6 +912,155 @@ class _DeferredLoader:
         module.__dict__[_PLAN] = _DeferredPlan(self._loader, self._early, self._after)
         module.__class__ = _DeferredModule
         state().setdefault("deferred", []).append(module.__name__)
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+
+# --------------------------------------------------------------------------------------------
+# Modules whose names are only put away during `import jax` (DEFER_HLO_DIALECTS)
+# --------------------------------------------------------------------------------------------
+
+HLO_DIALECT_MODULES = ("jaxlib.mlir.dialects.stablehlo", "jaxlib.mlir.dialects.chlo")
+_HLO_JAXLIB_VERSION = "0.9.0"
+_LATER = "__later_plan__"
+
+
+class _LaterPlan:
+    def __init__(self, loader, window):
+        import _thread
+
+        self.loader, self.window = loader, window
+        self.handed = {}  # name -> the `_Later` handed out for it
+        self.lock = _thread.RLock()
+
+
+class _Later:
+    """`<module>.<path>` of a module that has not run yet.
+
+    Reading an attribute of it while the module still waits gives the `_Later` for the longer
+    path (`hlo.TokenType.get`). Everything else runs the module and goes to the real object:
+    calling it, `isinstance` / `issubclass` against it, deriving from it, and reading a special
+    attribute. Once the module has run, attribute reads go to the real object as well.
+    """
+
+    __slots__ = ("_later_module", "_later_path", "_later_real")
+
+    def __init__(self, module, path):
+        self._later_module, self._later_path = module, path
+
+    def _later_resolve(self):
+        try:
+            return self._later_real
+        except AttributeError:
+            pass
+        module = self._later_module
+        _run_later(module)
+        real = module
+        for name in self._later_path:
+            real = getattr(real, name)
+        self._later_real = real
+        return real
+
+    def __getattr__(self, name):  # reached only for names that are not in __slots__
+        if name.startswith("_later_"):
+            raise AttributeError(name)  # a slot that is not set yet
+        if not name.startswith("__") and _LATER in object.__getattribute__(self._later_module, "__dict__"):
+            return _Later(self._later_module, self._later_path + (name,))
+        return getattr(self._later_resolve(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._later_resolve()(*args, **kwargs)
+
+    def __instancecheck__(self, instance):
+        return isinstance(instance, self._later_resolve())
+
+    def __subclasscheck__(self, subclass):
+        return issubclass(subclass, self._later_resolve())
+
+    def __mro_entries__(self, bases):
+        return (self._later_resolve(),)
+
+    def __repr__(self):
+        return f"<later {self._later_module.__name__}.{'.'.join(self._later_path)}>"
+
+
+class _LaterModule(type(sys)):
+    """A module whose code has not run yet (see DEFER_HLO_DIALECTS).
+
+    While the `jax` package executes, reading a public name gives a `_Later` and runs nothing.
+    At any other time the first read of anything that is not a description of the module
+    (`_DESCRIPTIVE`) runs the module's code in this very object, which then is an ordinary module.
+    """
+
+    def __getattribute__(self, name):
+        namespace = object.__getattribute__(self, "__dict__")
+        if name in _DESCRIPTIVE or name in namespace:
+            return object.__getattribute__(self, name)
+        plan = namespace.get(_LATER)
+        if plan is not None:
+            if plan.window[0] and not name.startswith("__"):
+                later = plan.handed.get(name)
+                if later is None:
+                    later = plan.handed[name] = _Later(self, (name,))
+                return later
+            _run_later(self)
+        return getattr(self, name)
+
+
+def _run_later(module):
+    """Run the code of a `_LaterModule` now; JAX's own module-level names then get the real objects."""
+    namespace = object.__getattribute__(module, "__dict__")
+    plan = namespace.get(_LATER)
+    if plan is None:
+        return
+    with plan.lock:
+        if namespace.get(_LATER) is not plan:
+            return  # ran meanwhile, or is running further up on this thread
+        del namespace[_LATER]
+        object.__setattr__(module, "__class__", type(sys))
+        try:
+            plan.loader.exec_module(module)
+        except BaseException:
+            # As after a failed ordinary import: the half-built module must not stay around.
+            if sys.modules.get(namespace.get("__name__")) is module:
+                del sys.modules[namespace["__name__"]]
+            raise
+        # `token_type = hlo.TokenType.get` and the like: what JAX keeps under a name of its own.
+        for name, other in list(sys.modules.items()):
+            if not name.startswith("jax.") or other is None:
+                continue
+            try:
+                names = object.__getattribute__(other, "__dict__")
+            except Exception:
+                continue
+            for key, value in list(names.items()):
+                if type(value) is _Later and value._later_module is module:
+                    names[key] = value._later_resolve()
+        state().setdefault("later_loaded", []).append(namespace.get("__name__"))
+
+
+class _LaterLoader:
+    """Loader wrapper: instead of running the module's code, turn the module into a `_LaterModule`."""
+
+    def __init__(self, loader, window):
+        self._loader, self._window = loader, window
+
+    def create_module(self, spec):
+        return self._loader.create_module(spec)
+
+    def exec_module(self, module):
+        try:
+            module.__spec__.loader = self._loader
+            module.__loader__ = self._loader
+        except Exception:
+            pass
+        if type(module) is not type(sys):
+            self._loader.exec_module(module)  # not a plain module object: load it the ordinary way
+            return
+        module.__dict__[_LATER] = _LaterPlan(self._loader, self._window)
+        module.__class__ = _LaterModule
+        state().setdefault("later", []).append(module.__name__)
 
     def __getattr__(self, name):
         return getattr(self._loader, name)
@@ -869,9 +1088,11 @@ class _PausedCollector:
         pause = self._watcher.pause and gc.isenabled()
         if pause:
             gc.disable()
+        self._watcher.window[0] = True  # `import jax` is running: see `_LaterModule`
         try:
             self._loader.exec_module(module)
         finally:
+            self._watcher.window[0] = False
             self._watcher.remove()
             if pause:
                 # Everything allocated meanwhile is module-level state that lives as long as
@@ -892,10 +1113,12 @@ class _Watcher:
     other name `None`, which sends the import machinery on to the normal finders.
     """
 
-    def __init__(self, pause, lazy, deferred=None, lazy_jits=False, fast_probe=False):
+    def __init__(self, pause, lazy, deferred=None, lazy_jits=False, fast_probe=False, later=()):
         self.pause = pause
         self.lazy = lazy
         self.deferred = deferred or {}
+        self.later = frozenset(later)
+        self.window = [False]  # True while the `jax` package executes
         self.after = {}
         if lazy_jits:
             self.after["jax._src.pjit"] = (_install_lazy_jits, "lazy_jits_installed")
@@ -910,7 +1133,7 @@ class _Watcher:
             pass
 
     def find_spec(self, name, path=None, target=None):
-        if name != "jax" and name not in self.lazy and name not in self.deferred and name not in self.after:
+        if name != "jax" and name not in self.lazy and name not in self.deferred and name not in self.after and name not in self.later:
             return None
         if self._busy:
             return None
@@ -938,6 +1161,13 @@ class _Watcher:
                 spec.loader = _DeferredLoader(spec.loader, *self.deferred[name])
             elif name in self.after:
                 spec.loader = _AfterExec(spec.loader, *self.after[name])
+            elif name in self.later:
+                from importlib.machinery import SourceFileLoader
+
+                jaxlib = sys.modules.get("jaxlib")
+                if type(spec.loader) is not SourceFileLoader or getattr(jaxlib, "__version__", None) != _HLO_JAXLIB_VERSION:
+                    return None
+                spec.loader = _LaterLoader(spec.loader, self.window)
             else:
                 from importlib.machinery import SourceFileLoader
 
@@ -1029,11 +1259,18 @@ def early(carrier="pth"):
     deferred = {name: plan for name, plan in DEFERRED_MODULES.items() if name not in sys.modules} if "defer" in options else {}
     if "report" in options:
         deferred.update((name, plan) for name, plan in REPORT_MODULES.items() if name not in sys.modules)
+    if "npdocs" in options and "numpy" not in sys.modules:
+        deferred.update(NUMPY_DOC_MODULES)
+        import builtins
+
+        if hasattr(builtins, "help") and type(builtins.help) is not _HelpWithDocs:
+            builtins.help = _HelpWithDocs(builtins.help)
     lazy_jits = "jits" in options
     fast_probe = "tpuprobe" in options
-    if pause or lazy or deferred or lazy_jits or fast_probe:
-        sys.meta_path.insert(0, _Watcher(pause, lazy, deferred, lazy_jits, fast_probe))
-        info["early"] += [name for name in ("gc", "lazy", "defer", "jits", "report", "tpuprobe") if name in options]
+    later = HLO_DIALECT_MODULES if "hlo" in options else ()
+    if pause or lazy or deferred or lazy_jits or fast_probe or later:
+        sys.meta_path.insert(0, _Watcher(pause, lazy, deferred, lazy_jits, fast_probe, later))
+        info["early"] += [name for name in ("gc", "lazy", "defer", "jits", "report", "tpuprobe", "npdocs", "hlo") if name in options]
     if "preimport" in options and carrier == "pth" and _is_benchmark_process():
         if _preimport():
             info["early"].append("preimport")
